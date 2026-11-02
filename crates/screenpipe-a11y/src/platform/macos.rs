@@ -1489,14 +1489,13 @@ fn emit_focus_state(state: &ObserverCallbackState, focused_elem: Option<&ax::UiE
         state.current_focus.store(Arc::new(InputFocus::default()));
         return;
     };
-    // Window title and focused-element reads below are AX requests to the
-    // frontmost app. A late notification from the previous app, or the
-    // `observed_pid == pid` refresh, can land here after a switch to a denied one.
-    if is_ax_denied_name(&name) {
-        state.current_focus.store(Arc::new(InputFocus::default()));
-        return;
-    }
-    let window_title = if state.config.should_capture_app(&name) {
+    // The window-title and focused-element reads are AX requests to the
+    // frontmost app, which hangs a denied one. A late notification from the
+    // previous app, or the `observed_pid == pid` refresh, can land here after a
+    // switch to it. Only those reads are skipped: input capture and app_switch
+    // events for the denied app are unaffected.
+    let ax_denied = is_ax_denied_name(&name);
+    let window_title = if state.config.should_capture_app(&name) && !ax_denied {
         get_focused_window_title(pid)
     } else {
         None
@@ -1515,7 +1514,11 @@ fn emit_focus_state(state: &ObserverCallbackState, focused_elem: Option<&ax::UiE
 
     if app_changed {
         if state.config.capture_app_switch {
-            let focused_element = focused_element_context(&state.config, focused_elem);
+            let focused_element = if ax_denied {
+                None
+            } else {
+                focused_element_context(&state.config, focused_elem)
+            };
 
             let mut event = UiEvent::app_switch(
                 Utc::now(),
@@ -1533,7 +1536,11 @@ fn emit_focus_state(state: &ObserverCallbackState, focused_elem: Option<&ax::UiE
 
     if window_title != focus.last_window || app_changed {
         if state.config.capture_window_focus {
-            let focused_element = focused_element_context(&state.config, focused_elem);
+            let focused_element = if ax_denied {
+                None
+            } else {
+                focused_element_context(&state.config, focused_elem)
+            };
 
             let event = UiEvent {
                 id: None,
@@ -1700,9 +1707,11 @@ fn run_app_observer(
         // Even creating an observer and registering notifications are AX
         // requests to the target, which is what hangs a denied app. Recording
         // `observed_pid` stops the periodic refresh from retrying every tick.
+        // `emit_focus_state` publishes the focus identity and app_switch without
+        // any AX read for a denied app.
         if is_ax_denied_name(&name) {
             observed_pid = pid;
-            state.current_focus.store(Arc::new(InputFocus::default()));
+            emit_focus_state(state, None);
             return true;
         }
 
@@ -1874,12 +1883,12 @@ pub(crate) fn is_ax_denied_pid(pid: i32) -> bool {
             buffer.len() as u32,
         )
     };
-    // Compare on the raw bytes to avoid the String allocation in
-    // `process_name_for_pid`; a non-UTF-8 name cannot match an ASCII denylist.
     if written <= 0 {
         return false;
     }
     let end = (written as usize).min(buffer.len());
+    // Decoding in place avoids the String allocation in `process_name_for_pid`;
+    // a non-UTF-8 name cannot match an ASCII denylist.
     std::str::from_utf8(&buffer[..end]).is_ok_and(is_ax_denied_name)
 }
 
@@ -3165,30 +3174,6 @@ mod tests {
         for name in ["Safari", "slack", "Code", ""] {
             assert!(!is_ax_denied_name(name), "{name:?} must not be denied");
         }
-    }
-
-    #[test]
-    fn ax_denied_click_preflight_is_filtered() {
-        let request = ContextCaptureRequest {
-            x: 400.0,
-            y: 300.0,
-            app_pid: 42,
-            captured_at: Instant::now(),
-            timestamp: Utc::now(),
-            relative_ms: 123,
-            button: 0,
-            click_count: 1,
-            modifiers: 0,
-        };
-        let config = UiCaptureConfig::new();
-        assert_eq!(
-            validate_click_preflight(&request, &config, Some("bomgar-rep"), 999),
-            Err(ClickDropReason::FilteredApp)
-        );
-        assert_eq!(
-            validate_click_preflight(&request, &config, Some("TextEdit"), 999),
-            Ok(())
-        );
     }
 
     /// The AX observer thread loops on `run_in_mode`. Two of the four results

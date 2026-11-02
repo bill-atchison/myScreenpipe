@@ -761,6 +761,16 @@ pub(super) fn check_focused_window_filters(
     .map_err(anyhow::Error::msg)
 }
 
+/// App-level filters for an AX-denied app. Reading its window title is an AX
+/// request, which is what hangs it, so the filters run with an empty title.
+fn denied_app_filter_result(
+    config: &TreeWalkerConfig,
+    app_name: String,
+) -> FocusedWindowFilterResult {
+    let excluded = is_excluded_app(&app_name.to_lowercase());
+    apply_focused_window_filters(config, app_name, String::new(), false, excluded)
+}
+
 fn check_focused_window_filters_inner(
     config: &TreeWalkerConfig,
 ) -> Result<FocusedWindowFilterResult> {
@@ -768,17 +778,8 @@ fn check_focused_window_filters_inner(
         Some(focused) => focused,
         None => return Ok(FocusedWindowFilterResult::NotFound),
     };
-    // Reading the window title is an AX request to the app, which is what hangs
-    // a denied one. Apply the app-level filters with an empty title instead.
     if crate::platform::macos::is_ax_denied_pid(pid) {
-        let excluded = is_excluded_app(&app_name.to_lowercase());
-        return Ok(apply_focused_window_filters(
-            config,
-            app_name,
-            String::new(),
-            false,
-            excluded,
-        ));
+        return Ok(denied_app_filter_result(config, app_name));
     }
     let _ = focused_app.set_messaging_timeout_secs(config.element_timeout_secs);
 
@@ -829,10 +830,17 @@ impl MacosTreeWalker {
             };
 
         // Must stay ahead of every AX call below, including the enhanced-mode
-        // write. NotFound, not Skipped: the engine drops a Skipped frame but
-        // falls back to OCR for NotFound, so the denied app is still recorded.
+        // write. Privacy filters still apply: the engine's OCR path never checks
+        // include/ignore patterns, so a filtered app must be Skipped here. When
+        // allowed, return NotFound rather than Skipped, because the engine drops
+        // a Skipped frame but falls back to OCR for NotFound.
         if crate::platform::macos::is_ax_denied_pid(pid) {
-            return Ok(TreeWalkResult::NotFound);
+            return Ok(match denied_app_filter_result(&self.config, app_name) {
+                FocusedWindowFilterResult::Skipped(reason) => TreeWalkResult::Skipped(reason),
+                FocusedWindowFilterResult::Allowed { .. } | FocusedWindowFilterResult::NotFound => {
+                    TreeWalkResult::NotFound
+                }
+            });
         }
 
         // Skip excluded apps (password managers, screenshot overlays, etc.)
@@ -2871,6 +2879,25 @@ fn fill_ax_props(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The OCR path never checks include patterns, so an AX-denied app must be
+    /// filtered here or it would be recorded despite an include list.
+    #[test]
+    fn ax_denied_app_filters_honor_include_list() {
+        let app = || "Representative Console".to_string();
+        let mut config = TreeWalkerConfig::default();
+        assert!(matches!(
+            denied_app_filter_result(&config, app()),
+            FocusedWindowFilterResult::Allowed { .. }
+        ));
+
+        config.included_windows = vec!["Safari".into()];
+        config.compile_patterns();
+        assert!(matches!(
+            denied_app_filter_result(&config, app()),
+            FocusedWindowFilterResult::Skipped(SkipReason::NotInIncludeList)
+        ));
+    }
 
     #[test]
     fn child_batch_validates_types_and_retains_handles() {
