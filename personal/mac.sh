@@ -43,18 +43,24 @@ cmd="${1:-}"; shift || true
 case "$cmd" in
   build)
     branch="${1:-$(git branch --show-current)}"
+    [ -n "$branch" ] || { echo "error: detached HEAD; pass a branch" >&2; exit 1; }
+    # Also rejects a leading '-', which fetch/switch would parse as an option.
+    git check-ref-format --branch "$branch" >/dev/null || { echo "error: invalid branch name '$branch'" >&2; exit 1; }
+    qb=$(printf '%q' "$branch")
     git fetch -q origin "$branch" || { echo "error: origin/$branch not found; push it first" >&2; exit 1; }
     if [ -n "$(git rev-list "origin/$branch..$branch" 2>/dev/null)" ]; then
       echo "error: $branch has commits not on origin; push them first (the Mac builds origin/$branch)" >&2
       exit 1
     fi
     onmac "
+      # A failed fetch, switch or ff-only merge must not fall through to building stale code.
+      setopt err_exit
       # Native builds rewrite tracked gen/schemas (AGENTS.md); drop only that noise.
       git checkout -- apps/screenpipe-app-tauri/src-tauri/gen/schemas
       git diff --quiet && git diff --cached --quiet || { echo 'error: Mac checkout has local changes' >&2; exit 1; }
-      git fetch -q origin $(printf '%q' "$branch")
-      git switch -q $(printf '%q' "$branch") 2>/dev/null || git switch -q -c $(printf '%q' "$branch") --track origin/$(printf '%q' "$branch")
-      git merge -q --ff-only origin/$(printf '%q' "$branch")
+      git fetch -q origin $qb
+      git switch -q $qb 2>/dev/null || git switch -q -c $qb --track origin/$qb
+      git merge -q --ff-only origin/$qb
       git log -1 --oneline
       cd apps/screenpipe-app-tauri && bun install --frozen-lockfile && bun run build:tauri:dev
     "
@@ -103,7 +109,12 @@ case "$cmd" in
   logs)
     follow=""; [ "${1:-}" = "-f" ] && { follow="-F"; shift; }
     lines="${1:-100}"
-    onmac "tail -n $(printf '%q' "$lines") $follow \"\$(ls -t ~/.screenpipe-dev/screenpipe-app.*.log | head -1)\""
+    # (N) makes an empty glob expand to nothing instead of zsh's "no matches found".
+    onmac "
+      logs=(~/.screenpipe-dev/screenpipe-app.*.log(N))
+      [ \${#logs} -gt 0 ] || { echo 'no dev logs yet' >&2; exit 1; }
+      tail -n $(printf '%q' "$lines") $follow \"\$(ls -t \$logs | head -1)\"
+    "
     ;;
   status)
     onmac "
@@ -114,6 +125,6 @@ case "$cmd" in
     "
     ;;
   *)
-    sed -n '5,10s/^# \{0,1\}//p' "$0"; exit 1
+    sed -n -e '/^# Edit on the/s/^# //p' -e '/^#   personal\/mac\.sh/s/^# //p' "$0"; exit 1
     ;;
 esac
