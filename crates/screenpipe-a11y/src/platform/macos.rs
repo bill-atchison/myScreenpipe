@@ -1489,6 +1489,13 @@ fn emit_focus_state(state: &ObserverCallbackState, focused_elem: Option<&ax::UiE
         state.current_focus.store(Arc::new(InputFocus::default()));
         return;
     };
+    // Window title and focused-element reads below are AX requests to the
+    // frontmost app. A late notification from the previous app, or the
+    // `observed_pid == pid` refresh, can land here after a switch to a denied one.
+    if is_ax_denied_name(&name) {
+        state.current_focus.store(Arc::new(InputFocus::default()));
+        return;
+    }
     let window_title = if state.config.should_capture_app(&name) {
         get_focused_window_title(pid)
     } else {
@@ -1676,7 +1683,7 @@ fn run_app_observer(
 
     let mut reattach_observer = || {
         let state = unsafe { &*callback_state_ptr };
-        let Some((pid, _name)) = get_focused_app_info() else {
+        let Some((pid, name)) = get_focused_app_info() else {
             state.current_focus.store(Arc::new(InputFocus::default()));
             return false;
         };
@@ -1688,6 +1695,15 @@ fn run_app_observer(
 
         if let Some(existing) = observer.take() {
             run_loop.remove_src(existing.run_loop_src(), run_loop_mode);
+        }
+
+        // Even creating an observer and registering notifications are AX
+        // requests to the target, which is what hangs a denied app. Recording
+        // `observed_pid` stops the periodic refresh from retrying every tick.
+        if is_ax_denied_name(&name) {
+            observed_pid = pid;
+            state.current_focus.store(Arc::new(InputFocus::default()));
+            return true;
         }
 
         let app = ax::UiElement::with_app_pid(pid);
@@ -1823,6 +1839,48 @@ fn get_focused_app_info() -> Option<(i32, String)> {
     // pid label instead of taking down the recorder.
     let name = process_name_for_pid(pid).unwrap_or_else(|| format!("pid-{pid}"));
     Some((pid, name))
+}
+
+/// Processes screenpipe must never send an AX request to. Matched as a
+/// case-insensitive substring of the `proc_name` process name.
+///
+/// BeyondTrust/Bomgar Representative Console (`bomgar-rep`, a Qt app) freezes
+/// while it answers screenpipe's AXChildren walk: Qt builds accessibility
+/// objects for its huge child list on the app's main thread. Its display name
+/// is "Representative Console", so a name-based `ignoredWindows` entry cannot
+/// match it, and ignoring the window would also drop its frames. Denying at the
+/// AX layer instead lets the OCR fallback keep recording them.
+const AX_DENIED_PROCESSES: &[&str] = &["bomgar-rep"];
+
+/// Allocation-free so it is safe on the click worker and observer paths.
+pub(crate) fn is_ax_denied_name(name: &str) -> bool {
+    AX_DENIED_PROCESSES.iter().any(|denied| {
+        name.as_bytes()
+            .windows(denied.len())
+            .any(|window| window.eq_ignore_ascii_case(denied.as_bytes()))
+    })
+}
+
+/// One `proc_name` call; use `is_ax_denied_name` when the name is already known.
+pub(crate) fn is_ax_denied_pid(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let mut buffer = [0_u8; PROCESS_NAME_BUFFER_SIZE];
+    let written = unsafe {
+        proc_name(
+            pid,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            buffer.len() as u32,
+        )
+    };
+    // Compare on the raw bytes to avoid the String allocation in
+    // `process_name_for_pid`; a non-UTF-8 name cannot match an ASCII denylist.
+    if written <= 0 {
+        return false;
+    }
+    let end = (written as usize).min(buffer.len());
+    std::str::from_utf8(&buffer[..end]).is_ok_and(is_ax_denied_name)
 }
 
 fn process_name_for_pid(pid: i32) -> Option<String> {
@@ -2104,7 +2162,7 @@ fn validate_click_preflight(
     // Preserve the existing privacy boundary: a fully excluded target app is
     // never AX-inspected. Scoped/window filters necessarily run after AXWindow
     // resolution below.
-    if !config.should_capture_app(app_name) {
+    if !config.should_capture_app(app_name) || is_ax_denied_name(app_name) {
         return Err(ClickDropReason::FilteredApp);
     }
     Ok(())
@@ -3095,6 +3153,43 @@ mod macos_click_attribution_eval;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ax_denied_name_matches_bomgar_rep_case_insensitively() {
+        assert!(is_ax_denied_name("bomgar-rep"));
+        assert!(is_ax_denied_name("Bomgar-Rep"));
+    }
+
+    #[test]
+    fn ax_denied_name_rejects_other_apps() {
+        for name in ["Safari", "slack", "Code", ""] {
+            assert!(!is_ax_denied_name(name), "{name:?} must not be denied");
+        }
+    }
+
+    #[test]
+    fn ax_denied_click_preflight_is_filtered() {
+        let request = ContextCaptureRequest {
+            x: 400.0,
+            y: 300.0,
+            app_pid: 42,
+            captured_at: Instant::now(),
+            timestamp: Utc::now(),
+            relative_ms: 123,
+            button: 0,
+            click_count: 1,
+            modifiers: 0,
+        };
+        let config = UiCaptureConfig::new();
+        assert_eq!(
+            validate_click_preflight(&request, &config, Some("bomgar-rep"), 999),
+            Err(ClickDropReason::FilteredApp)
+        );
+        assert_eq!(
+            validate_click_preflight(&request, &config, Some("TextEdit"), 999),
+            Ok(())
+        );
+    }
 
     /// The AX observer thread loops on `run_in_mode`. Two of the four results
     /// come back instantly: `Finished` when the mode has no sources or timers

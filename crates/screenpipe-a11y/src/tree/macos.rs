@@ -768,6 +768,18 @@ fn check_focused_window_filters_inner(
         Some(focused) => focused,
         None => return Ok(FocusedWindowFilterResult::NotFound),
     };
+    // Reading the window title is an AX request to the app, which is what hangs
+    // a denied one. Apply the app-level filters with an empty title instead.
+    if crate::platform::macos::is_ax_denied_pid(pid) {
+        let excluded = is_excluded_app(&app_name.to_lowercase());
+        return Ok(apply_focused_window_filters(
+            config,
+            app_name,
+            String::new(),
+            false,
+            excluded,
+        ));
+    }
     let _ = focused_app.set_messaging_timeout_secs(config.element_timeout_secs);
 
     let window = match resolve_focused_window(&focused_app, &app_name, pid) {
@@ -815,6 +827,13 @@ impl MacosTreeWalker {
                 Some(focused) => focused,
                 None => return Ok(TreeWalkResult::NotFound),
             };
+
+        // Must stay ahead of every AX call below, including the enhanced-mode
+        // write. NotFound, not Skipped: the engine drops a Skipped frame but
+        // falls back to OCR for NotFound, so the denied app is still recorded.
+        if crate::platform::macos::is_ax_denied_pid(pid) {
+            return Ok(TreeWalkResult::NotFound);
+        }
 
         // Skip excluded apps (password managers, screenshot overlays, etc.)
         let app_lower = app_name.to_lowercase();
