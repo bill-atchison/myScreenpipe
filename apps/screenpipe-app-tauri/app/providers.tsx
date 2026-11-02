@@ -116,7 +116,11 @@ export const Providers = forwardRef<
       // plus pollute prod analytics with test traffic.
       const isE2E = process.env.NEXT_PUBLIC_SCREENPIPE_E2E === "true";
       const isBrowserDev = Boolean(process.env.NEXT_PUBLIC_SCREENPIPE_WEB_DEV);
-      if (isDebug || isE2E || isBrowserDev) return;
+      // Personal build (PERSONAL.md): no PostHog at all, not even flag fetches.
+      const isPersonal = /^(1|true|yes|on)$/i.test(
+        (process.env.NEXT_PUBLIC_SCREENPIPE_PERSONAL_BUILD ?? "").trim(),
+      );
+      if (isDebug || isE2E || isBrowserDev || isPersonal) return;
       // Read the cached analytics preference to sync PostHog opt-in/out
       // after init. undefined = first boot → allow capturing (default true).
       const cachedEnabled = readCachedAnalyticsEnabled();

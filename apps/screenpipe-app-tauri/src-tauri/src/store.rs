@@ -3050,6 +3050,11 @@ pub fn init_store(app: &AppHandle) -> Result<SettingsStore, String> {
         }
     }
 
+    // Personal-build defaults for a new store only; see PERSONAL.md.
+    if crate::personal::apply_new_profile_defaults(&mut store, is_new_store) {
+        should_save = true;
+    }
+
     let managed_mode = crate::app_mode::for_settings(&store);
     if restore_headed_mode_for_consumer(&mut store, managed_mode) {
         tracing::info!(

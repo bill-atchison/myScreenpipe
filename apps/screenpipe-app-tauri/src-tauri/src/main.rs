@@ -120,6 +120,7 @@ mod engine_events;
 mod monitor_events;
 mod owned_browser_cookies;
 mod permissions;
+mod personal;
 mod pi;
 mod pi_command_queue;
 mod power_awake;
@@ -514,6 +515,8 @@ async fn main() {
     // resolve the data directory or focus port. No-op in release builds.
     // See `dev_isolation`.
     dev_isolation::apply();
+    // Personal-build telemetry default; see PERSONAL.md.
+    personal::apply_process_env();
 
     let focus_port: u16 = std::env::var("SCREENPIPE_FOCUS_PORT")
         .ok()
