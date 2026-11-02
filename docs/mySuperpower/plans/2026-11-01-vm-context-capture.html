@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VM Context Capture Implementation Plan</title>
+<style>
+  :root{
+    --paper:#f4efe1; --ink:#221f18; --maroon:#8a2b27; --meta-bg:#e9e1cd;
+    --label:#6d5f4e; --value:#2b2820; --amber:#a8762b;
+    --serif:Georgia,'Times New Roman',serif;
+    --mono:ui-monospace,'Cascadia Mono',Consolas,'Courier New',monospace;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--paper);color:var(--ink);
+       font-family:var(--serif);padding:3.5rem 2rem;}
+  .wrap{max-width:1080px;margin:0 auto;}
+  main p,main ul,main ol{max-width:104ch;}
+  main pre{max-width:100%;overflow-x:auto;}
+  .eyebrow{font-family:var(--mono);text-transform:uppercase;letter-spacing:.35em;
+           font-size:.8rem;font-weight:700;color:var(--maroon);margin:0 0 1.1rem;}
+  h1{font-family:var(--serif);font-weight:700;font-size:clamp(2.6rem,6vw,4rem);
+     line-height:1.04;letter-spacing:-.01em;margin:0 0 .9rem;}
+  .subtitle{font-family:var(--serif);font-style:italic;font-weight:700;
+            font-size:clamp(1.25rem,2.4vw,1.7rem);line-height:1.3;
+            margin:0 0 1.9rem;max-width:52ch;}
+  .meta-card{display:grid;grid-template-columns:max-content 1fr;column-gap:1.75rem;
+             row-gap:.55rem;align-items:baseline;background:var(--meta-bg);
+             border-radius:14px;border-left:6px solid var(--maroon);padding:1.4rem 1.85rem;}
+  .meta-card dt{font-family:var(--mono);color:var(--label);font-size:.95rem;font-weight:400;}
+  .meta-card dd{font-family:var(--mono);color:var(--value);font-size:.95rem;margin:0;word-break:break-word;}
+  .agentic-note{background:var(--meta-bg);border-radius:14px;padding:1.25rem 1.85rem;
+                margin-top:1rem;font-family:var(--mono);color:var(--value);
+                font-size:.92rem;line-height:1.6;}
+
+  /* ---- body ---- */
+  main{margin-top:3rem;line-height:1.6;font-size:1.04rem;}
+  main h2{font-size:1.6rem;margin:2.6rem 0 .8rem;padding-top:1.1rem;
+          border-top:1px solid rgba(34,31,24,.18);}
+  main h3{font-size:1.15rem;margin:1.4rem 0 .4rem;color:var(--value);}
+  main code{font-family:var(--mono);font-size:.86em;background:var(--meta-bg);
+            padding:.05rem .35rem;border-radius:4px;}
+  main pre{background:#2b2820;color:#f4efe1;padding:1rem 1.25rem;border-radius:10px;
+           font-size:.84rem;line-height:1.5;}
+  main pre code{background:none;padding:0;color:inherit;}
+  main table{width:100%;border-collapse:collapse;margin:.8rem 0 1.2rem;font-size:.95rem;}
+  main th{text-align:left;font-family:var(--mono);font-size:.76rem;letter-spacing:.12em;
+          text-transform:uppercase;color:var(--label);border-bottom:2px solid var(--maroon);padding:.45rem .55rem;}
+  main td{border-bottom:1px solid rgba(34,31,24,.14);padding:.5rem .55rem;vertical-align:top;}
+  section.task{border-left:4px solid var(--maroon);padding:.2rem 0 .6rem 1.4rem;margin:2.2rem 0;}
+  section.task h2{border-top:none;margin-top:.4rem;padding-top:0;}
+  section.task h2 .n{font-family:var(--mono);font-size:.8rem;color:var(--maroon);
+                     letter-spacing:.2em;display:block;}
+  .files{background:var(--meta-bg);border-radius:10px;padding:.7rem 1.1rem;font-size:.95rem;}
+  .files p{margin:.2rem 0;}
+  ol.steps{list-style:none;padding-left:0;}
+  li.step{position:relative;padding-left:2rem;margin:.65rem 0;}
+  li.step::before{content:"";position:absolute;left:0;top:.3rem;width:1rem;height:1rem;
+                  border:2px solid var(--amber);border-radius:3px;background:transparent;}
+  li.step > strong:first-child{color:var(--maroon);}
+  .note{border-left:4px solid var(--amber);background:var(--meta-bg);padding:.7rem 1.1rem;
+        border-radius:0 10px 10px 0;margin:1rem 0;font-size:.97rem;}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <p class="eyebrow">Plan &middot; Implementation</p>
+      <h1>VM Context Capture Implementation Plan</h1>
+      <p class="subtitle">TDD: label the Mac's Parallels frames with the Windows app and title sent by a tiny VM helper over SSH.</p>
+      <dl class="meta-card">
+        <dt>Date</dt><dd>2026-11-01</dd>
+        <dt>Branch</dt><dd>task/5925d7b5 (myScreenpipe)</dd>
+        <dt>Spec</dt><dd>docs/mySuperpower/specs/2026-11-01-vm-context-capture-design.html</dd>
+      </dl>
+      <p class="agentic-note">REQUIRED SUB-SKILL: execute task-by-task with TDD (red &rarr; green &rarr; commit) using subagent-driven-development (recommended) or executing-plans. Codex review of this plan + spec before implementation; per-task two-stage review. Steps are checkbox-styled; track progress with your task tools, not by editing this file.</p>
+    </header>
+
+    <main>
+      <h2>Overview</h2>
+      <p><strong>Goal:</strong> when Parallels is the frontmost Mac app, Mac screenpipe frames carry the foreground Windows app and window title, which a small helper inside the VM reports.</p>
+      <p><strong>Architecture:</strong> a new <code>external_context</code> module in screenpipe-engine holds the latest context, with epoch/seq ordering and a 5&nbsp;s freshness window on a monotonic clock. A new authenticated route, <code>POST /context/external</code>, feeds it. A small hook in <code>do_capture</code> attaches guest labels for <em>storage only</em>, plus a guest ignore/incognito check. Every admission and processing decision keeps the host values. A C# .NET&nbsp;10 helper in the VM tracks the foreground window through WinEvent hooks and posts through a supervised <code>ssh -L</code> tunnel.</p>
+      <p><strong>Tech stack:</strong> Rust (axum, arc-swap, tokio), crate <code>screenpipe-engine</code>. C# .NET&nbsp;10 WinExe using Win32 P/Invoke and Windows OpenSSH.</p>
+      <p><strong>Out of this plan:</strong> the MultiTerminal title (spec 5.4) lives in another repo and gets its own ticket and plan. Nothing here depends on it.</p>
+
+      <h2>Global constraints</h2>
+      <ul>
+        <li>The Mac API stays on <code>127.0.0.1:3030</code>; never <code>--listen-on-lan</code>. The tunnel binds <code>127.0.0.1:3031</code> in the VM.</li>
+        <li>The route returns <strong>403</strong> unless API auth is enabled (<code>AppState.api_auth</code>), and 204 on success.</li>
+        <li>Bounds: <code>app_name</code> ≤ 512 chars, <code>window_title</code> ≤ 1024 chars, and <code>source</code> must be <code>"parallels-vm"</code>. An empty <code>app_name</code> clears the context.</li>
+        <li>Freshness: at most <strong>5&nbsp;s</strong> by the Mac's monotonic clock. Helper heartbeat every <strong>2&nbsp;s</strong>.</li>
+        <li>Host app matched for an override: <code>"Parallels Desktop"</code>, case-insensitive (seen in Mac frames on 2026-11-01).</li>
+        <li>Unknown guest app: the frame is recorded as today, labelled <code>Parallels Desktop</code>. VM pixels are never skipped or masked for lack of context (Owner decision).</li>
+        <li>Hot path: on a miss the hook does one atomic load and no allocation. No locks, no awaits.</li>
+        <li>Native Rust tests run on the Mac (<code>ssh mac</code>, <code>~/Workspace/myScreenpipe</code>), because the VM has no pinned toolchain or sccache.</li>
+        <li>Rust and TS source files carry the AGENTS.md screenpipe header. C# helper files carry it with <code>//</code>.</li>
+      </ul>
+
+      <div class="note"><strong>Codex review, round 1 (NOT READY → fixed in this revision):</strong>
+        <ul>
+          <li><strong>Admission must not change.</strong> Guest labels are used <em>only</em> for storage and for a separate guest ignore + incognito check. The include list, URL policy, DRM, meeting classification and OCR decisions all keep the host values. This corrects spec 5.2's wording, which said relabelling runs "before the gates". The Owner's intent, "ignore Chrome applies inside the VM, recording comes first", is unchanged.</li>
+          <li><strong>No override on the startup capture</strong>, which passes focus ownership as <code>true</code> unconditionally (<code>event_driven_capture.rs:1218</code>).</li>
+          <li><strong>Epochs are ordered</strong> (the helper's start time in ms), and a clear keeps a tombstone, so a late or stale post can't revive old context.</li>
+          <li><strong>Tunnel ownership is checked</strong> by the owning PID of the 3031 listener, not just a <code>/health</code> response.</li>
+          <li><strong>Tests that touch <code>GLOBAL</code></strong> share one lock. Route tests go through the real router, middleware included.</li>
+          <li><strong>The cargo test command is fixed:</strong> it takes one filter.</li>
+        </ul></div>
+
+      <h2>Review focus</h2>
+      <ol>
+        <li><strong>A guest app switch between the screenshot and the hook</strong> must give <code>Parallels Desktop</code>, never the new label. Test in Task 3: <code>stale_seq_does_not_override</code>.</li>
+        <li><strong>Posts arriving out of order</strong> (an older seq after a newer one, or a restarted helper with a new epoch) must keep the newest state. Test in Task 1: <code>older_seq_is_rejected</code> and <code>new_epoch_replaces</code>.</li>
+        <li><strong>The helper stops (VM sleeps or locks)</strong>: after 5&nbsp;s, frames say <code>Parallels Desktop</code> again. Test in Task 1: <code>expires_after_five_seconds</code>. Lock handling in Task 4.</li>
+        <li><strong>API auth disabled, or a missing or wrong token</strong>: the route never accepts context. Test in Task 2: <code>rejects_when_auth_disabled</code>, plus the middleware cases.</li>
+        <li><strong>Port 3031 held by another process</strong>: the helper must not send the key. Task 4: <code>--once</code>, the readiness check, and a manual check with a dummy listener.</li>
+      </ol>
+
+      <section class="task">
+        <h2><span class="n">TASK 1</span>Context store with ordering and freshness</h2>
+        <div class="files">
+          <p>Create: <code>crates/screenpipe-engine/src/external_context.rs</code> (module plus <code>#[cfg(test)] mod tests</code>)</p>
+          <p>Modify: <code>crates/screenpipe-engine/src/lib.rs</code> (add <code>pub mod external_context;</code>)</p>
+        </div>
+        <h3>Interfaces</h3>
+<pre><code>pub struct ExternalContext { pub app_name: String, pub window_title: String,
+                             pub epoch: u64, pub seq: u64, pub received_at: std::time::Instant }
+pub enum Accept { Stored, Cleared, Stale }   // Stale = (epoch, seq) not newer than current
+// accept iff (epoch, seq) &gt; stored lexicographically; epoch = helper start time (unix ms).
+// A clear stores a tombstone (app_name "") that keeps its (epoch, seq).
+#[cfg(test)] pub static TEST_LOCK: std::sync::Mutex&lt;()&gt;;  // held by tests touching GLOBAL
+pub fn accept(store: &amp;ContextStore, epoch: u64, seq: u64, app_name: String,
+              window_title: String, now: Instant) -&gt; Accept
+pub fn current_seq(store: &amp;ContextStore) -&gt; Option&lt;(u64, u64)&gt;       // (epoch, seq)
+pub fn override_for(store: &amp;ContextStore, host_app: Option&lt;&amp;str&gt;, monitor_hosts_focus: bool,
+                    seq_at_screenshot: Option&lt;(u64, u64)&gt;, now: Instant)
+                    -&gt; Option&lt;(String, String)&gt;           // (app_name, window_title)
+pub fn clear(store: &amp;ContextStore)
+pub type ContextStore = arc_swap::ArcSwapOption&lt;ExternalContext&gt;;
+pub static GLOBAL: ContextStore;                         // ArcSwapOption::const_empty()</code></pre>
+        <ol class="steps">
+          <li class="step"><strong>Write the failing tests</strong> in <code>external_context.rs</code>, each on a fresh <code>ContextStore</code>:
+            <code>stores_and_overrides</code> (accept then override_for("Parallels Desktop", true, current seq, now) → <code>Some(("MultiTerminal","t"))</code>);
+            <code>wrong_host_app_is_none</code> ("Safari" → None);
+            <code>monitor_without_focus_is_none</code>;
+            <code>expires_after_five_seconds</code> (now + 5001&nbsp;ms → None; + 4999&nbsp;ms → Some);
+            <code>older_seq_is_rejected</code> (seq 5 then 4 → <code>Accept::Stale</code>, override still from 5);
+            <code>new_epoch_replaces</code> (epoch 1 seq 9, then epoch 2 seq 1 → Stored);
+            <code>older_epoch_is_rejected</code> (epoch 2 seq 1 stored, then epoch 1 seq 99 → Stale);
+            <code>empty_app_clears</code> (→ <code>Accept::Cleared</code>, override None);
+            <code>post_after_clear_needs_newer_seq</code> (clear at (1,5); then (1,4) → Stale, (1,6) → Stored);
+            <code>host_match_is_case_insensitive</code> ("parallels desktop" → Some).</li>
+          <li class="step"><strong>Run the tests on the Mac and confirm they fail:</strong> <code>cargo test -p screenpipe-engine --lib external_context</code>. Expected: a compile error, because the module doesn't exist yet.</li>
+          <li class="step"><strong>Implement</strong> the interfaces above. <code>accept</code> uses <code>rcu</code> to compare (epoch, seq) atomically: a new epoch or a higher seq wins. <code>override_for</code> clones strings only on a match. A <code>seq_at_screenshot</code> that differs from the stored (epoch, seq) returns None.</li>
+          <li class="step"><strong>Run the tests and confirm they pass</strong> (same command): 10 pass.</li>
+          <li class="step"><strong>Commit:</strong> <code>git add crates/screenpipe-engine/src/external_context.rs crates/screenpipe-engine/src/lib.rs</code>, message <code>feat(engine): external context store for VM app labels</code>.</li>
+        </ol>
+      </section>
+
+      <section class="task">
+        <h2><span class="n">TASK 2</span>Authenticated route <code>POST /context/external</code></h2>
+        <div class="files">
+          <p>Create: <code>crates/screenpipe-engine/src/routes/external_context.rs</code></p>
+          <p>Modify: <code>crates/screenpipe-engine/src/routes/mod.rs</code> (add <code>pub mod external_context;</code>); <code>crates/screenpipe-engine/src/server.rs</code> (register <code>.post("/context/external", post_external_context)</code> next to <code>.post("/add", add_to_database)</code>, ≈:939)</p>
+        </div>
+        <h3>Interfaces</h3>
+<pre><code>#[derive(Deserialize)] pub struct ExternalContextBody { pub source: String, pub epoch: u64, pub seq: u64,
+                                                       pub app_name: String, pub window_title: String }
+pub(crate) async fn post_external_context(State(state): State&lt;Arc&lt;AppState&gt;&gt;,
+                                          Json(body): Json&lt;ExternalContextBody&gt;) -&gt; StatusCode
+// 403 if !state.api_auth; 400 if source != "parallels-vm" or a bound is exceeded;
+// 204 for Stored/Cleared/Stale (a stale post is not an error). Consumes external_context::accept(&amp;GLOBAL, ..).</code></pre>
+        <ol class="steps">
+          <li class="step"><strong>Write the failing tests.</strong> They go through the real router with its auth middleware, as existing router tests in <code>server.rs</code> do, and each holds <code>TEST_LOCK</code>:
+            <code>rejects_when_auth_disabled</code> (403);
+            <code>rejects_missing_token</code> and <code>rejects_wrong_token</code> (403, the middleware's status, <code>server.rs:1691</code>);
+            <code>rejects_unknown_source</code> (400);
+            <code>rejects_oversized_app</code> (513 chars → 400);
+            <code>rejects_oversized_title</code> (1025 chars → 400);
+            <code>empty_app_clears_via_route</code> (204, then override None);
+            <code>accepts_valid_post</code> (204, then <code>current_seq(&amp;GLOBAL)</code> equals the posted (epoch, seq)).
+            The existing wake test in <code>sleep_monitor.rs</code> (≈:985) also takes <code>TEST_LOCK</code>, because wake now clears <code>GLOBAL</code>.</li>
+          <li class="step"><strong>Run the tests on the Mac and confirm they fail:</strong> <code>cargo test -p screenpipe-engine --lib external_context</code>. One filter matches both <code>external_context</code> modules. Expected: unresolved items.</li>
+          <li class="step"><strong>Implement the handler and register the route.</strong> No new exempt path: the auth middleware already requires the bearer token whenever auth is on.</li>
+          <li class="step"><strong>Run the tests and confirm they pass:</strong> 8 route tests pass, plus Task 1's.</li>
+          <li class="step"><strong>Commit</strong> these three files, message <code>feat(engine): POST /context/external (auth required)</code>.</li>
+        </ol>
+      </section>
+
+      <section class="task">
+        <h2><span class="n">TASK 3</span>Capture hook: guest labels for storage only</h2>
+        <div class="files">
+          <p>Modify: <code>crates/screenpipe-engine/src/event_driven_capture.rs</code>:
+            <ul>
+              <li>a new <code>is_startup: bool</code> parameter on <code>do_capture</code>: <code>true</code> at the startup call (≈:1207, which passes <code>CaptureTrigger::Manual</code> and focus <code>true</code> unconditionally), <code>false</code> at every live-loop call. Live forced captures also use <code>Manual</code> (≈:1853), so the trigger can't tell startup apart;</li>
+              <li>the seq snapshot just before the ScreenCaptureKit screenshot in <code>do_capture</code> (≈:3150-3165);</li>
+              <li>the guest lookup right after the metadata resolve (≈:3573-3587);</li>
+              <li>the guest ignore/incognito check after the existing privacy and filter gates (≈:3634-3685);</li>
+              <li>passing the guest labels into <code>CaptureContext</code> (≈:3761-3787).</li>
+            </ul>
+            Also <code>crates/screenpipe-capture/src/paired_capture.rs</code>: a new <code>CaptureContext</code> field, used only at the DB insert (≈:743-765). And <code>crates/screenpipe-engine/src/sleep_monitor.rs</code>: <code>external_context::clear(&amp;GLOBAL)</code> in the wake hook (≈:571).</p>
+          <p>Test: <code>external_context.rs</code> tests.</p>
+        </div>
+        <h3>Interfaces</h3>
+<pre><code>// external_context.rs (pure, unit-testable):
+pub fn guest_labels(store: &amp;ContextStore, host_app: Option&lt;&amp;str&gt;, monitor_hosts_focus: bool,
+                    is_startup: bool, seq_at_screenshot: Option&lt;(u64, u64)&gt;, now: Instant)
+                    -&gt; Option&lt;(String, String)&gt;   // None when is_startup or any override_for gate fails
+// paired_capture.rs, CaptureContext:
+pub stored_labels: Option&lt;(String, String)&gt;,   // when Some, replaces app_name/window_name at the
+                                               // DB insert ONLY; every other use keeps the host values
+// do_capture: host app_name/window_name stay untouched for every gate (lock screen, include list,
+// URL policy, DRM, bounds, meeting classification, OCR choice). If guest_labels is Some, run
+// the existing ignore-list + incognito title check on the guest pair; a match drops the frame
+// (the same result an ignored host app gives). Otherwise set CaptureContext.stored_labels.</code></pre>
+        <ol class="steps">
+          <li class="step"><strong>Write the failing tests:</strong>
+            <code>guest_labels_when_fresh</code> (host "Parallels Desktop", focus true, not startup, matching seq → Some(("MultiTerminal","t")));
+            <code>no_guest_labels_on_startup</code> (is_startup true → None);
+            <code>no_guest_labels_for_other_host</code> ("Safari" → None);
+            <code>stale_seq_does_not_override</code> (seq_at_screenshot (1,1), store at (1,2) → None).</li>
+          <li class="step"><strong>Run them on the Mac and confirm they fail:</strong> <code>cargo test -p screenpipe-engine --lib external_context</code>.</li>
+          <li class="step"><strong>Implement <code>guest_labels</code></strong> over <code>override_for</code>. Add <code>stored_labels</code> to <code>CaptureContext</code> (default None at every construction site) and use it only in the <code>insert_snapshot_frame_with_ocr</code> call. In <code>do_capture</code>, wire the seq snapshot, call <code>guest_labels</code> with the new <code>is_startup</code> parameter, run the guest ignore/incognito check using the same functions the host privacy gate uses, and set <code>stored_labels</code>. Add one <code>ponytail:</code> comment saying host values drive every admission and processing decision on purpose (Codex round 1).</li>
+          <li class="step"><strong>Run the tests and confirm they pass:</strong> 4 new tests pass. Then <code>cargo test -p screenpipe-engine --lib event_driven_capture</code> and <code>cargo test -p screenpipe-capture --lib paired_capture</code>, with no new failures. Record any failures that already exist on base.</li>
+          <li class="step"><strong>Commit</strong> the three files, message <code>feat(engine): store guest app labels for Parallels frames</code>.</li>
+        </ol>
+      </section>
+
+      <section class="task">
+        <h2><span class="n">TASK 4</span>VM helper <code>tools/vm-context-helper</code></h2>
+        <div class="files">
+          <p>Create: <code>tools/vm-context-helper/VmContextHelper.csproj</code> (net10.0-windows, WinExe, nullable on, TreatWarningsAsErrors); <code>Program.cs</code> (arg parsing, lifetime); <code>Foreground.cs</code> (WinEvent hook and name normalisation); <code>Sender.cs</code> (epoch/seq, single-flight, heartbeat); <code>Tunnel.cs</code> (ssh child, Job Object, readiness); <code>install-task.ps1</code> (per-user logon task)</p>
+          <p>Test: <code>tools/vm-context-helper.Tests/</code> (xUnit), covering the pure parts only</p>
+        </div>
+        <h3>Interfaces</h3>
+<pre><code>record ForegroundInfo(string AppName, string WindowTitle);
+static ForegroundInfo? Foreground.Read();                 // GetForegroundWindow + image name + GetWindowTextW
+static string Foreground.NormalizeAppName(string imagePath, string? uwpAppName); // pure; "x.exe" -&gt; "x"
+sealed class Sender { Sender(Uri baseUri, Func&lt;string&gt; readKey, ulong epoch /* start time, unix ms */);
+                      void Publish(ForegroundInfo? info);  // null = clear; keeps latest only
+                      object BuildBody(ForegroundInfo? info); }  // pure: {source,epoch,seq,app_name,window_title}
+sealed class Tunnel { Task&lt;bool&gt; EnsureReadyAsync(CancellationToken ct); event Action? Down; }
+// CLI: VmContextHelper.exe [--once]   (--once prints "app | title" and exits; no network)</code></pre>
+        <ol class="steps">
+          <li class="step"><strong>Write the failing xUnit tests:</strong>
+            <code>Normalize_StripsExe</code> ("C:\\…\\MultiTerminal.exe" → "MultiTerminal");
+            <code>Normalize_UsesUwpName_ForApplicationFrameHost</code>;
+            <code>Body_SeqStrictlyIncreases</code> (two BuildBody calls → seq 1, 2, same epoch);
+            <code>Body_NullIsClear</code> (app_name "" and window_title "");
+            <code>Body_TruncatesTitleTo1024</code>; <code>Send_RereadsKeyOnceOn403</code> (fake <code>HttpMessageHandler</code> answers 403 then 204; the key reader is called twice and exactly two requests are sent).</li>
+          <li class="step"><strong>Run the tests and confirm they fail:</strong> <code>dotnet test tools/vm-context-helper.Tests</code> on the VM.</li>
+          <li class="step"><strong>Implement:</strong>
+            <ul>
+              <li><code>Foreground</code>: <code>SetWinEventHook</code> on <code>EVENT_SYSTEM_FOREGROUND</code> and <code>EVENT_OBJECT_NAMECHANGE</code>, with a message loop on its own STA thread. Skip transient shell windows, as screenpipe's <code>get_focused_app_window_lightweight</code> does.</li>
+              <li><code>Sender</code>: one request at a time; a newer state replaces the pending one. POST <code>/context/external</code> with <code>Authorization: Bearer</code>. Heartbeat every 2&nbsp;s. On a 403, re-read the key once and retry once (the middleware answers 403 for a missing or wrong token); a second 403 logs and waits for the next state change.</li>
+              <li><code>Tunnel</code>: <code>ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -L 127.0.0.1:3031:127.0.0.1:3030 mac</code>, started in a Job Object with kill-on-close. Before any keyed send, confirm the listener on <code>127.0.0.1:3031</code> is owned by the supervised ssh child's PID (via <code>GetExtendedTcpTable</code>, <code>TCP_TABLE_OWNER_PID_LISTENER</code>). If another process owns it, don't send and log once. Restart with backoff from 1&nbsp;s up to 60&nbsp;s. Sending stops on <code>Down</code>.</li>
+              <li>Lock: a hidden window registered with <code>WTSRegisterSessionNotification</code>. On <code>WTS_SESSION_LOCK</code>, publish null and pause heartbeats; on <code>WTS_SESSION_UNLOCK</code>, read the foreground and publish it.</li>
+              <li>Key: read from <code>%APPDATA%\vm-context-helper\api-key</code> and never logged. The log goes to <code>%LOCALAPPDATA%\vm-context-helper\helper.log</code>, at most one line per state change or error, with a 1&nbsp;MB roll.</li>
+            </ul></li>
+          <li class="step"><strong>Run the tests and confirm they pass:</strong> 6 pass. Then <code>dotnet build tools/vm-context-helper -c Release</code> with 0 warnings, and <code>VmContextHelper.exe --once</code> prints the current foreground app and title.</li>
+          <li class="step"><strong>Manual check of the port hijack:</strong> start a dummy listener (<code>python -m http.server 3031 --bind 127.0.0.1</code>), then start the helper. It must log that 3031 is owned by another process, and the dummy server's log must show no request at all.</li>
+          <li class="step"><strong>Commit</strong> the helper, its tests and <code>install-task.ps1</code>, message <code>feat(tools): VM context helper for Parallels app labels</code>.</li>
+        </ol>
+      </section>
+
+      <section class="task">
+        <h2><span class="n">TASK 5</span>Docs, end-to-end check, cut-over (final)</h2>
+        <div class="files">
+          <p>Modify: <code>PERSONAL.md</code> (a "VM context helper" section covering install, getting the key via <code>screenpipe auth token</code>, the tunnel, the privacy note, and the upstream change log rows for <code>event_driven_capture.rs</code>, <code>server.rs</code>, <code>routes/mod.rs</code>, <code>lib.rs</code>, <code>sleep_monitor.rs</code>); regenerate <code>docs/coverage/CORE.md</code> and <code>docs/COVERAGE.md</code> if the coverage check flags them</p>
+        </div>
+        <ol class="steps">
+          <li class="step"><strong>Run the full checks on the Mac:</strong> <code>cargo test -p screenpipe-engine --lib external_context</code> (22 pass: 10 + 8 + 4) and the <code>event_driven_capture</code> suite (no new failures). On the VM: <code>dotnet test tools/vm-context-helper.Tests</code>, then <code>bun docs/coverage/scripts/generate-core-engine-coverage-report.ts --check</code> and the unified <code>--check</code>.</li>
+          <li class="step"><strong>Build the dev app on the Mac</strong> (<code>bun run build:tauri:dev</code>, with <code>NODE_EXTRA_CA_CERTS</code> set) and run it in place of the installed app. This pauses the Owner's recorder, so ask first.</li>
+          <li class="step"><strong>End to end with the Owner:</strong> the helper is installed and running in the VM, and the VM's screenpipe is stopped. Switch between MultiTerminal, Warp and Chrome in the VM. Read the dev DB (<code>frames.app_name</code> / <code>window_name</code> for the last 5 minutes) and confirm it holds those names. Stop the helper, wait more than 5&nbsp;s, and confirm frames say <code>Parallels Desktop</code>. Lock the VM and confirm the same.</li>
+          <li class="step"><strong>Run <code>/simplify</code></strong> on the branch diff, apply the fixes, and re-run the tests above.</li>
+          <li class="step"><strong>Final commit:</strong> <code>PERSONAL.md</code> plus any coverage files, message <code>docs(personal): VM context helper setup</code>.</li>
+          <li class="step"><strong>Cut-over (Owner):</strong> turn off the VM screenpipe's autostart once the end-to-end check passes.</li>
+        </ol>
+      </section>
+
+      <h2>Risk assessment</h2>
+      <table>
+        <tr><th>Risk</th><th>Mitigation</th></tr>
+        <tr><td>An upstream merge conflict in <code>event_driven_capture.rs</code></td><td>The hook is three small call sites; the logic lives in <code>external_context.rs</code>.</td></tr>
+        <tr><td>Mislabelled frames</td><td>A frame is relabelled only when the host app matches, the monitor has focus, the context is under 5&nbsp;s old, and its seq is unchanged since the screenshot. Unit tests cover each condition.</td></tr>
+        <tr><td>The API key leaks inside the VM</td><td>A user-only ACL file, never logged, sent only after the tunnel is verified.</td></tr>
+        <tr><td>Recording regresses</td><td>A miss is an atomic load; no frame is skipped because of this feature. The existing capture suite must stay green.</td></tr>
+      </table>
+
+      <h2>Self-review</h2>
+      <ul>
+        <li><strong>Spec coverage:</strong>
+          <ul>
+            <li>5.2 route and hook: Tasks 1-3.</li>
+            <li>5.3 helper: Task 4.</li>
+            <li>5.5 hardening: Tasks 1, 3 and 4. The seq snapshot, host-only admission, the startup skip and wake-clear are in Task 3; the port check, lock, Job Object and 403 re-read are in Task 4; the auth-off 403 is in Task 2.</li>
+            <li>5.6 verification: Task 5.</li>
+            <li>5.4 MultiTerminal title: deliberately a separate ticket.</li>
+          </ul></li>
+        <li><strong>Type consistency:</strong> <code>ContextStore</code>, <code>GLOBAL</code>, <code>accept</code>, <code>override_for</code>, <code>guest_labels</code>, <code>stored_labels</code>, <code>current_seq</code> and <code>clear</code> are named the same everywhere they appear.</li>
+        <li><strong>Ablation:</strong> <code>guest_labels</code> exists so the hot path is unit-testable without a capture session, which Task 3's tests need. <code>Sender.BuildBody</code> exists for Task 4's tests. There are no config knobs: 5&nbsp;s, 2&nbsp;s and the host app name are constants.</li>
+        <li><strong>Proportion:</strong> signatures and test names only, with no function bodies.</li>
+      </ul>
+    </main>
+  </div>
+</body>
+</html>
