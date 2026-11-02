@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VM Context Capture</title>
+<style>
+  :root{
+    --paper:#f4efe1; --ink:#221f18; --maroon:#8a2b27; --meta-bg:#e9e1cd;
+    --label:#6d5f4e; --value:#2b2820; --amber:#a8762b;
+    --serif:Georgia,'Times New Roman',serif;
+    --mono:ui-monospace,'Cascadia Mono',Consolas,'Courier New',monospace;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--paper);color:var(--ink);
+       font-family:var(--serif);padding:3.5rem 2rem;}
+  .wrap{max-width:880px;margin:0 auto;}
+  main p,main ul,main ol{max-width:84ch;}
+  main pre{max-width:100%;overflow-x:auto;}
+  .eyebrow{font-family:var(--mono);text-transform:uppercase;letter-spacing:.35em;
+           font-size:.8rem;font-weight:700;color:var(--maroon);margin:0 0 1.1rem;}
+  h1{font-family:var(--serif);font-weight:700;font-size:clamp(2.6rem,6vw,4rem);
+     line-height:1.04;letter-spacing:-.01em;margin:0 0 .9rem;}
+  .subtitle{font-family:var(--serif);font-style:italic;font-weight:700;
+            font-size:clamp(1.25rem,2.4vw,1.7rem);line-height:1.3;
+            margin:0 0 1.9rem;max-width:46ch;}
+  .meta-card{display:grid;grid-template-columns:max-content 1fr;column-gap:1.75rem;
+             row-gap:.55rem;align-items:baseline;background:var(--meta-bg);
+             border-radius:14px;border-left:6px solid var(--maroon);padding:1.4rem 1.85rem;}
+  .meta-card dt{font-family:var(--mono);color:var(--label);font-size:.95rem;font-weight:400;}
+  .meta-card dd{font-family:var(--mono);color:var(--value);font-size:.95rem;margin:0;word-break:break-word;}
+  .status-pill{display:inline-block;border:1px solid var(--amber);color:var(--amber);
+               border-radius:999px;padding:.12rem .75rem;font-size:.82rem;letter-spacing:.08em;
+               text-transform:uppercase;line-height:1.45;background:transparent;}
+
+  /* ---- body ---- */
+  main{margin-top:3rem;line-height:1.6;font-size:1.06rem;}
+  main h2{font-size:1.65rem;margin:2.8rem 0 .8rem;padding-top:1.2rem;
+          border-top:1px solid rgba(34,31,24,.18);}
+  main h2 .num{font-family:var(--mono);font-size:.85rem;color:var(--maroon);
+               letter-spacing:.2em;display:block;margin-bottom:.25rem;}
+  main h3{font-size:1.2rem;margin:1.8rem 0 .5rem;color:var(--value);}
+  main li{margin:.3rem 0;}
+  main code{font-family:var(--mono);font-size:.88em;background:var(--meta-bg);
+            padding:.05rem .35rem;border-radius:4px;}
+  main pre{background:#2b2820;color:#f4efe1;padding:1.1rem 1.3rem;border-radius:10px;
+           font-size:.86rem;line-height:1.5;}
+  main pre code{background:none;padding:0;color:inherit;}
+  main table{width:100%;border-collapse:collapse;margin:1rem 0 1.4rem;font-size:.97rem;}
+  main th{text-align:left;font-family:var(--mono);font-size:.78rem;letter-spacing:.12em;
+          text-transform:uppercase;color:var(--label);border-bottom:2px solid var(--maroon);
+          padding:.5rem .6rem;}
+  main td{border-bottom:1px solid rgba(34,31,24,.14);padding:.55rem .6rem;vertical-align:top;}
+  main tr.picked td{background:rgba(168,118,43,.10);}
+  .callout{border-left:4px solid var(--amber);background:var(--meta-bg);padding:.9rem 1.2rem;
+           border-radius:0 10px 10px 0;margin:1.2rem 0;}
+  .callout strong{color:var(--maroon);}
+  .tag{font-family:var(--mono);font-size:.72rem;letter-spacing:.1em;text-transform:uppercase;
+       color:var(--amber);border:1px solid var(--amber);border-radius:999px;padding:0 .5rem;
+       margin-left:.4rem;vertical-align:middle;}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <p class="eyebrow">Spec &middot; Design</p>
+      <h1>VM Context Capture</h1>
+      <p class="subtitle">One Mac screenpipe that knows which Windows app &mdash; and which project &mdash; you are in inside the Parallels VM.</p>
+      <dl class="meta-card">
+        <dt>Date</dt><dd>2026-11-01</dd>
+        <dt>Branch</dt><dd>task/5925d7b5 (myScreenpipe); a separate branch in myMultiterminal</dd>
+        <dt>Status</dt><dd><span class="status-pill">Design &mdash; Awaiting Plan + Impl</span></dd>
+        <dt>Source</dt><dd>Ticket 5925d7b5 &ldquo;Capture Parallels VM activity from the Mac host&rdquo;, reshaped with the Owner on 2026-11-01</dd>
+      </dl>
+    </header>
+
+    <main>
+      <h2><span class="num">01</span>Intent &amp; why</h2>
+      <p>The Owner works mostly inside a Parallels Windows 11 VM on a Mac: MultiTerminal, Warp, Claude Code and Codex. They want <strong>one screenpipe, on the Mac</strong>, to record that work in a way that shows which app and which <em>project</em> it belongs to. Today that takes two screenpipes. The second one runs inside the VM and costs CPU, and the Owner wants it gone.</p>
+      <p>What the Mac records today, from a sample of 81 Parallels frames:</p>
+      <ul>
+        <li><strong>Text is already good.</strong> Every frame has OCR text, about 3,100 characters on average. screenpipe falls back to OCR when accessibility returns nothing.</li>
+        <li><strong>The labels are useless.</strong> The app is <code>Parallels Desktop</code> and 80 of 81 window names are <code>Windows 11</code>. Nobody can tell MultiTerminal from Chrome, or one project from another.</li>
+        <li><strong>MultiTerminal never says which project you're in.</strong> Its window title stays fixed at <code>MultiTerminal - REST API: Running on port 5050</code>, even though it already knows the focused pane's project and ticket.</li>
+      </ul>
+
+      <h2><span class="num">02</span>Goals, non-goals, anti-goals</h2>
+      <h3>Goals</h3>
+      <ul>
+        <li>Mac frames of the VM carry the <strong>real Windows app name and window title</strong> in <code>app_name</code> / <code>window_name</code>, so search, the timeline and activity summaries group work properly.</li>
+        <li>MultiTerminal's window title shows the <strong>focused pane's project and ticket</strong>, so the label above carries the project.</li>
+        <li>The VM's screenpipe can be turned off, leaving one recorder in total.</li>
+        <li>The VM-side helper uses negligible CPU and memory.</li>
+      </ul>
+      <h3>Non-goals</h3>
+      <ul>
+        <li>Screen text, UI Automation text, keystrokes or audio from inside the VM. The Mac already captures all of these through the VM window. <em>(Owner default; they may revisit.)</em></li>
+        <li>Browser URLs from inside the VM, and Coherence-mode-specific handling. Both are possible later additions.</li>
+        <li>Titles that terminal programs set <em>inside</em> MultiTerminal's tabs. They never reach the Windows window title, and MultiTerminal's own title covers the project.</li>
+      </ul>
+      <h3>Anti-goals: a failure even if it works</h3>
+      <ul>
+        <li>Exposing the Mac's screenpipe API beyond the Mac itself, for example to the corporate LAN.</li>
+        <li>Delaying, dropping or blocking any capture. Recording is the critical path (AGENTS.md).</li>
+        <li>Mislabelling frames: putting VM context on frames when Parallels isn't the frontmost Mac app, or when the context is stale.</li>
+        <li>Letting a relabelled frame slip past the user's privacy filters.</li>
+      </ul>
+
+      <h2><span class="num">03</span>Constraints</h2>
+      <ul>
+        <li><strong>Network:</strong> the Mac API listens on <code>127.0.0.1:3030</code> only, and every request needs the bearer API key, including from localhost (<code>server.rs:1597-1601</code>). The only built-in way to widen it is <code>--listen-on-lan</code> (0.0.0.0, no allow-list), which is ruled out.</li>
+        <li><strong>Existing VM→Mac SSH:</strong> the VM already reaches the Mac over the Parallels network with the passwordless key <code>~/.ssh/id_ed25519_mac</code> (alias <code>mac</code>, set up for the build loop).</li>
+        <li><strong>Hot paths:</strong> <code>do_capture</code> in <code>event_driven_capture.rs</code> runs for every frame. Changes there must not block, must not take locks, and must not add allocation for non-Parallels frames.</li>
+        <li><strong>VM toolchain:</strong> it has .NET 10 SDK and Windows OpenSSH 10.2. It has no Rust 1.94 (pinned) and no sccache, so native screenpipe crates can't be built on the VM.</li>
+        <li><strong>MultiTerminal repo rules</strong> (<code>.claude/CLAUDE.md</code>): agents never launch or kill MultiTerminal.exe, builds go to staged output, only the human deploys, and TreatWarningsAsErrors is on.</li>
+        <li><strong>Fork hygiene:</strong> changes are additive, so upstream merges stay clean. <code>event_driven_capture.rs</code> is a hot upstream file, so the hook there stays small and the logic lives elsewhere.</li>
+      </ul>
+
+      <h2><span class="num">04</span>Approaches</h2>
+      <table>
+        <tr><th>Approach</th><th>How</th><th>Trade-off</th></tr>
+        <tr class="picked"><td><strong>A. VM context helper</strong><span class="tag">picked</span></td>
+          <td>A tiny Windows background program sends the foreground app and window title to the Mac screenpipe, which relabels its Parallels frames.</td>
+          <td>Accurate, and works in normal window mode. A small new program plus a Mac-side route and hook.</td></tr>
+        <tr><td>B. Coherence + titles</td>
+          <td>Run Parallels in Coherence so each Windows app becomes a Mac window, and parse titles on the Mac.</td>
+          <td>No VM program, but it changes how the Owner works and only gives titles.</td></tr>
+        <tr class="picked"><td><strong>C. MultiTerminal title</strong><span class="tag">picked</span></td>
+          <td>MultiTerminal writes the focused pane's project and ticket into its window title.</td>
+          <td>Small. Helps A, B and any other tool that reads titles.</td></tr>
+        <tr><td>Keep two screenpipes</td><td>Leave the VM screenpipe running.</td><td>Rejected by the Owner: double CPU.</td></tr>
+      </table>
+      <p>For the network path, the Owner chose an <strong>SSH tunnel</strong>, reusing the existing key, over a new Parallels-only listen address or <code>--listen-on-lan</code>.</p>
+
+      <h2><span class="num">05</span>Decided how</h2>
+
+      <h3>5.1 Data flow</h3>
+<pre><code>Windows VM                                    macOS host
+-----------------------------------------     ----------------------------------------------
+vm-context-helper.exe                         screenpipe (127.0.0.1:3030, API key required)
+  foreground app + window title                 POST /context/external  -> latest ExternalContext
+  on change, plus a heartbeat every 2 s          do_capture: frontmost == Parallels Desktop
+  -> http://127.0.0.1:3031/context/external        and context fresh (&lt;= 5 s, Mac clock)
+       |                                           and this monitor hosts focus
+  ssh -N -L 3031:127.0.0.1:3030 mac  ======&gt;       => app_name / window_name := Windows values
+  (supervised by the helper)                     -> privacy filters -> paired_capture -> DB</code></pre>
+
+      <h3>5.2 Mac side: screenpipe engine <span class="tag">myScreenpipe</span></h3>
+      <ul>
+        <li><strong>A new route</strong>, <code>POST /context/external</code>, registered next to <code>/add</code>. It is behind the existing auth middleware and has no new auth path. Body:
+          <code>{ "source": "parallels-vm", "app_name": "MultiTerminal", "window_title": "…", "seq": 42 }</code>.
+          It validates that strings are bounded (e.g. 512 chars for app, 1024 for title) and that <code>source</code> is known. It stores the result, stamped with the <strong>Mac's own receive time</strong> (no reliance on the VM clock), in a process-global <code>ArcSwap&lt;Option&lt;ExternalContext&gt;&gt;</code>. It returns 204. An empty <code>app_name</code> clears the context.</li>
+        <li><strong>A capture hook:</strong> one call, right after metadata is resolved in <code>do_capture</code> (≈ <code>event_driven_capture.rs:3587</code>) and <strong>before</strong> the lock-screen, privacy, filter and DRM gates. A pure function, e.g. <code>external_context::override_for(app_name, monitor_hosts_focus, now) -&gt; Option&lt;(String, String)&gt;</code>, does an atomic load with no lock. It returns a replacement only when all of these hold:
+          <ul>
+            <li>the resolved app is the Parallels VM window app;</li>
+            <li>the context is at most 5 s old;</li>
+            <li>the monitor hosts focus.</li>
+          </ul>
+          Otherwise nothing changes and nothing is allocated.</li>
+        <li><strong>Unknown guest app (Owner decision, 2026-11-01):</strong> when the context is missing, stale or cleared (helper off, tunnel down, VM locked), the VM window is recorded exactly as today, labelled <code>Parallels Desktop</code>. Ignore rules for Windows apps apply only while the helper is reporting. VM pixels are never masked or skipped for lack of context, because recording comes first. The include list keeps matching the host app, so a user with an include list must list <code>Parallels Desktop</code> to record the VM, as today.</li>
+        <li><strong>Privacy:</strong> because the override runs before the gates, the user's ignore and include lists, incognito detection and DRM checks see the <em>Windows</em> app and title. Ignoring "Chrome" then also applies inside the VM.</li>
+        <li><strong>Settings:</strong> no new setting <span class="tag">builder's call, noted</span>. Without a helper posting, the route is inert and the hook never matches. The ticket asked for "behind a setting", but an inert-by-default route meets the intent with less code.</li>
+        <li><strong>Bounds and focus checks</strong> keep the original host app. See 5.5: overriding them would turn frames into placeholders when URL allow-lists are on.</li>
+      </ul>
+
+      <h3>5.3 VM side: <code>vm-context-helper</code> <span class="tag">myScreenpipe</span></h3>
+      <ul>
+        <li><strong>Language:</strong> C# on .NET 10, as a single-file, framework-dependent console app run windowless (WinExe). Rust would match screenpipe, but the VM can't build the pinned toolchain. C# is the Owner's home language, and the SDK is already installed.</li>
+        <li><strong>Location:</strong> <code>tools/vm-context-helper/</code> in the fork. It is not part of the cargo workspace or the app build. It is documented in <code>PERSONAL.md</code>.</li>
+        <li><strong>Foreground tracking:</strong> event-driven via <code>SetWinEventHook</code>, using <code>EVENT_SYSTEM_FOREGROUND</code> plus <code>EVENT_OBJECT_NAMECHANGE</code> on the foreground window, so title changes are caught. There is no busy polling. It copies the logic of screenpipe's <code>get_focused_app_window_lightweight</code> (<code>screenpipe-a11y/src/platform/windows.rs:2287</code>): GetForegroundWindow, the process image name with UWP/ApplicationFrameHost handling, and GetWindowTextW. Transient shell windows are skipped.</li>
+        <li><strong>Sending:</strong> it posts on every change and sends a heartbeat every 2 s, so the Mac's 5 s freshness holds while you sit in one app. When the VM locks or sleeps, posts stop, the context goes stale, and the Mac falls back to <code>Parallels Desktop</code>.</li>
+        <li><strong>Tunnel:</strong> the helper starts and supervises <code>ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -L 3031:127.0.0.1:3030 mac</code>, restarting it with backoff. If the tunnel is down, posts fail quietly and are logged at a low rate. They are never retried in bulk; only the latest state matters.</li>
+        <li><strong>API key:</strong> read once from <code>%APPDATA%\vm-context-helper\api-key</code>, a file with a user-only ACL. The Owner copies it in using <code>screenpipe auth token</code> on the Mac. It is never logged.</li>
+        <li><strong>Start-up:</strong> a per-user Task Scheduler entry at logon, with an install script that the Owner runs once.</li>
+      </ul>
+
+      <h3>5.4 MultiTerminal title <span class="tag">myMultiterminal</span></h3>
+      <ul>
+        <li>Replace the one-time title (<code>MainForm.cs:1511</code>) with a formatter. With a focused pane:
+          <code>MultiTerminal — {project} · {pane name}: {task title} (REST API :5050)</code>.
+          With none, it keeps today's text.</li>
+        <li><strong>Inputs:</strong> <code>_lastActiveTerminal</code> as the source of truth for focus (<code>ActiveDocumentChanged</code> misses WebView2 clicks), and the project and task values that <code>TerminalDocument.UpdateStatusBar</code> already computes (<code>:3296-3334</code>).</li>
+        <li><strong>Refresh:</strong> when <code>_lastActiveTerminal</code> changes and when that pane's status bar refreshes. Only write <code>Text</code> when the string actually changes.</li>
+        <li><strong>Delivery:</strong> its own ticket and branch in myMultiterminal, verified with the repo's build and test commands. The Owner deploys it.</li>
+      </ul>
+
+      <h3>5.5 Hardening from review <span class="tag">builder check + Codex</span></h3>
+      <table>
+        <tr><th>Risk found</th><th>Resolution</th></tr>
+        <tr><td><strong>A fresh label lands on older pixels.</strong> The guest switches app between the screenshot and the hook.</td>
+          <td>Read the context's <code>seq</code> before the screenshot and again at the hook. If it changed, don't override; the frame keeps <code>Parallels Desktop</code>.</td></tr>
+        <tr><td><strong>Port hijack leaks the key.</strong> Another process holds 3031, the forward fails, and an HTTP post reaches that process.</td>
+          <td>The forward binds <code>127.0.0.1:3031</code> explicitly, with <code>ExitOnForwardFailure=yes</code>. The key is sent only after a check through the tunnel: an unauthenticated <code>GET /health</code> must answer as screenpipe. Sending stops as soon as the ssh child exits.</td></tr>
+        <tr><td><strong>The route works with auth off.</strong> The auth middleware is bypassed when api_auth is disabled (<code>server.rs:1611</code>).</td>
+          <td>The route returns 403 unless API auth is enabled. Tests cover auth disabled, a missing token and a wrong token.</td></tr>
+        <tr><td><strong>Stale or reordered posts.</strong></td>
+          <td>Each helper start picks a random <code>epoch</code>, and <code>seq</code> strictly increases within it. The Mac accepts a post only if it is newer: a new epoch, or a higher seq in the same epoch. Expiry uses the Mac's monotonic clock and is cleared on Mac sleep/wake. The helper sends one request at a time and keeps only the latest pending state.</td></tr>
+        <tr><td><strong>Lock and sleep keep the context alive.</strong></td>
+          <td>The helper handles <code>WM_WTSSESSION_CHANGE</code>: on lock it posts a clear and pauses heartbeats; on unlock it samples again.</td></tr>
+        <tr><td><strong>Losing the bounds kills OCR.</strong> With URL allow-lists, a mismatched focused-window-bounds check gives a placeholder frame (<code>:3739</code>), not a full-frame OCR as 5.2 said.</td>
+          <td>The override changes only the <em>stored labels</em> and the inputs to the privacy filters. The bounds and focus checks keep using the original host app. A ponytail note in the code records why.</td></tr>
+        <tr><td><strong>Consumers of app_name.</strong> Meeting detection, the AX denylist, browser URL.</td>
+          <td>The AX denylist keys on the host process name and doesn't change. Meeting detection and browser-URL lookup keep the host values. Only labels and the privacy filters see guest values.</td></tr>
+        <tr><td><strong>MultiTerminal focus.</strong> <code>_lastActiveTerminal</code> isn't updated on tab switches (<code>MainForm.cs:7575</code>).</td>
+          <td>Title focus combines tab activation and terminal clicks, and is cleared when a non-terminal or closed pane is active.</td></tr>
+        <tr><td><strong>Helper process hygiene.</strong></td>
+          <td>The ssh child sits in a Job Object, so it dies with the helper. Key auth needs no passphrase, and <code>known_hosts</code> already trusts <code>mac</code>; ssh runs with <code>BatchMode=yes</code>, so it never prompts. The key is re-read after a 401.</td></tr>
+      </table>
+
+      <h3>5.6 Verification</h3>
+      <ul>
+        <li><strong>Mac unit tests</strong>, <code>cargo test -p screenpipe-engine</code>, run on the Mac:
+          <ul>
+            <li><code>override_for</code>: fresh, stale, wrong app, monitor not focused, cleared context;</li>
+            <li>route validation: bounds, unknown source, empty clears.</li>
+          </ul></li>
+        <li><strong>MultiTerminal:</strong> a unit test for the title formatter, plus the repo's standard <code>dotnet test</code>.</li>
+        <li><strong>Helper:</strong> <code>dotnet build</code>, plus a <code>--once</code> flag that prints the current foreground app and title, for manual checks.</li>
+        <li><strong>End to end</strong>, with the Owner:
+          <ul>
+            <li>with the helper running and the VM's screenpipe stopped, switch between MultiTerminal, Warp and Chrome in the VM;</li>
+            <li>Mac frames show those app names and titles;</li>
+            <li>MultiTerminal frames show the project and ticket;</li>
+            <li>with Parallels not frontmost, or the helper stopped for more than 5 s, frames say <code>Parallels Desktop</code> again.</li>
+          </ul></li>
+        <li><strong>Cut-over:</strong> once verified, the Owner turns off the VM's screenpipe autostart.</li>
+      </ul>
+
+      <h2><span class="num">06</span>Left to the builder</h2>
+      <ul>
+        <li>The exact macOS <code>app_name</code> string for the VM window (<code>Parallels Desktop</code> vs <code>prl_client_app</code>). Confirm it on the Mac, and match on a small constant list.</li>
+        <li>The exact names, file and module for <code>external_context</code> inside screenpipe-engine, and the route's handler location (<code>routes/</code>).</li>
+        <li>Whether a context change should also fire a capture trigger, if the engine already has a cheap way to ask for one. Without that, in-VM app switches are caught on the next normal trigger.</li>
+        <li>The helper's logging format and log location, and the backoff numbers.</li>
+        <li>The precise MultiTerminal refresh call sites, and trimming long task titles.</li>
+      </ul>
+      <div class="callout"><strong>Privacy note.</strong> Window titles can contain secrets. A recorded PowerShell title held a GitLab token on 2026-11-01. This design carries titles to the Mac just as the VM's screenpipe already did, and the Mac's privacy filters still apply. A better title-redaction rule is out of scope here, but worth a follow-up ticket.</div>
+    </main>
+  </div>
+</body>
+</html>
