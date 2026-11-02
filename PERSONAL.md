@@ -111,7 +111,7 @@ tracks `option_env!`, but confirm that sccache did not reuse a stale result.
 From `apps/screenpipe-app-tauri`:
 
 ```bash
-bun run test:tauri personal:: -- store::   # native unit tests (queued, debug-dev)
+bun run test:tauri personal::   # native unit tests (queued, debug-dev)
 bun run test                               # frontend (vitest + bun tests)
 ```
 
@@ -122,7 +122,7 @@ Keep this list complete so upstream merges stay easy to review.
 | File | Change |
 | --- | --- |
 | `apps/screenpipe-app-tauri/src-tauri/src/main.rs` | `mod personal;` plus `personal::apply_process_env()` right after `dev_isolation::apply()` (+3 lines) |
-| `apps/screenpipe-app-tauri/src-tauri/src/store.rs` | `init_store`: call `personal::apply_new_profile_defaults(&mut store, is_new_store)` (+5 lines) |
+| `apps/screenpipe-app-tauri/src-tauri/src/store.rs` | `init_store`: call `personal::apply_new_profile_defaults(&mut store, is_new_store)` after the settings migrations, just before the save (+7 lines) |
 | `apps/screenpipe-app-tauri/app/providers.tsx` | skip `posthog.init` when the flag is set (+5/-1 lines) |
 
 Files added by this fork (not upstream): `PERSONAL.md`,

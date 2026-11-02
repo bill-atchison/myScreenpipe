@@ -85,7 +85,8 @@ fn apply_defaults_if(store: &mut SettingsStore, apply: bool) -> bool {
     true
 }
 
-// Same contract as dev_isolation's private helper: an explicit value wins.
+// Same contract as dev_isolation's helper (an explicit value wins); copied
+// because that one is #[cfg(debug_assertions)] and absent from release builds.
 fn set_if_unset(key: &str, value: &str) {
     if std::env::var_os(key).is_some_and(|v| !v.is_empty()) {
         return;

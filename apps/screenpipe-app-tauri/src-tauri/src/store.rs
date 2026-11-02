@@ -3050,11 +3050,6 @@ pub fn init_store(app: &AppHandle) -> Result<SettingsStore, String> {
         }
     }
 
-    // Personal-build defaults for a new store only; see PERSONAL.md.
-    if crate::personal::apply_new_profile_defaults(&mut store, is_new_store) {
-        should_save = true;
-    }
-
     let managed_mode = crate::app_mode::for_settings(&store);
     if restore_headed_mode_for_consumer(&mut store, managed_mode) {
         tracing::info!(
@@ -3083,6 +3078,12 @@ pub fn init_store(app: &AppHandle) -> Result<SettingsStore, String> {
         && can_run_settings_migrations
         && migrate_remote_logs_default_enabled(&mut store)
     {
+        should_save = true;
+    }
+
+    // Personal-build defaults for a new store only; see PERSONAL.md. Runs after
+    // the migrations above so none of them (e.g. remote logs on) overrides it.
+    if crate::personal::apply_new_profile_defaults(&mut store, is_new_store) {
         should_save = true;
     }
 
