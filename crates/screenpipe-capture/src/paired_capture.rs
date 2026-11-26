@@ -249,6 +249,9 @@ pub struct PairedCaptureResult {
     pub browser_url: Option<String>,
     /// Content hash from accessibility tree (for dedup)
     pub content_hash: Option<i64>,
+    /// Some when the frames row stores these (app, window) instead of
+    /// `app_name`/`window_name` (see `CaptureContext::stored_labels`).
+    pub stored_labels: Option<(String, String)>,
 }
 
 /// Performs a paired capture: screenshot + accessibility tree data.
@@ -744,11 +747,13 @@ async fn paired_capture_inner(
         None
     };
 
-    let (stored_app_name, stored_window_name) = match ctx.stored_labels.as_ref() {
-        Some((app, window)) if ctx.monitor_hosts_focus => {
-            (Some(app.as_str()), Some(window.as_str()))
-        }
-        _ => (app_name, window_name),
+    let stored_labels = ctx
+        .stored_labels
+        .as_ref()
+        .filter(|_| ctx.monitor_hosts_focus);
+    let (stored_app_name, stored_window_name) = match stored_labels {
+        Some((app, window)) => (Some(app.as_str()), Some(window.as_str())),
+        None => (app_name, window_name),
     };
     let frame_id = ctx
         .db
@@ -818,6 +823,7 @@ async fn paired_capture_inner(
         window_name: window_name.map(String::from),
         browser_url: browser_url.map(String::from),
         content_hash,
+        stored_labels: stored_labels.cloned(),
     })
 }
 
@@ -1322,6 +1328,69 @@ mod tests {
         assert!(result.text_source.is_none());
         assert!(result.ocr_duration_ms.is_none());
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stored_labels_replace_frames_row_labels_only_on_focus_monitor() {
+        let tmp = TempDir::new().unwrap();
+        let snapshot_writer = SnapshotWriter::new(tmp.path(), 80, 1920);
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
+        let start = Utc::now() - chrono::Duration::minutes(1);
+        let guest = ("MultiTerminal".to_string(), "t".to_string());
+
+        for monitor_hosts_focus in [true, false] {
+            let ctx = CaptureContext {
+                db: &db,
+                snapshot_writer: &snapshot_writer,
+                image: test_image(),
+                captured_at: Utc::now(),
+                monitor_id: 0,
+                device_name: "test_monitor",
+                app_name: Some("Parallels Desktop"),
+                window_name: Some("Windows 11"),
+                browser_url: None,
+                document_path: None,
+                focused: true,
+                capture_trigger: "click",
+                use_pii_removal: false,
+                languages: vec![],
+                elements_ref_frame_id: None,
+                screenshot_disabled: false,
+                in_meeting: false,
+                monitor_hosts_focus,
+                ax_screenshot_coherent: true,
+                focused_window_bounds: None,
+                stored_labels: Some(guest.clone()),
+            };
+            let result = paired_capture(&ctx, None, None).await.unwrap();
+
+            let chunk = db
+                .find_video_chunks(start, Utc::now() + chrono::Duration::minutes(1))
+                .await
+                .unwrap();
+            let frame = chunk
+                .frames
+                .iter()
+                .find(|f| f.frame_id == result.frame_id)
+                .expect("frame on timeline");
+            let row = (
+                frame.ocr_entries[0].app_name.as_str(),
+                frame.ocr_entries[0].window_name.as_str(),
+            );
+            if monitor_hosts_focus {
+                assert_eq!(row, ("MultiTerminal", "t"));
+                assert_eq!(result.stored_labels.as_ref(), Some(&guest));
+                // Everything but the frames row keeps the host labels.
+                assert_eq!(result.app_name.as_deref(), Some("Parallels Desktop"));
+                assert_eq!(result.window_name.as_deref(), Some("Windows 11"));
+            } else {
+                // Non-focus monitors store no identity at all, guest or host.
+                assert_eq!(row, ("", ""));
+                assert_eq!(result.stored_labels, None);
+            }
+        }
     }
 
     #[tokio::test]

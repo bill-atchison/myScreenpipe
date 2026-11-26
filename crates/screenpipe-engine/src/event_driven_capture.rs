@@ -2431,12 +2431,20 @@ async fn push_to_hot_cache(
     device_name: &str,
     trigger: &CaptureTrigger,
 ) {
+    // Live timeline shows the same labels the frames row stores.
+    let (app_name, window_name) = match result.stored_labels.as_ref() {
+        Some((app, window)) => (app.as_str(), window.as_str()),
+        None => (
+            result.app_name.as_deref().unwrap_or(""),
+            result.window_name.as_deref().unwrap_or(""),
+        ),
+    };
     let hot = HotFrame {
         frame_id: result.frame_id,
         timestamp: result.captured_at,
         device_name: device_name.into(),
-        app_name: result.app_name.as_deref().unwrap_or("").into(),
-        window_name: result.window_name.as_deref().unwrap_or("").into(),
+        app_name: app_name.into(),
+        window_name: window_name.into(),
         ocr_text_preview: result
             .accessibility_text
             .as_deref()
@@ -3141,8 +3149,12 @@ async fn do_capture(
     }
 
     // VM guest context as of these pixels; a later post can't relabel them.
-    let guest_seq_at_screenshot =
-        crate::external_context::current_seq(&crate::external_context::GLOBAL);
+    // The host app is not known yet, so only focus and startup can skip it.
+    let guest_seq_at_screenshot = if monitor_hosts_focus && !is_startup {
+        crate::external_context::current_seq(&crate::external_context::GLOBAL)
+    } else {
+        None
+    };
     let image = if screenshot_disabled || skip_pixels_for_unknown_exclusions {
         debug!(
             "screenshot capture skipped for monitor {} (trigger={})",
@@ -4263,6 +4275,7 @@ mod tests {
             window_name: None,
             browser_url: None,
             content_hash: None,
+            stored_labels: None,
         }
     }
 

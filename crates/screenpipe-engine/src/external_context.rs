@@ -106,7 +106,11 @@ pub fn guest_labels(
     seq_at_screenshot: Option<(u64, u64)>,
     now: Instant,
 ) -> Option<(String, String)> {
-    if is_startup {
+    // Cheap gates first so a miss costs no store load beyond the seq snapshot.
+    if is_startup
+        || !monitor_hosts_focus
+        || !host_app.is_some_and(|a| a.eq_ignore_ascii_case(HOST_APP))
+    {
         return None;
     }
     override_for(store, host_app, monitor_hosts_focus, seq_at_screenshot, now)
