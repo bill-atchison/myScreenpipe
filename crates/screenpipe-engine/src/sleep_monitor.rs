@@ -119,6 +119,8 @@ fn mark_recently_woke(platform: &'static str) {
     RECENTLY_WOKE.store(true, Ordering::SeqCst);
     let seq = RECENTLY_WOKE_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
     tracing::info!("Detected system wake on {}", platform);
+    // The VM may have changed focus while the host slept.
+    crate::external_context::clear(&crate::external_context::GLOBAL);
 
     // Suppress permission-change emissions briefly — TCC / preflight APIs
     // can return stale denied while the OS re-registers the process.
@@ -967,10 +969,20 @@ mod tests {
     /// on_did_wake must set both vision AND audio invalidation flags.
     #[cfg(target_os = "macos")]
     #[tokio::test]
+    // Test-harness serialization guards, held across .await on purpose.
+    #[allow(clippy::await_holding_lock)]
     async fn test_on_did_wake_sets_audio_invalidation() {
+        use crate::external_context as ec;
         let _guard = RECENTLY_WOKE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Wake clears the global VM context.
+        let _ec_guard = ec::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (epoch, seq) = ec::current_seq(&ec::GLOBAL).unwrap_or((0, 0));
+        let now = std::time::Instant::now();
+        ec::accept(&ec::GLOBAL, epoch, seq + 1, "A".into(), "t".into(), now);
         // Clear stale flags
         let _ = screenpipe_audio::stream_invalidation::take();
         let _ = screenpipe_screen::stream_invalidation::take();
@@ -993,6 +1005,17 @@ mod tests {
         assert!(
             recently_woke_from_sleep(),
             "RECENTLY_WOKE should be set after on_did_wake"
+        );
+        assert_eq!(
+            ec::override_for(
+                &ec::GLOBAL,
+                Some("Parallels Desktop"),
+                true,
+                ec::current_seq(&ec::GLOBAL),
+                now
+            ),
+            None,
+            "wake must clear the VM guest context"
         );
         assert!(
             screenpipe_audio::stream_invalidation::take(),

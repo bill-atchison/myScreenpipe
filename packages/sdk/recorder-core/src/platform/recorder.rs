@@ -1145,6 +1145,7 @@ async fn paired_capture_loop_for_monitor(
             monitor_hosts_focus,
             ax_screenshot_coherent: true,
             focused_window_bounds: None,
+            stored_labels: None,
         };
 
         match paired_capture(&ctx, Some(&snapshot), None).await {

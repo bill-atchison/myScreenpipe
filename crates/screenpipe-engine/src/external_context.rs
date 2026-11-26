@@ -96,6 +96,22 @@ pub fn override_for(
     Some((c.app_name.clone(), c.window_title.clone()))
 }
 
+/// Labels to store for a captured frame. The startup capture is excluded: it
+/// runs before any focus event, so nothing ties the stored context to it.
+pub fn guest_labels(
+    store: &ContextStore,
+    host_app: Option<&str>,
+    monitor_hosts_focus: bool,
+    is_startup: bool,
+    seq_at_screenshot: Option<(u64, u64)>,
+    now: Instant,
+) -> Option<(String, String)> {
+    if is_startup {
+        return None;
+    }
+    override_for(store, host_app, monitor_hosts_focus, seq_at_screenshot, now)
+}
+
 pub fn clear(store: &ContextStore) {
     // Tombstone, not None: a late post with an old (epoch, seq) must stay Stale.
     store.rcu(|cur| {
@@ -225,5 +241,49 @@ mod tests {
         let now = Instant::now();
         put(&s, 1, 1, "A", now);
         assert!(override_for(&s, Some("parallels desktop"), true, current_seq(&s), now).is_some());
+    }
+
+    #[test]
+    fn guest_labels_when_fresh() {
+        let s = ContextStore::empty();
+        let now = Instant::now();
+        put(&s, 1, 1, "MultiTerminal", now);
+        assert_eq!(
+            guest_labels(&s, Some(HOST), true, false, current_seq(&s), now),
+            Some(("MultiTerminal".into(), "t".into()))
+        );
+    }
+
+    #[test]
+    fn no_guest_labels_on_startup() {
+        let s = ContextStore::empty();
+        let now = Instant::now();
+        put(&s, 1, 1, "MultiTerminal", now);
+        assert_eq!(
+            guest_labels(&s, Some(HOST), true, true, current_seq(&s), now),
+            None
+        );
+    }
+
+    #[test]
+    fn no_guest_labels_for_other_host() {
+        let s = ContextStore::empty();
+        let now = Instant::now();
+        put(&s, 1, 1, "MultiTerminal", now);
+        assert_eq!(
+            guest_labels(&s, Some("Safari"), true, false, current_seq(&s), now),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_seq_does_not_override() {
+        let s = ContextStore::empty();
+        let now = Instant::now();
+        put(&s, 1, 2, "MultiTerminal", now);
+        assert_eq!(
+            guest_labels(&s, Some(HOST), true, false, Some((1, 1)), now),
+            None
+        );
     }
 }

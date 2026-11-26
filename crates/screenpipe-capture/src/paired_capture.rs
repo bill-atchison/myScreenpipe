@@ -198,6 +198,10 @@ pub struct CaptureContext<'a> {
     /// focused (same judgment call as `monitor_hosts_focus`). `None` keeps
     /// full-frame behavior.
     pub focused_window_bounds: Option<FocusedWindowBounds>,
+    /// (app, window) reported from inside a VM for the focused VM window.
+    /// When Some, replaces `app_name`/`window_name` at the DB insert only;
+    /// every other use keeps the host values.
+    pub stored_labels: Option<(String, String)>,
 }
 
 /// Result of a paired capture operation.
@@ -740,14 +744,20 @@ async fn paired_capture_inner(
         None
     };
 
+    let (stored_app_name, stored_window_name) = match ctx.stored_labels.as_ref() {
+        Some((app, window)) if ctx.monitor_hosts_focus => {
+            (Some(app.as_str()), Some(window.as_str()))
+        }
+        _ => (app_name, window_name),
+    };
     let frame_id = ctx
         .db
         .insert_snapshot_frame_with_ocr(
             ctx.device_name,
             ctx.captured_at,
             &snapshot_path_str,
-            app_name,
-            window_name,
+            stored_app_name,
+            stored_window_name,
             browser_url,
             document_path,
             ctx.focused && ctx.monitor_hosts_focus,
@@ -1169,6 +1179,7 @@ mod tests {
             monitor_hosts_focus: true,
             ax_screenshot_coherent: true,
             focused_window_bounds: None,
+            stored_labels: None,
         };
         let first = paired_capture_deferred(&ctx).await.unwrap();
         ctx.captured_at += chrono::Duration::seconds(1);
@@ -1259,6 +1270,7 @@ mod tests {
             monitor_hosts_focus: true,
             ax_screenshot_coherent: true,
             focused_window_bounds: None,
+            stored_labels: None,
         };
 
         let result = paired_capture(&ctx, None, None).await.unwrap();
@@ -1299,6 +1311,7 @@ mod tests {
             monitor_hosts_focus: true,
             ax_screenshot_coherent: true,
             focused_window_bounds: None,
+            stored_labels: None,
         };
 
         let result = paired_capture(&ctx, None, None).await.unwrap();
@@ -1343,6 +1356,7 @@ mod tests {
             monitor_hosts_focus: true,
             ax_screenshot_coherent: true,
             focused_window_bounds: None,
+            stored_labels: None,
         };
 
         let snap = TreeSnapshot {
@@ -1416,6 +1430,7 @@ mod tests {
             monitor_hosts_focus: true,
             ax_screenshot_coherent: true,
             focused_window_bounds: None,
+            stored_labels: None,
         };
 
         // Empty accessibility text should be treated as no text
@@ -1614,6 +1629,7 @@ mod tests {
             monitor_hosts_focus: true,
             ax_screenshot_coherent: false,
             focused_window_bounds: None,
+            stored_labels: None,
         };
 
         let result = paired_capture(&ctx, Some(&snapshot), None).await.unwrap();
@@ -1944,6 +1960,7 @@ mod tests {
             monitor_hosts_focus: true,
             ax_screenshot_coherent: true,
             focused_window_bounds: None,
+            stored_labels: None,
         };
         let snap = rich_meeting_snap();
         let mut gate = OcrGate::new();
@@ -1989,6 +2006,7 @@ mod tests {
             monitor_hosts_focus: true,
             ax_screenshot_coherent: true,
             focused_window_bounds: None,
+            stored_labels: None,
         };
         let snap = rich_meeting_snap();
         let mut gate = OcrGate::new();
@@ -2035,6 +2053,7 @@ mod tests {
             monitor_hosts_focus: true,
             ax_screenshot_coherent: true,
             focused_window_bounds: None,
+            stored_labels: None,
         };
         let snap = rich_meeting_snap();
         // No gate wired: callers outside the engine loop keep the
@@ -2086,6 +2105,7 @@ mod tests {
             monitor_hosts_focus: false,
             ax_screenshot_coherent: true,
             focused_window_bounds: None,
+            stored_labels: None,
         };
         let mut gate = OcrGate::new();
         // Text on this monitor: first sighting OCRs it.
@@ -2155,6 +2175,7 @@ mod tests {
             monitor_hosts_focus: true,
             ax_screenshot_coherent: true,
             focused_window_bounds: None,
+            stored_labels: None,
         };
         let mut gate = OcrGate::new();
         // First capture: the detect finds the stroke region, the union crop
@@ -2255,6 +2276,7 @@ mod tests {
             monitor_hosts_focus: true,
             ax_screenshot_coherent: true,
             focused_window_bounds: bounds,
+            stored_labels: None,
         };
 
         let mut gate = OcrGate::new();
@@ -2314,6 +2336,7 @@ mod tests {
             monitor_hosts_focus: true,
             ax_screenshot_coherent: true,
             focused_window_bounds: Some(bounds),
+            stored_labels: None,
         };
 
         let mut gate = OcrGate::new();
@@ -2390,6 +2413,7 @@ mod tests {
             monitor_hosts_focus: true,
             ax_screenshot_coherent: true,
             focused_window_bounds: None,
+            stored_labels: None,
         };
 
         // Fully closed DB (both pools + drain loop) → the frame insert

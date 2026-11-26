@@ -1217,6 +1217,7 @@ pub(crate) async fn event_driven_capture_loop(
                 false, // not in a meeting at startup
                 true,  // focus unknown at startup — controller defaults to Active
                 &mut last_screenshot_focus_pid,
+                true, // startup capture: never relabel with VM guest context
             ),
         )
         .await
@@ -2116,6 +2117,7 @@ pub(crate) async fn event_driven_capture_loop(
                         // hysteresis and unknown/stale focus fallbacks.
                         focus_controller.hosts_focus_for_monitor(&monitor),
                         &mut last_screenshot_focus_pid,
+                        false,
                     ),
                 )
                 .await;
@@ -3077,6 +3079,7 @@ async fn do_capture(
     in_meeting: bool,
     monitor_hosts_focus: bool,
     #[allow(unused_variables)] last_screenshot_focus_pid: &mut Option<i32>,
+    is_startup: bool,
 ) -> Result<CaptureOutput> {
     let captured_at = Utc::now();
     let bypass_capture_throttles = bypasses_capture_throttles(trigger);
@@ -3137,6 +3140,9 @@ async fn do_capture(
         tokio::time::sleep(CONTEXT_CAPTURE_SETTLE).await;
     }
 
+    // VM guest context as of these pixels; a later post can't relabel them.
+    let guest_seq_at_screenshot =
+        crate::external_context::current_seq(&crate::external_context::GLOBAL);
     let image = if screenshot_disabled || skip_pixels_for_unknown_exclusions {
         debug!(
             "screenshot capture skipped for monitor {} (trigger={})",
@@ -3585,6 +3591,18 @@ async fn do_capture(
                 None,
             )
         };
+    // ponytail: guest labels are stored on the frame only; host values drive
+    // every admission and processing decision on purpose (lock screen, include
+    // list, URL policy, DRM, bounds, meeting, OCR). Feeding guest labels into
+    // those gates means per-gate VM semantics; add them gate by gate if needed.
+    let guest_labels = crate::external_context::guest_labels(
+        &crate::external_context::GLOBAL,
+        app_name_owned.as_deref(),
+        monitor_hosts_focus,
+        is_startup,
+        guest_seq_at_screenshot,
+        Instant::now(),
+    );
 
     // Skip lock screen / screensaver — these waste disk and pollute timeline.
     // Also update the global SCREEN_IS_LOCKED flag so subsequent loop iterations
@@ -3695,6 +3713,29 @@ async fn do_capture(
         });
     }
 
+    // The guest pair goes through the same ignore-list/incognito gate as the
+    // host pair: a guest app the user ignored must not be stored either.
+    if let Some((guest_app, guest_window)) = guest_labels.as_ref() {
+        if resolved_window_matches_privacy_filters(
+            params.tree_walker_config.ignore_incognito_windows,
+            monitor_hosts_focus,
+            &params.ignored_patterns,
+            Some(guest_app),
+            Some(guest_window),
+        ) {
+            debug!(
+                "skipping capture: VM guest app matches privacy filter on monitor {}",
+                params.monitor_id
+            );
+            return Ok(CaptureOutput {
+                result: None,
+                image,
+                elements_deduped: false,
+                corrupt: None,
+            });
+        }
+    }
+
     // Focused-window bounds for window-scoped meeting OCR (#5054 follow-up):
     // scale the walker's monitor-normalized fractions to this frame's actual
     // pixel size (the capture may be width-capped below native resolution).
@@ -3784,6 +3825,7 @@ async fn do_capture(
         monitor_hosts_focus,
         ax_screenshot_coherent,
         focused_window_bounds,
+        stored_labels: guest_labels,
     };
 
     let result = if defer_text_extraction {
