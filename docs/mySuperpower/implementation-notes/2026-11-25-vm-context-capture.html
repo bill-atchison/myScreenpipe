@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<!--
+  IMPLEMENTATION NOTES / REVIEW DOC — a LIVE doc with TWO regions, both updated in REAL
+  TIME as work happens:
+    1. TASK STATUS table — one task-row per plan task with its TDD SUBTASK rows beneath.
+       Flip each pill pending -> in progress -> done (done rows show commit short-SHA),
+       in sync with the TodoWrite list.
+    2. IMPLEMENTATION LOG · BY TASK — everything for each task together, in task order.
+       The log OPENS with a "PRE-IMPL · CONTEXT" card when the run needs process context
+       (adapted workflow, environment constraints). Then, per task, append a GROUP:
+         a. an <h3 class="tglabel"> task-group heading — task number + title, with a
+            <span class="st-mini"> status/sha annotation ("· abc1234" or "(no code)");
+         b. one dd-card per substantive item (off-spec decision, plan deviation, important
+            fix, cross-task interaction, tradeoff — NOT routine progress). Each card has a
+            maroon tag ("TASK N · DONE · <sha>", "PRE-IMPL · CONTEXT", …), a bold title,
+            and prose/bullets with inline <code> chips;
+         c. one .cc CODE-CHANGE card per applied edit — heading, mono .loc location line,
+            then labelled BEFORE (red) / AFTER (green) <pre> blocks. Keep excerpts minimal:
+            the changed lines plus just enough context; elide unchanged runs with "...".
+       Append new groups at the TASK_LOG comment marker so decisions and code stay co-located.
+
+  FIXED MASTHEAD + PALETTE (per owner spec): header, palette, table, card, and code-block
+  styles are FIXED — reproduce as-is so this doc shares the editorial identity of the spec
+  (Spec · Design) and plan (Plan · Implementation). Stay on-palette.
+
+  HARD RULES: one self-contained .html; ALL CSS inline; web-safe/system fonts only;
+  NO external fonts/CDN/images/<link>/external <script>; renders from file:// offline.
+  An inline <meta refresh> is allowed for the live phase.
+
+  LIVE-VIEW: the <meta refresh> only fires when the tab is the ACTIVE/visible tab
+  (browsers throttle background tabs) — tell the owner to keep the notes tab visible.
+  At completion: flip Status pill to "Implementation — Complete" and REMOVE the <meta refresh>.
+
+  WHO UPDATES WHAT (the controller/agent owns ALL writes; implementer subagents stay report-only):
+    - subagent-driven-development: the CONTROLLER renders the table at setup (all rows
+      pending), flips each task's row to in-progress before dispatch and to done·<sha> after
+      review (filling its subtask rows from the implementer's report), and appends the task's
+      log group (tglabel heading, dd-cards, .cc code cards) from the implementer's report.
+      Implementer subagents never write this file.
+    - executing-plans: the agent renders, flips rows, and appends log groups itself, live.
+
+  PLACEHOLDERS: VM Context Capture Label the Mac's Parallels frames with the Windows app and title sent by a VM helper. 2026-11-25 task/5925d7b5 docs/mySuperpower/specs/2026-11-01-vm-context-capture-design.html docs/mySuperpower/plans/2026-11-01-vm-context-capture.html
+    <tr class="task-row"><td class="num">1</td><td class="desc">Context store with ordering and freshness</td><td class="st"><span class="tstatus done">&check; done &middot; ab235c5</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; write failing test (red)</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; implement (green)</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; commit</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="task-row"><td class="num">2</td><td class="desc">Authenticated route POST /context/external</td><td class="st"><span class="tstatus done">&check; done &middot; f17bde2</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; write failing test (red)</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; implement (green)</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; commit</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="task-row"><td class="num">3</td><td class="desc">Capture hook: guest labels for storage only</td><td class="st"><span class="tstatus done">&check; done &middot; b76491b</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; write failing test (red)</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; implement (green)</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; commit</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="task-row"><td class="num">4</td><td class="desc">VM helper tools/vm-context-helper</td><td class="st"><span class="tstatus done">&check; done &middot; e4ac34c</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; write failing test (red)</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; implement (green)</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; port-hijack manual check</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; commit</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="task-row"><td class="num">5</td><td class="desc">Docs, end-to-end check, cut-over</td><td class="st"><span class="tstatus done">&check; done &middot; ba8b958</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; full checks</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; dev build + end-to-end with Owner</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; commit</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>   -> task-row + sub rows per plan task (START all "pending")
+          <div class="dd-card">
+        <span class="dd-tag">Pre-impl &middot; Context</span>
+        <h3>Pre-flight rulings</h3>
+        <ul>
+          <li><strong>R1:</strong> the <code>TEST_LOCK</code> on the sleep_monitor wake tests moves from Task 2 to Task 3, where wake starts clearing <code>GLOBAL</code>.</li>
+          <li><strong>R2:</strong> the wake clear goes in <code>mark_recently_woke</code> (shared by macOS, Windows, Linux and the clock-gap fallback), not the macOS-only <code>on_did_wake</code>.</li>
+          <li><strong>R3:</strong> the helper also truncates <code>app_name</code> to 512, so a long name can't get 400 forever.</li>
+          <li><strong>R4:</strong> Rust bounds count chars; the helper truncates by UTF-16 units without splitting a surrogate pair.</li>
+          <li><strong>Test loop:</strong> Rust tests run in <code>mac:~/Workspace/wt-5925d7b5</code>, synced by tar, because <code>git push</code> to the Mac fails without git-lfs there.</li>
+        </ul>
+      </div>
+      <h3 class="tglabel">Task 1 &mdash; Context store with ordering and freshness <span class="st-mini">&middot; ab235c5</span></h3>
+      <div class="dd-card">
+        <span class="dd-tag">Task 1 &middot; Done &middot; ab235c5</span>
+        <h3>clear() keeps a tombstone (review fix)</h3>
+        <p><strong>Important fix.</strong> The first <code>clear()</code> stored <code>None</code>, which dropped the ordering: after a wake clear, a late post from before sleep was accepted and relabelled frames for up to 5 s. <code>clear()</code> now stores an empty-label tombstone that keeps <code>(epoch, seq)</code>.</p>
+        <ul><li><strong>Tests:</strong> 11, not the plan's 10, because of the new <code>clear_keeps_tombstone_ordering</code>. Task 5's total becomes 23.</li>
+        <li><strong>Tradeoff:</strong> a helper whose clock goes backwards (a VM snapshot revert gives a lower epoch) stays Stale until the Mac app restarts. That is inherent to the epoch design.</li>
+        <li><strong>Interaction for Task 3:</strong> the wake hook calls this <code>clear(&amp;GLOBAL)</code>.</li></ul>
+      </div>
+      <div class="cc">
+        <h3>Task 1 &middot; Change 1 &mdash; clear() tombstone</h3>
+        <p class="loc"><code>crates/screenpipe-engine/src/external_context.rs</code> &mdash; <code>clear</code>. Committed <code>ab235c5</code>.</p>
+        <div class="ba">
+          <p class="lbl before">Before</p>
+          <pre class="before"><code>pub fn clear(store: &amp;ContextStore) {
+    store.store(None);
+}</code></pre>
+          <p class="lbl after">After</p>
+          <pre class="after"><code>pub fn clear(store: &amp;ContextStore) {
+    // Tombstone, not None: a late post with an old (epoch, seq) must stay Stale.
+    store.rcu(|cur| {
+        cur.as_ref().map(|c| {
+            Arc::new(ExternalContext {
+                app_name: String::new(), window_title: String::new(),
+                epoch: c.epoch, seq: c.seq, received_at: c.received_at,
+            })
+        })
+    });
+}</code></pre>
+        </div>
+      </div>
+      <div class="cc">
+        <h3>Task 1 &middot; Change 2 &mdash; ordered accept</h3>
+        <p class="loc"><code>crates/screenpipe-engine/src/external_context.rs</code> &mdash; new module, <code>accept</code>. Committed <code>dae8ad7</code>.</p>
+        <div class="ba">
+          <p class="lbl before">Before</p>
+          <pre class="before"><code>(new file)</code></pre>
+          <p class="lbl after">After</p>
+          <pre class="after"><code>store.rcu(|cur| {
+    stale = cur.as_ref().is_some_and(|c| (c.epoch, c.seq) &gt;= (epoch, seq));
+    if stale { cur.clone() } else { Some(new.clone()) }
+});</code></pre>
+        </div>
+      </div>
+      <h3 class="tglabel">Task 2 &mdash; Authenticated route POST /context/external <span class="st-mini">&middot; f17bde2</span></h3>
+      <div class="dd-card">
+        <span class="dd-tag">Task 2 &middot; Done &middot; f17bde2</span>
+        <h3>Route registered with plain axum, not the oasgen builder</h3>
+        <p><strong>Plan deviation (repo mismatch).</strong> The plan said <code>.post("/context/external", ...)</code> next to <code>/add</code>. That is the oasgen builder, which panics at startup on a non-oasgen handler (<code>server.rs:1154</code> documents this). The route is a plain <code>.route(..., axum::routing::post(...))</code> just after <code>.merge(server.into_router())</code>.</p>
+        <ul><li><strong>Verified:</strong> it sits in the same chain as <code>/add</code>, before every layer (auth, CORS, privacy, trace) at <code>server.rs:1565-1715</code>. It is also kept out of the public OpenAPI spec.</li>
+        <li><strong>Deferred to the final review:</strong> malformed JSON is rejected by axum (400/415/422) before the <code>api_auth</code> check; 8 clippy <code>await_holding_lock</code> warnings in the tests; and some route tests could be stronger.</li></ul>
+      </div>
+      <div class="cc">
+        <h3>Task 2 &middot; Change 1 &mdash; route registration</h3>
+        <p class="loc"><code>crates/screenpipe-engine/src/server.rs</code> &mdash; router chain, after the oasgen merge. Committed <code>f17bde2</code>.</p>
+        <div class="ba">
+          <p class="lbl before">Before</p>
+          <pre class="before"><code>.merge(server.into_router())
+...</code></pre>
+          <p class="lbl after">After</p>
+          <pre class="after"><code>.merge(server.into_router())
+.route("/context/external", axum::routing::post(post_external_context))
+...</code></pre>
+        </div>
+      </div>
+      <h3 class="tglabel">Task 3 &mdash; Capture hook: guest labels for storage only <span class="st-mini">&middot; b76491b</span></h3>
+      <div class="dd-card">
+        <span class="dd-tag">Task 3 &middot; Done &middot; b76491b</span>
+        <h3>Live timeline also shows the guest label (ruling on a plan-mandated finding)</h3>
+        <p><strong>Plan deviation.</strong> The plan said guest labels go to the DB insert <em>only</em>. That made the live timeline (hot cache) show <code>Parallels Desktop</code> for a frame the DB stores as <code>MultiTerminal</code>. <code>PairedCaptureResult.stored_labels</code> now carries the pair actually written to the row, and only <code>push_to_hot_cache</code> reads it.</p>
+        <ul><li><strong>Unchanged:</strong> every admission and processing decision (lock screen, include list, URL policy, DRM, bounds, meeting, OCR gate) still uses host values.</li>
+        <li><strong>Semantic projection</strong> stays on host values. It can't be reached for Parallels frames: no parser matches, so the job ends with <code>no_candidate</code> before anything is stored.</li>
+        <li><strong>Rulings applied:</strong> R2 (the wake clear goes in <code>mark_recently_woke</code>) and R1 (the wake tests take <code>TEST_LOCK</code>).</li>
+        <li><strong>Extra file:</strong> <code>packages/sdk/recorder-core</code> needed <code>stored_labels: None</code> to compile.</li>
+        <li><strong>Deferred:</strong> a Parallels-host miss on the focus monitor costs two lock-free loads, where the constraint says one (tens of ns, no allocation).</li></ul>
+      </div>
+      <div class="cc">
+        <h3>Task 3 &middot; Change 1 &mdash; stored labels only at the insert</h3>
+        <p class="loc"><code>crates/screenpipe-capture/src/paired_capture.rs</code> &mdash; frame insert in <code>paired_capture_inner</code>. Committed <code>b7d3dfd</code>.</p>
+        <div class="ba">
+          <p class="lbl before">Before</p>
+          <pre class="before"><code>insert_snapshot_frame_with_ocr(... ctx.app_name, ctx.window_name, ...)</code></pre>
+          <p class="lbl after">After</p>
+          <pre class="after"><code>let (app, window) = match &amp;ctx.stored_labels {
+    Some((a, w)) if ctx.monitor_hosts_focus =&gt; (Some(a.as_str()), Some(w.as_str())),
+    _ =&gt; (app_name, window_name),
+};
+insert_snapshot_frame_with_ocr(... app, window, ...)</code></pre>
+        </div>
+      </div>
+      <div class="cc">
+        <h3>Task 3 &middot; Change 2 &mdash; guest_labels with early returns</h3>
+        <p class="loc"><code>crates/screenpipe-engine/src/external_context.rs</code>. Committed <code>b76491b</code>.</p>
+        <div class="ba">
+          <p class="lbl before">Before</p>
+          <pre class="before"><code>(new function)</code></pre>
+          <p class="lbl after">After</p>
+          <pre class="after"><code>pub fn guest_labels(store, host_app, monitor_hosts_focus, is_startup, seq_at_screenshot, now) {
+    if is_startup || !monitor_hosts_focus || !is_parallels(host_app) { return None; }
+    override_for(store, host_app, monitor_hosts_focus, seq_at_screenshot, now)
+}</code></pre>
+        </div>
+      </div>
+      <h3 class="tglabel">Task 4 &mdash; VM helper tools/vm-context-helper <span class="st-mini">&middot; e4ac34c</span></h3>
+      <div class="dd-card">
+        <span class="dd-tag">Task 4 &middot; Done &middot; e4ac34c</span>
+        <h3>Owner-PID gate before every keyed post (security fix)</h3>
+        <p><strong>Important fix.</strong> The 403 retry re-read the key and posted again without re-checking who owned port 3031, a gap of a whole request round trip. The gate now runs inside <code>PostAsync</code>, so it guards every request. A test proves a "not ready" gate on the second call sends only one request.</p>
+        <ul><li><strong>Hardening ruled into the same round:</strong> the helper joins its own kill-on-close Job Object, so ssh children are born inside it; <code>UseProxy=false</code> and <code>AllowAutoRedirect=false</code>; the dead <code>Down</code> event is removed; the old <code>Process</code> is disposed; a test for not splitting surrogate pairs (R4); and a missing key file is logged clearly and starts no tunnel.</li>
+        <li><strong>Round 2:</strong> a job setup failure is logged with the failing call and its Win32 error, then the helper exits (fails closed).</li>
+        <li><strong>Not verified live:</strong> the real tunnel and a 204 (Task 5), backoff, lock/unlock, log roll, and the job-failure path.</li></ul>
+      </div>
+      <div class="cc">
+        <h3>Task 4 &middot; Change 1 &mdash; gate inside PostAsync</h3>
+        <p class="loc"><code>tools/vm-context-helper/Sender.cs</code> &mdash; <code>PostAsync</code>. Committed <code>48ddcfd</code>.</p>
+        <div class="ba">
+          <p class="lbl before">Before</p>
+          <pre class="before"><code>if (!await _ready(ct)) return -1;   // once, in TrySendAsync
+var s = await PostAsync(body, key);
+if (s == 403) { key = _readKey(); s = await PostAsync(body, key); }</code></pre>
+          <p class="lbl after">After</p>
+          <pre class="after"><code>async Task&lt;int&gt; PostAsync(...) {
+    if (!await _ready(ct)) return -1;   // before every keyed request
+    ...
+}</code></pre>
+        </div>
+      </div>
+      <h3 class="tglabel">Task 5 &mdash; Docs, final review, end-to-end check <span class="st-mini">&middot; ba8b958</span></h3>
+      <div class="dd-card">
+        <span class="dd-tag">Task 5 &middot; Done &middot; ba8b958</span>
+        <h3>Heartbeats no longer drop the label (final-review fix)</h3>
+        <p><strong>Plan flaw, fixed.</strong> Every heartbeat got a new <code>seq</code>, and the hook required the stored seq to equal the one snapshotted before the screenshot, so steady-state VM frames intermittently fell back to Parallels Desktop. <code>ExternalContext.since</code> now moves only when the labels change (or on a new epoch or a clear); the snapshot and <code>override_for</code> compare <code>since</code>, while Stale ordering still uses <code>(epoch, seq)</code>. A miss is still one load.</p>
+        <ul><li><strong>Also fixed in the wave:</strong> rustfmt (a CI blocker); the helper logs instead of crashing when session registration fails; an unidentifiable foreground clears the label; Warp is labelled <code>Warp</code> (its exe is <code>preview.exe</code>; ProductName is used only for generic exe stems); PERSONAL.md wording.</li>
+        <li><strong>End-to-end (twice, Owner present):</strong> labels for MultiTerminal, Warp and chrome; 8 consecutive steady chrome frames kept the label; helper stopped, then frames say Parallels Desktop; VM locked, then frames say Parallels Desktop (the clear lands about 1 s after the lock).</li>
+        <li><strong>Parked for the Owner:</strong> the generic-stem list has four speculative entries beyond <code>preview</code>; <code>ProductName()</code> catches only FileNotFoundException.</li></ul>
+      </div>
+ -> Implementation Log groups, appended as tasks complete (may start
+                       empty, or with a single PRE-IMPL · CONTEXT card)
+  Eyebrow FIXED "Notes · Implementation". Status pill starts "Implementation — In Progress".
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VM Context Capture</title>
+<style>
+  :root{
+    --paper:#f4efe1; --ink:#221f18; --maroon:#8a2b27; --meta-bg:#e9e1cd;
+    --label:#6d5f4e; --value:#2b2820; --amber:#a8762b; --olive:#7a6a2e;
+    --rule:#ddd3bc; --subrule:#ece4d0; --green:#3f7d3f; --card:#faf7ef;
+    --code-bg:#2b2820; --code-ink:#f4efe1; --add:#3f7d3f; --del:#8a2b27;
+    --serif:Georgia,'Times New Roman',serif;
+    --mono:ui-monospace,'Cascadia Mono',Consolas,'Courier New',monospace;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--serif);padding:3.5rem 2rem;}
+  .wrap{max-width:1040px;margin:0 auto;}
+  .eyebrow{font-family:var(--mono);text-transform:uppercase;letter-spacing:.35em;
+           font-size:.8rem;font-weight:700;color:var(--maroon);margin:0 0 1.1rem;}
+  h1{font-family:var(--serif);font-weight:700;font-size:clamp(2.6rem,6vw,4rem);
+     line-height:1.04;letter-spacing:-.01em;margin:0 0 .9rem;}
+  .subtitle{font-family:var(--serif);font-style:italic;font-weight:700;
+            font-size:clamp(1.25rem,2.4vw,1.7rem);line-height:1.3;margin:0 0 1.9rem;max-width:48ch;}
+  .meta-card{display:grid;grid-template-columns:max-content 1fr;column-gap:1.75rem;row-gap:.55rem;
+             align-items:baseline;background:var(--meta-bg);border-radius:14px;
+             border-left:6px solid var(--maroon);padding:1.4rem 1.85rem;}
+  .meta-card dt{font-family:var(--mono);color:var(--label);font-size:.95rem;font-weight:400;}
+  .meta-card dd{font-family:var(--mono);color:var(--value);font-size:.95rem;margin:0;word-break:break-word;}
+  .status-pill{display:inline-block;border:1px solid var(--amber);color:var(--amber);border-radius:999px;
+               padding:.12rem .75rem;font-size:.82rem;letter-spacing:.08em;text-transform:uppercase;
+               line-height:1.45;background:transparent;}
+  .section-label{font-family:var(--mono);text-transform:uppercase;letter-spacing:.2em;font-size:.95rem;
+                 font-weight:700;color:var(--ink);border-bottom:2px solid var(--ink);
+                 padding-bottom:.5rem;margin:2.6rem 0 1.4rem;}
+  table.tasks{width:100%;border-collapse:collapse;}
+  table.tasks th{font-family:var(--mono);text-transform:uppercase;letter-spacing:.12em;font-size:.72rem;
+                 color:var(--label);text-align:left;font-weight:400;padding:.4rem .75rem;}
+  table.tasks td{padding:.6rem .75rem;vertical-align:middle;}
+  td.num{font-family:var(--mono);color:var(--label);width:3rem;}
+  td.st{width:1%;white-space:nowrap;text-align:right;}
+  tr.task-row td{border-top:2px solid var(--ink);font-size:1.05rem;}
+  tr.task-row td.desc{font-weight:700;}
+  tr.sub td{border-top:1px solid var(--subrule);}
+  td.subtask{padding-left:2.1rem;color:var(--label);font-size:.95rem;}
+  .tstatus{font-family:var(--mono);font-size:.78rem;padding:.22rem .65rem;border-radius:7px;white-space:nowrap;}
+  .tstatus.done{background:#d6e8cf;color:var(--green);}
+  .tstatus.inprogress{background:#ecdcbf;color:#9a6a1f;}
+  .tstatus.pending{background:#e7dfca;color:var(--label);}
+  .tglabel{font-family:var(--serif);font-weight:700;font-size:1.55rem;color:var(--maroon);margin:2.8rem 0 .2rem;padding-bottom:.3rem;border-bottom:2px solid var(--rule);}
+  .tglabel .st-mini{font-family:var(--mono);font-size:.72rem;font-weight:400;color:var(--label);letter-spacing:.05em;}
+  .cc{margin:1.7rem 0;}
+  .cc h3{font-family:var(--serif);font-weight:700;font-size:1.25rem;margin:.3rem 0 .3rem;color:var(--maroon);}
+  .cc .loc{font-family:var(--mono);font-size:.8rem;color:var(--label);margin:0 0 .6rem;}
+  .cc .ba{display:grid;grid-template-columns:1fr;gap:.5rem;}
+  .cc .lbl{font-family:var(--mono);text-transform:uppercase;letter-spacing:.1em;font-size:.68rem;font-weight:700;margin:.2rem 0 -.2rem;}
+  .cc .lbl.before{color:var(--del);}
+  .cc .lbl.after{color:var(--add);}
+  pre{font-family:var(--mono);font-size:.8rem;line-height:1.5;background:var(--code-bg);color:var(--code-ink);
+      border-radius:10px;padding:1rem 1.2rem;overflow-x:auto;margin:.3rem 0;}
+  pre.before{border-left:4px solid var(--del);}
+  pre.after{border-left:4px solid var(--add);}
+  pre code{background:none;padding:0;font-size:1em;color:inherit;border:none;}
+  .pending-note{font-family:var(--mono);font-size:.85rem;color:var(--label);font-style:italic;}
+  .dd-card{position:relative;background:var(--card);border:1px solid var(--rule);border-radius:14px;
+           padding:1.7rem 1.85rem 1.4rem;margin:1.7rem 0;}
+  .dd-tag{position:absolute;top:-0.75rem;left:1.5rem;background:var(--maroon);color:var(--paper);
+          font-family:var(--mono);text-transform:uppercase;letter-spacing:.1em;font-size:.72rem;
+          font-weight:700;padding:.28rem .7rem;border-radius:6px;}
+  .dd-card h3{font-family:var(--serif);font-weight:700;font-size:1.3rem;margin:.3rem 0 .8rem;}
+  .dd-card p{font-size:1.05rem;line-height:1.55;margin:.5rem 0;}
+  .dd-card ul{margin:.6rem 0;padding-left:1.4rem;}
+  .dd-card li{margin:.5rem 0;line-height:1.55;}
+  code{font-family:var(--mono);background:var(--meta-bg);border:1px solid var(--rule);
+       padding:.05em .35em;border-radius:5px;font-size:.85em;}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <p class="eyebrow">Notes &middot; Implementation</p>
+      <h1>VM Context Capture</h1>
+      <p class="subtitle">Label the Mac's Parallels frames with the Windows app and title sent by a VM helper.</p>
+      <dl class="meta-card">
+        <dt>Started</dt><dd>2026-11-25</dd>
+        <dt>Branch</dt><dd>task/5925d7b5</dd>
+        <dt>Spec</dt><dd>docs/mySuperpower/specs/2026-11-01-vm-context-capture-design.html</dd>
+        <dt>Plan</dt><dd>docs/mySuperpower/plans/2026-11-01-vm-context-capture.html</dd>
+        <dt>Status</dt><dd><span class="status-pill">Implementation &mdash; Complete</span></dd>
+      </dl>
+    </header>
+
+    <section class="task-status">
+      <h2 class="section-label">Task Status</h2>
+      <table class="tasks">
+        <thead><tr><th>Task</th><th>Description</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr class="task-row"><td class="num">1</td><td class="desc">Context store with ordering and freshness</td><td class="st"><span class="tstatus done">&check; done &middot; ab235c5</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; write failing test (red)</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; implement (green)</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; commit</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="task-row"><td class="num">2</td><td class="desc">Authenticated route POST /context/external</td><td class="st"><span class="tstatus done">&check; done &middot; f17bde2</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; write failing test (red)</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; implement (green)</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; commit</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="task-row"><td class="num">3</td><td class="desc">Capture hook: guest labels for storage only</td><td class="st"><span class="tstatus done">&check; done &middot; b76491b</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; write failing test (red)</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; implement (green)</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; commit</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="task-row"><td class="num">4</td><td class="desc">VM helper tools/vm-context-helper</td><td class="st"><span class="tstatus done">&check; done &middot; e4ac34c</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; write failing test (red)</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; implement (green)</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; port-hijack manual check</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; commit</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="task-row"><td class="num">5</td><td class="desc">Docs, end-to-end check, cut-over</td><td class="st"><span class="tstatus done">&check; done &middot; ba8b958</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; full checks</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; dev build + end-to-end with Owner</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; commit</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <!-- One task-row per plan task + its subtask rows. START all "pending"; flip live:
+          <tr class="task-row"><td class="num">1</td><td class="desc">Task title</td><td class="st"><span class="tstatus done">&check; done &middot; abc1234</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; write failing test (red)</td><td class="st"><span class="tstatus done">&check; done</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; implement (green)</td><td class="st"><span class="tstatus inprogress">in progress</span></td></tr>
+          <tr class="sub"><td></td><td class="subtask">&#8627; commit</td><td class="st"><span class="tstatus pending">pending</span></td></tr>
+          -->
+        </tbody>
+      </table>
+    </section>
+
+    <section class="log">
+      <h2 class="section-label">Implementation Log &middot; By Task</h2>
+      <p class="pending-note">Everything for each task together &mdash; decisions/deviations and the before&rarr;after code.</p>
+            <div class="dd-card">
+        <span class="dd-tag">Pre-impl &middot; Context</span>
+        <h3>Pre-flight rulings</h3>
+        <ul>
+          <li><strong>R1:</strong> the <code>TEST_LOCK</code> on the sleep_monitor wake tests moves from Task 2 to Task 3, where wake starts clearing <code>GLOBAL</code>.</li>
+          <li><strong>R2:</strong> the wake clear goes in <code>mark_recently_woke</code> (shared by macOS, Windows, Linux and the clock-gap fallback), not the macOS-only <code>on_did_wake</code>.</li>
+          <li><strong>R3:</strong> the helper also truncates <code>app_name</code> to 512, so a long name can't get 400 forever.</li>
+          <li><strong>R4:</strong> Rust bounds count chars; the helper truncates by UTF-16 units without splitting a surrogate pair.</li>
+          <li><strong>Test loop:</strong> Rust tests run in <code>mac:~/Workspace/wt-5925d7b5</code>, synced by tar, because <code>git push</code> to the Mac fails without git-lfs there.</li>
+        </ul>
+      </div>
+      <h3 class="tglabel">Task 1 &mdash; Context store with ordering and freshness <span class="st-mini">&middot; ab235c5</span></h3>
+      <div class="dd-card">
+        <span class="dd-tag">Task 1 &middot; Done &middot; ab235c5</span>
+        <h3>clear() keeps a tombstone (review fix)</h3>
+        <p><strong>Important fix.</strong> The first <code>clear()</code> stored <code>None</code>, which dropped the ordering: after a wake clear, a late post from before sleep was accepted and relabelled frames for up to 5 s. <code>clear()</code> now stores an empty-label tombstone that keeps <code>(epoch, seq)</code>.</p>
+        <ul><li><strong>Tests:</strong> 11, not the plan's 10, because of the new <code>clear_keeps_tombstone_ordering</code>. Task 5's total becomes 23.</li>
+        <li><strong>Tradeoff:</strong> a helper whose clock goes backwards (a VM snapshot revert gives a lower epoch) stays Stale until the Mac app restarts. That is inherent to the epoch design.</li>
+        <li><strong>Interaction for Task 3:</strong> the wake hook calls this <code>clear(&amp;GLOBAL)</code>.</li></ul>
+      </div>
+      <div class="cc">
+        <h3>Task 1 &middot; Change 1 &mdash; clear() tombstone</h3>
+        <p class="loc"><code>crates/screenpipe-engine/src/external_context.rs</code> &mdash; <code>clear</code>. Committed <code>ab235c5</code>.</p>
+        <div class="ba">
+          <p class="lbl before">Before</p>
+          <pre class="before"><code>pub fn clear(store: &amp;ContextStore) {
+    store.store(None);
+}</code></pre>
+          <p class="lbl after">After</p>
+          <pre class="after"><code>pub fn clear(store: &amp;ContextStore) {
+    // Tombstone, not None: a late post with an old (epoch, seq) must stay Stale.
+    store.rcu(|cur| {
+        cur.as_ref().map(|c| {
+            Arc::new(ExternalContext {
+                app_name: String::new(), window_title: String::new(),
+                epoch: c.epoch, seq: c.seq, received_at: c.received_at,
+            })
+        })
+    });
+}</code></pre>
+        </div>
+      </div>
+      <div class="cc">
+        <h3>Task 1 &middot; Change 2 &mdash; ordered accept</h3>
+        <p class="loc"><code>crates/screenpipe-engine/src/external_context.rs</code> &mdash; new module, <code>accept</code>. Committed <code>dae8ad7</code>.</p>
+        <div class="ba">
+          <p class="lbl before">Before</p>
+          <pre class="before"><code>(new file)</code></pre>
+          <p class="lbl after">After</p>
+          <pre class="after"><code>store.rcu(|cur| {
+    stale = cur.as_ref().is_some_and(|c| (c.epoch, c.seq) &gt;= (epoch, seq));
+    if stale { cur.clone() } else { Some(new.clone()) }
+});</code></pre>
+        </div>
+      </div>
+      <h3 class="tglabel">Task 2 &mdash; Authenticated route POST /context/external <span class="st-mini">&middot; f17bde2</span></h3>
+      <div class="dd-card">
+        <span class="dd-tag">Task 2 &middot; Done &middot; f17bde2</span>
+        <h3>Route registered with plain axum, not the oasgen builder</h3>
+        <p><strong>Plan deviation (repo mismatch).</strong> The plan said <code>.post("/context/external", ...)</code> next to <code>/add</code>. That is the oasgen builder, which panics at startup on a non-oasgen handler (<code>server.rs:1154</code> documents this). The route is a plain <code>.route(..., axum::routing::post(...))</code> just after <code>.merge(server.into_router())</code>.</p>
+        <ul><li><strong>Verified:</strong> it sits in the same chain as <code>/add</code>, before every layer (auth, CORS, privacy, trace) at <code>server.rs:1565-1715</code>. It is also kept out of the public OpenAPI spec.</li>
+        <li><strong>Deferred to the final review:</strong> malformed JSON is rejected by axum (400/415/422) before the <code>api_auth</code> check; 8 clippy <code>await_holding_lock</code> warnings in the tests; and some route tests could be stronger.</li></ul>
+      </div>
+      <div class="cc">
+        <h3>Task 2 &middot; Change 1 &mdash; route registration</h3>
+        <p class="loc"><code>crates/screenpipe-engine/src/server.rs</code> &mdash; router chain, after the oasgen merge. Committed <code>f17bde2</code>.</p>
+        <div class="ba">
+          <p class="lbl before">Before</p>
+          <pre class="before"><code>.merge(server.into_router())
+...</code></pre>
+          <p class="lbl after">After</p>
+          <pre class="after"><code>.merge(server.into_router())
+.route("/context/external", axum::routing::post(post_external_context))
+...</code></pre>
+        </div>
+      </div>
+      <h3 class="tglabel">Task 3 &mdash; Capture hook: guest labels for storage only <span class="st-mini">&middot; b76491b</span></h3>
+      <div class="dd-card">
+        <span class="dd-tag">Task 3 &middot; Done &middot; b76491b</span>
+        <h3>Live timeline also shows the guest label (ruling on a plan-mandated finding)</h3>
+        <p><strong>Plan deviation.</strong> The plan said guest labels go to the DB insert <em>only</em>. That made the live timeline (hot cache) show <code>Parallels Desktop</code> for a frame the DB stores as <code>MultiTerminal</code>. <code>PairedCaptureResult.stored_labels</code> now carries the pair actually written to the row, and only <code>push_to_hot_cache</code> reads it.</p>
+        <ul><li><strong>Unchanged:</strong> every admission and processing decision (lock screen, include list, URL policy, DRM, bounds, meeting, OCR gate) still uses host values.</li>
+        <li><strong>Semantic projection</strong> stays on host values. It can't be reached for Parallels frames: no parser matches, so the job ends with <code>no_candidate</code> before anything is stored.</li>
+        <li><strong>Rulings applied:</strong> R2 (the wake clear goes in <code>mark_recently_woke</code>) and R1 (the wake tests take <code>TEST_LOCK</code>).</li>
+        <li><strong>Extra file:</strong> <code>packages/sdk/recorder-core</code> needed <code>stored_labels: None</code> to compile.</li>
+        <li><strong>Deferred:</strong> a Parallels-host miss on the focus monitor costs two lock-free loads, where the constraint says one (tens of ns, no allocation).</li></ul>
+      </div>
+      <div class="cc">
+        <h3>Task 3 &middot; Change 1 &mdash; stored labels only at the insert</h3>
+        <p class="loc"><code>crates/screenpipe-capture/src/paired_capture.rs</code> &mdash; frame insert in <code>paired_capture_inner</code>. Committed <code>b7d3dfd</code>.</p>
+        <div class="ba">
+          <p class="lbl before">Before</p>
+          <pre class="before"><code>insert_snapshot_frame_with_ocr(... ctx.app_name, ctx.window_name, ...)</code></pre>
+          <p class="lbl after">After</p>
+          <pre class="after"><code>let (app, window) = match &amp;ctx.stored_labels {
+    Some((a, w)) if ctx.monitor_hosts_focus =&gt; (Some(a.as_str()), Some(w.as_str())),
+    _ =&gt; (app_name, window_name),
+};
+insert_snapshot_frame_with_ocr(... app, window, ...)</code></pre>
+        </div>
+      </div>
+      <div class="cc">
+        <h3>Task 3 &middot; Change 2 &mdash; guest_labels with early returns</h3>
+        <p class="loc"><code>crates/screenpipe-engine/src/external_context.rs</code>. Committed <code>b76491b</code>.</p>
+        <div class="ba">
+          <p class="lbl before">Before</p>
+          <pre class="before"><code>(new function)</code></pre>
+          <p class="lbl after">After</p>
+          <pre class="after"><code>pub fn guest_labels(store, host_app, monitor_hosts_focus, is_startup, seq_at_screenshot, now) {
+    if is_startup || !monitor_hosts_focus || !is_parallels(host_app) { return None; }
+    override_for(store, host_app, monitor_hosts_focus, seq_at_screenshot, now)
+}</code></pre>
+        </div>
+      </div>
+      <h3 class="tglabel">Task 4 &mdash; VM helper tools/vm-context-helper <span class="st-mini">&middot; e4ac34c</span></h3>
+      <div class="dd-card">
+        <span class="dd-tag">Task 4 &middot; Done &middot; e4ac34c</span>
+        <h3>Owner-PID gate before every keyed post (security fix)</h3>
+        <p><strong>Important fix.</strong> The 403 retry re-read the key and posted again without re-checking who owned port 3031, a gap of a whole request round trip. The gate now runs inside <code>PostAsync</code>, so it guards every request. A test proves a "not ready" gate on the second call sends only one request.</p>
+        <ul><li><strong>Hardening ruled into the same round:</strong> the helper joins its own kill-on-close Job Object, so ssh children are born inside it; <code>UseProxy=false</code> and <code>AllowAutoRedirect=false</code>; the dead <code>Down</code> event is removed; the old <code>Process</code> is disposed; a test for not splitting surrogate pairs (R4); and a missing key file is logged clearly and starts no tunnel.</li>
+        <li><strong>Round 2:</strong> a job setup failure is logged with the failing call and its Win32 error, then the helper exits (fails closed).</li>
+        <li><strong>Not verified live:</strong> the real tunnel and a 204 (Task 5), backoff, lock/unlock, log roll, and the job-failure path.</li></ul>
+      </div>
+      <div class="cc">
+        <h3>Task 4 &middot; Change 1 &mdash; gate inside PostAsync</h3>
+        <p class="loc"><code>tools/vm-context-helper/Sender.cs</code> &mdash; <code>PostAsync</code>. Committed <code>48ddcfd</code>.</p>
+        <div class="ba">
+          <p class="lbl before">Before</p>
+          <pre class="before"><code>if (!await _ready(ct)) return -1;   // once, in TrySendAsync
+var s = await PostAsync(body, key);
+if (s == 403) { key = _readKey(); s = await PostAsync(body, key); }</code></pre>
+          <p class="lbl after">After</p>
+          <pre class="after"><code>async Task&lt;int&gt; PostAsync(...) {
+    if (!await _ready(ct)) return -1;   // before every keyed request
+    ...
+}</code></pre>
+        </div>
+      </div>
+      <h3 class="tglabel">Task 5 &mdash; Docs, final review, end-to-end check <span class="st-mini">&middot; ba8b958</span></h3>
+      <div class="dd-card">
+        <span class="dd-tag">Task 5 &middot; Done &middot; ba8b958</span>
+        <h3>Heartbeats no longer drop the label (final-review fix)</h3>
+        <p><strong>Plan flaw, fixed.</strong> Every heartbeat got a new <code>seq</code>, and the hook required the stored seq to equal the one snapshotted before the screenshot, so steady-state VM frames intermittently fell back to Parallels Desktop. <code>ExternalContext.since</code> now moves only when the labels change (or on a new epoch or a clear); the snapshot and <code>override_for</code> compare <code>since</code>, while Stale ordering still uses <code>(epoch, seq)</code>. A miss is still one load.</p>
+        <ul><li><strong>Also fixed in the wave:</strong> rustfmt (a CI blocker); the helper logs instead of crashing when session registration fails; an unidentifiable foreground clears the label; Warp is labelled <code>Warp</code> (its exe is <code>preview.exe</code>; ProductName is used only for generic exe stems); PERSONAL.md wording.</li>
+        <li><strong>End-to-end (twice, Owner present):</strong> labels for MultiTerminal, Warp and chrome; 8 consecutive steady chrome frames kept the label; helper stopped, then frames say Parallels Desktop; VM locked, then frames say Parallels Desktop (the clear lands about 1 s after the lock).</li>
+        <li><strong>Parked for the Owner:</strong> the generic-stem list has four speculative entries beyond <code>preview</code>; <code>ProductName()</code> catches only FileNotFoundException.</li></ul>
+      </div>
+
+      <!-- Append one GROUP per task as it completes: an h3.tglabel heading, then that task's
+           dd-card decision/deviation cards (substantive items only — off-spec decisions, plan
+           deviations, important fixes, cross-task interactions, tradeoffs; NOT routine
+           progress), then one .cc card per applied code change (BEFORE/AFTER excerpts, elide
+           unchanged runs with "..."). A run may open with a PRE-IMPL · CONTEXT dd-card
+           (no tglabel) for process context. Example group:
+
+      <h3 class="tglabel">Task 1 &mdash; Short task title <span class="st-mini">&middot; abc1234</span></h3>
+      <div class="dd-card">
+        <span class="dd-tag">Task 1 &middot; Done &middot; abc1234</span>
+        <h3>Short decision title</h3>
+        <p><strong>Decision (off-spec).</strong> What was decided and why; use inline <code>code</code> chips.</p>
+        <ul><li><strong>Rationale:</strong> …</li><li><strong>Interaction for Task N:</strong> …</li></ul>
+      </div>
+      <div class="cc">
+        <h3>Task 1 &middot; Change 1 &mdash; short change title</h3>
+        <p class="loc"><code>path/to/file.ext</code> &mdash; where in the file. Committed <code>abc1234</code>.</p>
+        <div class="ba">
+          <p class="lbl before">Before</p>
+          <pre class="before"><code>old lines (minimal excerpt; "..." for elided runs)</code></pre>
+          <p class="lbl after">After</p>
+          <pre class="after"><code>new lines</code></pre>
+        </div>
+      </div>
+      -->
+      <!-- TASK_LOG: append the next task group here (h3.tglabel heading, then its dd-card decisions, then its .cc before/after blocks) -->
+    </section>
+  </div>
+</body>
+</html>
