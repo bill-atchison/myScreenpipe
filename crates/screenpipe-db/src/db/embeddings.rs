@@ -17,6 +17,17 @@ pub const EMBEDDING_DIMS: usize = 384;
 /// at most this many (newest) sources so a single text cannot flood results.
 const SOURCES_PER_HIT: i64 = 20;
 
+// The correlated LIMIT walks idx_embedding_sources_text_hash backwards, so a
+// hit reads at most SOURCES_PER_HIT index entries however many frames share it.
+const KNN_SQL: &str = "SELECT s.source_type, s.source_id, c.chunk_index, h.distance \
+     FROM (SELECT rowid AS id, distance FROM text_embeddings_vec \
+           WHERE embedding MATCH ?1 AND k = ?2) h \
+     JOIN embedding_chunks c ON c.id = h.id \
+     JOIN embedding_sources s ON s.rowid IN ( \
+         SELECT rowid FROM embedding_sources WHERE text_hash = c.text_hash \
+         ORDER BY source_id DESC LIMIT ?3) \
+     ORDER BY h.distance, s.source_id DESC";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EmbeddingSourceType {
     Frame,
@@ -43,7 +54,7 @@ impl EmbeddingSourceType {
 }
 
 /// A capture row and the hash of the text it was embedded from.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmbeddingSource {
     pub source_type: EmbeddingSourceType,
     pub source_id: i64,
@@ -62,11 +73,19 @@ impl DatabaseManager {
     /// Record sources and any new chunks in one transaction. Chunks already
     /// stored for a `(text_hash, chunk_index)` are kept; already-mapped
     /// sources are left unchanged.
+    ///
+    /// `sources` are recorded as given: their text's chunks are in `chunks`,
+    /// or the text has none (nothing to embed). `reused` are sources whose
+    /// text the caller found via [`Self::known_text_hashes`] and did not
+    /// re-embed. If a deletion removed that text's chunks in the meantime,
+    /// recording them would leave the row unsearchable for good, so they are
+    /// skipped and returned for the caller to embed again.
     pub async fn insert_embeddings(
         &self,
         sources: &[EmbeddingSource],
+        reused: &[EmbeddingSource],
         chunks: &[EmbeddingChunk],
-    ) -> Result<(), SqlxError> {
+    ) -> Result<Vec<EmbeddingSource>, SqlxError> {
         let mut tx = self.begin_immediate_with_retry().await?;
         for chunk in chunks {
             let id: Option<i64> = sqlx::query_scalar(
@@ -85,7 +104,22 @@ impl DatabaseManager {
                     .await?;
             }
         }
-        for source in sources {
+        let mut stale = Vec::new();
+        for source in reused {
+            let stored: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM embedding_chunks WHERE text_hash = ?1)",
+            )
+            .bind(source.text_hash)
+            .fetch_one(&mut **tx.conn())
+            .await?;
+            if !stored {
+                stale.push(*source);
+            }
+        }
+        for source in sources
+            .iter()
+            .chain(reused.iter().filter(|s| !stale.contains(s)))
+        {
             sqlx::query(
                 "INSERT INTO embedding_sources (source_type, source_id, text_hash) \
                  VALUES (?1, ?2, ?3) ON CONFLICT (source_type, source_id) DO NOTHING",
@@ -97,7 +131,7 @@ impl DatabaseManager {
             .await?;
         }
         tx.commit().await?;
-        Ok(())
+        Ok(stale)
     }
 
     /// The subset of `hashes` whose chunks are already stored.
@@ -120,21 +154,12 @@ impl DatabaseManager {
         query: &[f32; EMBEDDING_DIMS],
         k: i64,
     ) -> Result<Vec<(EmbeddingSourceType, i64, i64, f32)>, SqlxError> {
-        let rows: Vec<(String, i64, i64, f64)> = sqlx::query_as(
-            "SELECT source_type, source_id, chunk_index, distance FROM ( \
-                 SELECT s.source_type, s.source_id, c.chunk_index, h.distance, \
-                        ROW_NUMBER() OVER (PARTITION BY h.id ORDER BY s.source_id DESC) AS n \
-                 FROM (SELECT rowid AS id, distance FROM text_embeddings_vec \
-                       WHERE embedding MATCH ?1 AND k = ?2) h \
-                 JOIN embedding_chunks c ON c.id = h.id \
-                 JOIN embedding_sources s ON s.text_hash = c.text_hash \
-             ) WHERE n <= ?3 ORDER BY distance, source_id DESC",
-        )
-        .bind(query.as_bytes())
-        .bind(k)
-        .bind(SOURCES_PER_HIT)
-        .fetch_all(&mut *self.acquire_read().await?)
-        .await?;
+        let rows: Vec<(String, i64, i64, f64)> = sqlx::query_as(KNN_SQL)
+            .bind(query.as_bytes())
+            .bind(k)
+            .bind(SOURCES_PER_HIT)
+            .fetch_all(&mut *self.acquire_read().await?)
+            .await?;
         rows.into_iter()
             .map(|(source_type, source_id, chunk_index, distance)| {
                 Ok((
@@ -295,6 +320,7 @@ mod tests {
     async fn embed_seed(db: &DatabaseManager) {
         db.insert_embeddings(
             &[frame(1, 10), frame(2, 10), audio(1, 20)],
+            &[],
             &[chunk(10, 0, 0), chunk(10, 1, 1), chunk(20, 0, 2)],
         )
         .await
@@ -335,7 +361,7 @@ mod tests {
         db.execute_raw_sql_write(SEED).await.unwrap();
         embed_seed(&db).await;
         // Re-inserting a known chunk is a no-op, not a duplicate vector.
-        db.insert_embeddings(&[frame(1, 10)], &[chunk(10, 0, 0)])
+        db.insert_embeddings(&[frame(1, 10)], &[], &[chunk(10, 0, 0)])
             .await
             .unwrap();
         assert_eq!(count(&db, "text_embeddings_vec").await, 3);
@@ -390,14 +416,170 @@ mod tests {
         let db = DatabaseManager::new("sqlite::memory:", Default::default())
             .await
             .unwrap();
-        let sources: Vec<_> = (1..=SOURCES_PER_HIT + 5).map(|id| frame(id, 10)).collect();
-        db.insert_embeddings(&sources, &[chunk(10, 0, 0)])
+        // One static screen shared by 5k frames, plus a second text.
+        let mut sources: Vec<_> = (1..=5000).map(|id| frame(id, 10)).collect();
+        sources.push(audio(1, 20));
+        db.insert_embeddings(&sources, &[], &[chunk(10, 0, 0), chunk(20, 0, 1)])
             .await
             .unwrap();
-        let hits = db.knn(&unit(0), 1).await.unwrap();
-        assert_eq!(hits.len() as i64, SOURCES_PER_HIT);
-        assert_eq!(hits[0].1, SOURCES_PER_HIT + 5, "newest sources first");
+        let hits = db.knn(&unit(0), 2).await.unwrap();
+        assert_eq!(hits.len() as i64, SOURCES_PER_HIT + 1);
+        let newest: Vec<i64> = (5001 - SOURCES_PER_HIT..=5000).rev().collect();
+        let ids: Vec<i64> = hits[..SOURCES_PER_HIT as usize]
+            .iter()
+            .map(|h| h.1)
+            .collect();
+        assert_eq!(ids, newest, "newest sources of the nearest text first");
+        assert_eq!(hits[SOURCES_PER_HIT as usize].0, EmbeddingSourceType::Audio);
         db.close().await;
+    }
+
+    /// The per-hit expansion must seek the (text_hash, source_id) index, not
+    /// read and sort every source of a shared text.
+    #[tokio::test]
+    async fn knn_expansion_seeks_the_source_index() {
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {KNN_SQL}")))
+                .bind(unit(0).as_bytes())
+                .bind(2i64)
+                .bind(SOURCES_PER_HIT)
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        let details: Vec<&str> = plan.iter().map(|row| row.3.as_str()).collect();
+        eprintln!("KNN plan: {details:#?}");
+        assert!(
+            details.iter().any(|d| d
+                == &"SEARCH embedding_sources USING COVERING INDEX idx_embedding_sources_text_hash (text_hash=?)"),
+            "{details:#?}"
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|d| d.starts_with("SCAN embedding_sources")),
+            "{details:#?}"
+        );
+        // Only the final ORDER BY over at most k * cap rows may sort.
+        assert_eq!(
+            details.iter().filter(|d| d.contains("TEMP B-TREE")).count(),
+            1,
+            "{details:#?}"
+        );
+        db.close().await;
+    }
+
+    /// known_text_hashes said "stored", then retention deleted that text's
+    /// last source (and with it the chunks) before the insert committed.
+    #[tokio::test]
+    async fn reused_source_whose_chunks_vanished_is_returned_not_recorded() {
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
+        db.execute_raw_sql_write(SEED).await.unwrap();
+        embed_seed(&db).await;
+        assert!(db.known_text_hashes(&[10]).await.unwrap().contains(&10));
+        db.execute_raw_sql_write("DELETE FROM frames WHERE id IN (1,2)")
+            .await
+            .unwrap();
+        let stale = db
+            .insert_embeddings(&[], &[frame(3, 10), frame(4, 20)], &[])
+            .await
+            .unwrap();
+        assert_eq!(stale, vec![frame(3, 10)]);
+        let recorded: Vec<i64> =
+            sqlx::query_scalar("SELECT source_id FROM embedding_sources WHERE source_type='frame'")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded, vec![4], "text 20 still has chunks");
+        // Re-embedding the returned source in the same batch records it.
+        let stale = db
+            .insert_embeddings(&[], &[frame(3, 10)], &[chunk(10, 0, 0)])
+            .await
+            .unwrap();
+        assert!(stale.is_empty());
+        assert_eq!(db.knn(&unit(0), 1).await.unwrap()[0].1, 3);
+        db.close().await;
+    }
+
+    /// Retention-delete cost of the embedding triggers (AGENTS hot-path rule):
+    /// the real retention slice over 50k frames, 20% of them embedded, with
+    /// and without this migration's objects.
+    #[tokio::test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    async fn retention_delete_cost() {
+        use chrono::TimeZone;
+        const FRAMES: i64 = 50_000;
+        let range = (
+            Utc.with_ymd_and_hms(2025, 12, 31, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap(),
+        );
+        for hybrid in [false, true] {
+            for with_embeddings in [false, true, false, true, false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let db = if hybrid {
+                    DatabaseManager::new_hybrid(root.path(), Default::default(), Default::default())
+                        .await
+                        .unwrap()
+                } else {
+                    let path = root.path().join("db.sqlite");
+                    DatabaseManager::new(path.to_str().unwrap(), Default::default())
+                        .await
+                        .unwrap()
+                };
+                db.execute_raw_sql_write(&format!(
+                    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<{FRAMES}) \
+                     INSERT INTO frames(id,timestamp,full_text) \
+                     SELECT i, strftime('%Y-%m-%dT%H:%M:%fZ','2026-01-01','+'||i||' seconds'), \
+                            'screen text '||(i % 2000) FROM n"
+                ))
+                .await
+                .unwrap();
+                if with_embeddings {
+                    // 10k embedded frames over 2k distinct texts (5 frames each).
+                    let sources: Vec<_> = (1..=FRAMES)
+                        .filter(|i| i % 5 == 0)
+                        .map(|i| frame(i, (i / 5) % 2000))
+                        .collect();
+                    let chunks: Vec<_> = (0..2000).map(|h| chunk(h, 0, h as usize % 384)).collect();
+                    db.insert_embeddings(&sources, &[], &chunks).await.unwrap();
+                } else {
+                    // The database as it was before this migration.
+                    db.execute_raw_sql_write(
+                        "DROP TRIGGER embedding_frames_ad; DROP TRIGGER embedding_audio_ad; \
+                         DROP TABLE text_embeddings_vec; DROP TABLE embedding_chunks; \
+                         DROP TABLE embedding_sources; DROP TABLE embedding_cursor;",
+                    )
+                    .await
+                    .unwrap();
+                }
+                let started = std::time::Instant::now();
+                let deleted = db
+                    .delete_retention_time_slice(range.0, range.0, range.1)
+                    .await
+                    .unwrap();
+                let elapsed = started.elapsed();
+                assert_eq!(deleted.frames_deleted, FRAMES as u64);
+                if with_embeddings {
+                    for table in [
+                        "embedding_sources",
+                        "embedding_chunks",
+                        "text_embeddings_vec",
+                    ] {
+                        assert_eq!(count(&db, table).await, 0, "{table}");
+                    }
+                }
+                eprintln!(
+                    "RETENTION mode={} embeddings={with_embeddings} frames={FRAMES} delete_ms={}",
+                    if hybrid { "compressed" } else { "sqlite" },
+                    elapsed.as_millis()
+                );
+                db.close().await;
+            }
+        }
     }
 
     #[tokio::test]
@@ -417,7 +599,7 @@ mod tests {
         )
         .await
         .unwrap();
-        db.insert_embeddings(&[frame(5, 1), audio(4, 2)], &[])
+        db.insert_embeddings(&[frame(5, 1), audio(4, 2)], &[], &[])
             .await
             .unwrap();
         let s = |v: &[(i64, &str)]| -> Vec<(i64, String)> {

@@ -28,6 +28,9 @@ const MAX_TOKENS: usize = 256;
 /// [CLS] and [SEP] fill the rest of each chunk's window.
 const CHUNK_TOKENS: usize = MAX_TOKENS - 2;
 const MAX_CHUNKS: usize = 8;
+/// 16 bytes per token covers ordinary prose with room to spare; denser text
+/// simply yields fewer chunks.
+const MAX_INPUT_BYTES: usize = MAX_CHUNKS * CHUNK_TOKENS * 16;
 
 /// Where screenpipe keeps downloaded models (same as the audio crate).
 pub fn default_cache_dir() -> Result<PathBuf> {
@@ -41,6 +44,13 @@ pub fn default_cache_dir() -> Result<PathBuf> {
 /// tokens each. Text past the eighth chunk is not embedded. A text the
 /// tokenizer rejects yields no chunks, like empty text.
 pub fn chunk(text: &str, tokenizer: &Tokenizer) -> Vec<String> {
+    // Only the first MAX_CHUNKS windows are kept, so don't tokenize a
+    // multi-megabyte capture past them.
+    let mut end = text.len().min(MAX_INPUT_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let text = &text[..end];
     let Ok(encoding) = tokenizer.encode(text, false) else {
         return Vec::new();
     };
@@ -263,6 +273,24 @@ mod tests {
         assert!(chunks
             .iter()
             .all(|c| text.contains(c.as_str()) && c.trim() == c));
+    }
+
+    #[test]
+    fn chunk_reads_only_a_bounded_prefix_of_huge_input() {
+        let t = word_tokenizer();
+        // 29-byte words: the byte bound lands inside a two-byte "é".
+        let word = format!("{} ", "é".repeat(14));
+        let huge = word.repeat(10 * 1024 * 1024 / word.len());
+        assert!(!huge.is_char_boundary(MAX_INPUT_BYTES));
+        let started = std::time::Instant::now();
+        let chunks = chunk(&huge, &t);
+        let elapsed = started.elapsed();
+        // Without the bound, 8 full windows of these words span ~59 KB.
+        let covered: usize = chunks.iter().map(|c| c.len() + 1).sum();
+        assert!(covered <= MAX_INPUT_BYTES, "{covered} bytes chunked");
+        assert!(!chunks.is_empty() && chunks.len() <= MAX_CHUNKS);
+        assert!(huge.starts_with(&chunks[0]));
+        eprintln!("10 MB input: {} chunks in {elapsed:?}", chunks.len());
     }
 
     #[test]

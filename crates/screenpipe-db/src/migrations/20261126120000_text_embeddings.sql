@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS embedding_sources (
     text_hash INTEGER NOT NULL,
     PRIMARY KEY (source_type, source_id)
 );
-CREATE INDEX IF NOT EXISTS idx_embedding_sources_text_hash ON embedding_sources(text_hash);
+-- Serves the delete cascade and KNN's newest-N-sources-per-text lookup.
+CREATE INDEX IF NOT EXISTS idx_embedding_sources_text_hash ON embedding_sources(text_hash, source_id);
 
 -- rowid = embedding_chunks.id. Vectors are L2-normalized, so L2 distance
 -- orders results exactly as cosine similarity would.
