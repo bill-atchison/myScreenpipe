@@ -1122,6 +1122,12 @@ impl SCServer {
                 get(crate::routes::privacy_release::ready_page),
             )
             .merge(server.into_router())
+            // Plain axum (not in OpenAPI): VM helper reports its foreground app.
+            // Auth is enforced by the global middleware plus the handler's own check.
+            .route(
+                "/context/external",
+                axum::routing::post(crate::routes::external_context::post_external_context),
+            )
             // Agent self-improvement lives behind one validated local API so
             // native Pi and ACP share profile safety, prompt rendering, skill
             // provenance, optimistic concurrency, and bundled protection.
