@@ -28,8 +28,20 @@ static class Program
 
         var tunnel = new Tunnel(Log.Write);
         var epoch = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        var sender = new Sender(new Uri($"http://127.0.0.1:{Tunnel.Port}/"), ReadKey, epoch,
-            tunnel.EnsureReadyAsync, Log.Write);
+        bool keyMissingLogged = false;
+        // No key file: neither start the tunnel nor send; rechecked on each retry/heartbeat.
+        Task<bool> Ready(CancellationToken ct)
+        {
+            if (!File.Exists(keyPath))
+            {
+                if (!keyMissingLogged) Log.Write(@"API key file missing: %APPDATA%\vm-context-helper\api-key");
+                keyMissingLogged = true;
+                return Task.FromResult(false);
+            }
+            keyMissingLogged = false;
+            return tunnel.EnsureReadyAsync(ct);
+        }
+        var sender = new Sender(new Uri($"http://127.0.0.1:{Tunnel.Port}/"), ReadKey, epoch, Ready, Log.Write);
         _ = Task.Run(() => sender.RunAsync(CancellationToken.None));
 
         bool locked = false;

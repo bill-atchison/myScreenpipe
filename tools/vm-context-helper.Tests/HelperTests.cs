@@ -52,6 +52,31 @@ public class HelperTests
         Assert.Equal(1024, b.GetProperty("window_title").GetString()!.Length);
     }
 
+    [Fact]
+    public void Body_TruncationNeverSplitsSurrogatePair()
+    {
+        // The emoji occupies UTF-16 units 1023 and 1024: a naive cut at 1024 keeps half of it.
+        var title = new string('x', 1023) + "\U0001F600" + "y";
+        // Read the raw string, not via JSON: the serializer would mask a lone surrogate as U+FFFD.
+        var body = NewSender(() => "k").BuildBody(new("App", title));
+        var t = (string)body.GetType().GetProperty("window_title")!.GetValue(body)!;
+        Assert.True(t.Length <= 1024);
+        Assert.False(char.IsHighSurrogate(t[^1]));
+    }
+
+    [Fact]
+    public async Task Send_GateChecksBeforeEveryPost_NoRetryWhenNotReady()
+    {
+        var fake = new Fake(HttpStatusCode.Forbidden, HttpStatusCode.NoContent);
+        int gateCalls = 0;
+        var s = new Sender(new Uri("http://127.0.0.1:3031/"), () => "k", 42,
+            ready: _ => Task.FromResult(++gateCalls == 1), handler: fake);
+        var status = await s.SendAsync(new("App", "t"));
+        Assert.Equal(-1, status);
+        Assert.Equal(2, gateCalls);
+        Assert.Single(fake.Auth);
+    }
+
     sealed class Fake(params HttpStatusCode[] answers) : HttpMessageHandler
     {
         public List<string?> Auth = new();

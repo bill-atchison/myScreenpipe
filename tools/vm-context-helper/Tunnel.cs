@@ -22,17 +22,18 @@ public sealed class Tunnel
     DateTime _nextStart = DateTime.MinValue;
     string? _lastNote;
 
-    public event Action? Down;
-
     public Tunnel(Action<string> log)
     {
         _log = log;
         // Kill-on-close: the ssh child dies with this process, however it dies.
+        // The helper itself joins the job so every descendant (ProxyCommand etc.)
+        // is born inside it, with no assignment gap.
         _job = CreateJobObjectW(0, null);
         var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
         info.BasicLimitInformation.LimitFlags = 0x2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         if (!SetInformationJobObject(_job, 9 /* ExtendedLimitInformation */, ref info,
-                Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()))
+                Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+            || !AssignProcessToJobObject(_job, Process.GetCurrentProcess().Handle))
             throw new InvalidOperationException("job object setup failed");
     }
 
@@ -88,9 +89,9 @@ public sealed class Tunnel
             var p = Process.Start(psi) ?? throw new InvalidOperationException("ssh did not start");
             p.EnableRaisingEvents = true;
             p.ErrorDataReceived += (_, e) => { if (!string.IsNullOrWhiteSpace(e.Data)) _log("ssh: " + e.Data); };
-            p.Exited += (_, _) => { _log("tunnel down"); Down?.Invoke(); };
+            p.Exited += (_, _) => _log("tunnel down");
             p.BeginErrorReadLine();
-            if (!AssignProcessToJobObject(_job, p.Handle)) { p.Kill(); throw new InvalidOperationException("job assign failed"); }
+            _child?.Dispose();
             _child = p;
             return true;
         }

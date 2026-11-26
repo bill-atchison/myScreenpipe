@@ -42,7 +42,8 @@ public sealed class Sender
         _epoch = epoch;
         _ready = ready;
         _log = log ?? (_ => { });
-        _http = handler is null ? new HttpClient() : new HttpClient(handler);
+        // No system proxy and no redirects: the owner-PID gate only vouches for 127.0.0.1:3031.
+        _http = new HttpClient(handler ?? new HttpClientHandler { UseProxy = false, AllowAutoRedirect = false });
         _http.Timeout = TimeSpan.FromSeconds(5);
     }
 
@@ -75,21 +76,27 @@ public sealed class Sender
         return s[..n];
     }
 
-    /// <summary>Returns the final HTTP status. Re-reads the key once on 403 and retries once.</summary>
+    const int NotReady = -1;
+
+    /// <summary>
+    /// Returns the final HTTP status, or -1 when the gate refused (nothing sent).
+    /// Re-reads the key once on 403 and retries once.
+    /// </summary>
     public async Task<int> SendAsync(ForegroundInfo? info, CancellationToken ct = default)
     {
-        _key ??= _readKey();
-        int status = await PostAsync(info, _key, ct);
+        int status = await PostAsync(info, forceKeyRead: false, ct);
         if (status == 403)
-        {
-            _key = _readKey();
-            status = await PostAsync(info, _key, ct);
-        }
+            status = await PostAsync(info, forceKeyRead: true, ct);
         return status;
     }
 
-    async Task<int> PostAsync(ForegroundInfo? info, string key, CancellationToken ct)
+    async Task<int> PostAsync(ForegroundInfo? info, bool forceKeyRead, CancellationToken ct)
     {
+        // The gate runs before every keyed request, including the 403 retry:
+        // the tunnel can drop and the port change hands during a round trip.
+        if (_ready is not null && !await _ready(ct)) return NotReady;
+        if (forceKeyRead || _key is null) _key = _readKey();
+        var key = _key;
         using var req = new HttpRequestMessage(HttpMethod.Post, new Uri(_baseUri, "context/external"))
         {
             Content = JsonContent.Create(BuildBody(info)),
@@ -124,8 +131,8 @@ public sealed class Sender
     {
         try
         {
-            if (_ready is not null && !await _ready(ct)) return false;
             int status = await SendAsync(info, ct);
+            if (status == NotReady) return false;
             if (status == 204) { _lastError = null; return true; }
             lock (_lock) _blocked = true; // 403 twice or 400: wait for the next state change
             LogError($"post rejected: HTTP {status}");
