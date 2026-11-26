@@ -122,8 +122,10 @@ Desktop". A small helper inside the VM reports the VM's foreground app name and
 window title to the Mac, which stores them as the frame's app and window labels.
 The host's own values still drive every admission decision (ignore list,
 incognito, pause); the guest labels only change what is stored and what the live
-hot cache shows. Labels older than 5 s, or after the session locks or the Mac
-wakes, fall back to "Parallels Desktop".
+hot cache shows. Labels fall back to "Parallels Desktop" when they are older
+than 5 s, while the VM session is locked, or while the VM's foreground cannot be
+identified (for example a UAC prompt). After the Mac wakes they fall back only
+until the helper's next heartbeat (at most 2 s).
 
 Requirements:
 
@@ -154,8 +156,12 @@ closed, logging one line, and sends nothing when:
 
 - another process owns port 3031,
 - the key file is missing, or
-- the Job Object that kills ssh with the helper cannot be set up (the helper
-  exits).
+- the Job Object that kills ssh with the helper cannot be set up, or session
+  lock notifications cannot be registered (the helper exits).
+
+If the VM clock steps backwards and the helper then restarts, the Mac silently
+drops every post as stale (HTTP 204) until the Mac screenpipe restarts; restart
+it to recover.
 
 Privacy: the VM sends only the foreground app name and window title. Window
 titles are not written to the helper log (app names are). The Mac's ignore list
@@ -184,5 +190,5 @@ Keep this list complete so upstream merges stay easy to review.
 Files added by this fork (not upstream): `PERSONAL.md`,
 `apps/screenpipe-app-tauri/src-tauri/src/personal.rs`, `personal/mac.sh`,
 `crates/screenpipe-engine/src/external_context.rs`,
-`crates/screenpipe-engine/src/routes/external_context.rs`, `tools/vm-context-helper/`,
-`tools/vm-context-helper.Tests/`.
+`crates/screenpipe-engine/src/routes/external_context.rs`, `tools/.gitignore`,
+`tools/vm-context-helper/`, `tools/vm-context-helper.Tests/`.
