@@ -16,7 +16,7 @@ static class Program
         if (args.Contains("--once"))
         {
             AttachConsole(-1); // WinExe: borrow the parent's console so output is visible
-            var info = Foreground.Read();
+            var info = Foreground.Read(out _);
             Console.WriteLine(info is null ? "(no foreground window)" : $"{info.AppName} | {info.WindowTitle}");
             return 0;
         }
@@ -56,20 +56,31 @@ static class Program
 
         void Publish(bool force)
         {
-            var info = Foreground.Read();
-            if (info is null) return; // transient/unreadable: keep the previous state
-            var key = info.AppName + "\0" + info.WindowTitle;
+            var info = Foreground.Read(out bool transient);
+            if (transient) return; // focus-stealing shell window: keep the previous state
+            // Unidentifiable foreground clears, so frames never carry the previous app's label.
+            // "" never collides with a real key, which always contains "\0".
+            var key = info is null ? "" : info.AppName + "\0" + info.WindowTitle;
             if (!force && key == lastKey) return;
             lastKey = key;
-            if (info.AppName != lastApp) { lastApp = info.AppName; Log.Write($"foreground: {info.AppName}"); }
+            if (info?.AppName != lastApp) { lastApp = info?.AppName; Log.Write($"foreground: {lastApp ?? "(unidentified)"}"); }
             sender.Publish(info);
         }
 
         Publish(true);
-        Foreground.Run(
-            onForegroundEvent: () => { if (!locked) Publish(false); },
-            onLock: () => { locked = true; Log.Write("session locked"); sender.Publish(null); sender.Pause(); lastKey = null; },
-            onUnlock: () => { locked = false; Log.Write("session unlocked"); sender.Resume(); Publish(true); });
+        try
+        {
+            Foreground.Run(
+                onForegroundEvent: () => { if (!locked) Publish(false); },
+                onLock: () => { locked = true; Log.Write("session locked"); sender.Publish(null); sender.Pause(); lastKey = null; },
+                onUnlock: () => { locked = false; Log.Write("session unlocked"); sender.Resume(); Publish(true); });
+        }
+        catch (InvalidOperationException e)
+        {
+            // Without lock notifications the helper would keep labelling a locked session.
+            Log.Write(e.Message);
+            return 1;
+        }
         return 0;
     }
 }

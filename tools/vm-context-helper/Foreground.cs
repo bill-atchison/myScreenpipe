@@ -27,11 +27,15 @@ public static class Foreground
         return stem;
     }
 
-    /// <summary>null = no usable foreground window (none, transient shell window, unreadable process).</summary>
-    public static ForegroundInfo? Read()
+    /// <summary>
+    /// null = no identifiable foreground window (none, e.g. a UAC secure desktop, or an
+    /// unreadable process). transient = a shell window that briefly steals focus; also null.
+    /// </summary>
+    public static ForegroundInfo? Read(out bool transient)
     {
         var hwnd = GetForegroundWindow();
-        if (hwnd == 0 || IsTransient(hwnd)) return null;
+        transient = hwnd != 0 && IsTransient(hwnd);
+        if (hwnd == 0 || transient) return null;
         GetWindowThreadProcessId(hwnd, out uint pid);
         var image = ImagePath(pid);
         if (image is null) return null;
