@@ -257,6 +257,8 @@
       "files": [
         "src/compaction_encoder.rs",
         "src/event_driven_capture.rs",
+        "src/external_context.rs",
+        "src/routes/external_context.rs",
         "src/focus_aware_controller.rs",
         "src/frame_linker.rs",
         "src/frame_linker_actor.rs",

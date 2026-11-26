@@ -115,6 +115,55 @@ bun run test:tauri personal::   # native unit tests (queued, debug-dev)
 bun run test                               # frontend (vitest + bun tests)
 ```
 
+## VM context helper
+
+When the Mac records a Parallels Windows VM, every VM frame is just "Parallels
+Desktop". A small helper inside the VM reports the VM's foreground app name and
+window title to the Mac, which stores them as the frame's app and window labels.
+The host's own values still drive every admission decision (ignore list,
+incognito, pause); the guest labels only change what is stored and what the live
+hot cache shows. Labels older than 5 s, or after the session locks or the Mac
+wakes, fall back to "Parallels Desktop".
+
+Requirements:
+
+- Mac API auth must be ON. `POST /context/external` returns 403 otherwise.
+- `ssh mac` must work from the VM with key auth and no prompts (the tunnel runs
+  with `BatchMode=yes`).
+- The VM's own screenpipe should be stopped while you rely on this.
+
+Install, inside the VM, as the user who is logged in:
+
+1. Get the key on the Mac: `screenpipe auth token`.
+2. Save it, alone on one line, to `%APPDATA%\vm-context-helper\api-key`.
+3. From `tools/vm-context-helper`, publish and register the logon task:
+
+```powershell
+dotnet publish -c Release -o $env:LOCALAPPDATA\vm-context-helper\bin
+.\install-task.ps1
+```
+
+The task `VmContextHelper` runs non-elevated at logon with `RestartCount 3` (one
+minute apart). After 3 crashes it stays down until the next logon. Check what the
+helper sees with `VmContextHelper.exe --once`.
+
+The helper opens `ssh -N -L 127.0.0.1:3031:127.0.0.1:3030 mac` itself (retry
+backoff 1 s to 60 s) and sends only when that ssh child owns port 3031. Log:
+`%LOCALAPPDATA%\vm-context-helper\helper.log` (rotates at 1 MB). It fails
+closed, logging one line, and sends nothing when:
+
+- another process owns port 3031,
+- the key file is missing, or
+- the Job Object that kills ssh with the helper cannot be set up (the helper
+  exits).
+
+Privacy: the VM sends only the foreground app name and window title. Window
+titles are not written to the helper log (app names are). The Mac's ignore list
+and incognito check also apply to the guest app.
+
+Checks: `dotnet test tools/vm-context-helper.Tests` (VM, 8 tests);
+`cargo test -p screenpipe-engine --lib external_context` (Mac).
+
 ## Change log: upstream files touched
 
 Keep this list complete so upstream merges stay easy to review.
@@ -124,6 +173,16 @@ Keep this list complete so upstream merges stay easy to review.
 | `apps/screenpipe-app-tauri/src-tauri/src/main.rs` | `mod personal;` plus `personal::apply_process_env()` right after `dev_isolation::apply()` (+3 lines) |
 | `apps/screenpipe-app-tauri/src-tauri/src/store.rs` | `init_store`: call `personal::apply_new_profile_defaults(&mut store, is_new_store)` after the settings migrations, just before the save (+7 lines) |
 | `apps/screenpipe-app-tauri/app/providers.tsx` | skip `posthog.init` when the flag is set (+5/-1 lines) |
+| `crates/screenpipe-engine/src/event_driven_capture.rs` | capture hook: guest labels override stored and hot-cache app/window only; host values still drive admission |
+| `crates/screenpipe-engine/src/server.rs` | register `POST /context/external` |
+| `crates/screenpipe-engine/src/routes/mod.rs` | `pub mod external_context;` |
+| `crates/screenpipe-engine/src/lib.rs` | `pub mod external_context;` |
+| `crates/screenpipe-engine/src/sleep_monitor.rs` | clear the external context on wake |
+| `crates/screenpipe-capture/src/paired_capture.rs` | optional stored labels for the frame's app/window |
+| `packages/sdk/recorder-core/src/platform/recorder.rs` | `stored_labels: None` for the new field |
 
 Files added by this fork (not upstream): `PERSONAL.md`,
-`apps/screenpipe-app-tauri/src-tauri/src/personal.rs`, `personal/mac.sh`.
+`apps/screenpipe-app-tauri/src-tauri/src/personal.rs`, `personal/mac.sh`,
+`crates/screenpipe-engine/src/external_context.rs`,
+`crates/screenpipe-engine/src/routes/external_context.rs`, `tools/vm-context-helper/`,
+`tools/vm-context-helper.Tests/`.
