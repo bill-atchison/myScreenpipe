@@ -1503,6 +1503,12 @@ impl ServerCore {
             }
         }
 
+        // Opt-in semantic search: embeds stored text in the background.
+        // Capture never waits on it; aborted with the other owned tasks.
+        if config.enable_semantic_search {
+            owned_tasks.push(screenpipe_engine::embedding_worker::spawn(Arc::clone(&db)));
+        }
+
         Ok(Self {
             db,
             audio_manager,

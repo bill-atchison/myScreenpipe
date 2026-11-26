@@ -71,6 +71,25 @@ pub fn text_hash(text: &str) -> i64 {
     i64::from_le_bytes(digest[..8].try_into().expect("SHA-256 has 32 bytes"))
 }
 
+/// Paths of the cached model and tokenizer, downloading what is missing.
+fn fetch(cache_dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    std::fs::create_dir_all(cache_dir)?;
+    // The app and the CLI share this cache; an OS lock keeps a second
+    // process from downloading the same files concurrently.
+    let lock = std::fs::File::create(cache_dir.join("all-MiniLM-L6-v2.lock"))?;
+    lock.lock()?;
+    let repo = ApiBuilder::new()
+        .with_cache_dir(cache_dir.to_path_buf())
+        .with_progress(false)
+        .build()?
+        .repo(Repo::with_revision(
+            MODEL_REPO.into(),
+            RepoType::Model,
+            MODEL_REVISION.into(),
+        ));
+    Ok((repo.get(MODEL_FILE)?, repo.get(TOKENIZER_FILE)?))
+}
+
 pub struct Embedder {
     session: Mutex<Session>,
     tokenizer: Tokenizer,
@@ -85,24 +104,17 @@ impl Embedder {
             .context("embedder load panicked")?
     }
 
+    /// Fetch the model files into `cache_dir` without loading them. Takes as
+    /// long as the network does; a later [`Self::load`] reads the cache.
+    pub async fn download(cache_dir: impl Into<PathBuf>) -> Result<()> {
+        let cache_dir = cache_dir.into();
+        tokio::task::spawn_blocking(move || fetch(&cache_dir).map(drop))
+            .await
+            .context("embedder download panicked")?
+    }
+
     fn load_blocking(cache_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(cache_dir)?;
-        let (model, tokenizer) = {
-            // The app and the CLI share this cache; an OS lock keeps a second
-            // process from downloading the same files concurrently.
-            let lock = std::fs::File::create(cache_dir.join("all-MiniLM-L6-v2.lock"))?;
-            lock.lock()?;
-            let repo = ApiBuilder::new()
-                .with_cache_dir(cache_dir.to_path_buf())
-                .with_progress(false)
-                .build()?
-                .repo(Repo::with_revision(
-                    MODEL_REPO.into(),
-                    RepoType::Model,
-                    MODEL_REVISION.into(),
-                ));
-            (repo.get(MODEL_FILE)?, repo.get(TOKENIZER_FILE)?)
-        };
+        let (model, tokenizer) = fetch(cache_dir)?;
         let mut tokenizer = Tokenizer::from_file(&tokenizer).map_err(|e| anyhow!("{e}"))?;
         // `chunk` needs every token; `embed` bounds sequences itself.
         tokenizer

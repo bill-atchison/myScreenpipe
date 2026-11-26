@@ -208,14 +208,82 @@ impl DatabaseManager {
     }
 
     /// Frames with `after_id < id < before_id` (either bound optional) that have
-    /// non-empty `full_text` and no embedding yet, as `(id, full_text)`
-    /// newest first. Whitespace-only text is returned; it yields no chunks.
+    /// non-empty `full_text` and no embedding yet, newest first, as
+    /// `(id, Some(full_text))`, or `(id, None)` while the frame waits for
+    /// privacy release. Whitespace-only text is returned; it yields no chunks.
     pub async fn unembedded_frames(
         &self,
         before_id: Option<i64>,
         after_id: Option<i64>,
         limit: i64,
-    ) -> Result<Vec<(i64, String)>, SqlxError> {
+    ) -> Result<Vec<(i64, Option<String>)>, SqlxError> {
+        let rows: Vec<(i64, bool)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT f.id, {} {} AND f.id < ?1 AND f.id > ?2 ORDER BY f.id DESC LIMIT ?3",
+            self.release_gate("frames", "f.id").await?,
+            self.unembedded_frames_filter()
+        )))
+        .bind(before_id.unwrap_or(i64::MAX))
+        .bind(after_id.unwrap_or(i64::MIN))
+        .bind(limit)
+        .fetch_all(&mut *self.acquire_read().await?)
+        .await?;
+        let ready: Vec<i64> = rows.iter().filter(|r| r.1).map(|r| r.0).collect();
+        let mut payloads = if ready.is_empty() {
+            Default::default()
+        } else {
+            self.frame_payloads(&ready, Projection::Search).await?
+        };
+        // A frame deleted between the two reads is simply skipped.
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, ready)| {
+                if !ready {
+                    return Some((id, None));
+                }
+                Some((id, Some(payloads.remove(&id)?.full_text?)))
+            })
+            .collect())
+    }
+
+    /// Transcriptions with `after_id < id < before_id` that have non-empty
+    /// text and no embedding yet, newest first, as `(id, Some(transcription))`,
+    /// or `(id, None)` while the row waits for privacy release.
+    pub async fn unembedded_audio(
+        &self,
+        before_id: Option<i64>,
+        after_id: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<(i64, Option<String>)>, SqlxError> {
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT a.id, CASE WHEN {} THEN a.transcription END {UNEMBEDDED_AUDIO} \
+             AND a.id < ?1 AND a.id > ?2 ORDER BY a.id DESC LIMIT ?3",
+            self.release_gate("audio", "a.id").await?
+        )))
+        .bind(before_id.unwrap_or(i64::MAX))
+        .bind(after_id.unwrap_or(i64::MIN))
+        .bind(limit)
+        .fetch_all(&mut *self.acquire_read().await?)
+        .await
+    }
+
+    /// Rows still waiting for an embedding, as `(frames, audio)`. Counts the
+    /// whole history, so call it once (e.g. at worker start), not per batch.
+    pub async fn unembedded_counts(&self) -> Result<(i64, i64), SqlxError> {
+        let frames: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) {}",
+            self.unembedded_frames_filter()
+        )))
+        .fetch_one(&mut *self.acquire_read().await?)
+        .await?;
+        let audio: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) {UNEMBEDDED_AUDIO}"
+        )))
+        .fetch_one(&mut *self.acquire_read().await?)
+        .await?;
+        Ok((frames, audio))
+    }
+
+    fn unembedded_frames_filter(&self) -> String {
         // Compressed storage keeps sealed text outside SQLite; its length
         // column is maintained for both staged and sealed frames.
         let length = if self.storage.is_some() {
@@ -223,50 +291,34 @@ impl DatabaseManager {
         } else {
             "LENGTH(f.full_text)"
         };
-        let ids: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT f.id FROM frames f WHERE f.id < ?1 AND f.id > ?2 AND {length} > 0 \
+        format!(
+            "FROM frames f WHERE {length} > 0 \
              AND NOT EXISTS (SELECT 1 FROM embedding_sources s \
-                             WHERE s.source_type = 'frame' AND s.source_id = f.id) \
-             ORDER BY f.id DESC LIMIT ?3"
-        )))
-        .bind(before_id.unwrap_or(i64::MAX))
-        .bind(after_id.unwrap_or(i64::MIN))
-        .bind(limit)
-        .fetch_all(&mut *self.acquire_read().await?)
-        .await?;
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut payloads = self.frame_payloads(&ids, Projection::Search).await?;
-        // A frame deleted between the two reads is simply skipped.
-        Ok(ids
-            .into_iter()
-            .filter_map(|id| Some((id, payloads.remove(&id)?.full_text?)))
-            .collect())
+                             WHERE s.source_type = 'frame' AND s.source_id = f.id)"
+        )
     }
 
-    /// Transcriptions with `after_id < id < before_id` that have non-empty
-    /// text and no embedding yet, as `(id, transcription)` newest first.
-    pub async fn unembedded_audio(
-        &self,
-        before_id: Option<i64>,
-        after_id: Option<i64>,
-        limit: i64,
-    ) -> Result<Vec<(i64, String)>, SqlxError> {
-        sqlx::query_as(
-            "SELECT a.id, a.transcription FROM audio_transcriptions a \
-             WHERE a.id < ?1 AND a.id > ?2 AND a.transcription != '' \
-             AND NOT EXISTS (SELECT 1 FROM embedding_sources s \
-                             WHERE s.source_type = 'audio' AND s.source_id = a.id) \
-             ORDER BY a.id DESC LIMIT ?3",
-        )
-        .bind(before_id.unwrap_or(i64::MAX))
-        .bind(after_id.unwrap_or(i64::MIN))
-        .bind(limit)
-        .fetch_all(&mut *self.acquire_read().await?)
-        .await
+    /// SQL that is true when the `kind` row `id` may be embedded. With text
+    /// privacy release on, that is only once its receipt for the current
+    /// policy is certified: the gate `protected_reads` applies, after which
+    /// the source columns hold the redacted text. `*_redacted_at` markers
+    /// are not used; they survive policy changes and edits.
+    async fn release_gate(&self, kind: &str, id: &str) -> Result<String, SqlxError> {
+        Ok(if self.release_policy().await?.text {
+            format!(
+                "EXISTS (SELECT 1 FROM _privacy_release r JOIN _privacy_policy p ON p.id = 1 \
+                 WHERE r.kind = '{kind}' AND r.id = CAST({id} AS TEXT) \
+                 AND r.policy = CAST(p.receipt_key AS TEXT))"
+            )
+        } else {
+            "1".into()
+        })
     }
 }
+
+const UNEMBEDDED_AUDIO: &str = "FROM audio_transcriptions a WHERE a.transcription != '' \
+     AND NOT EXISTS (SELECT 1 FROM embedding_sources s \
+                     WHERE s.source_type = 'audio' AND s.source_id = a.id)";
 
 #[cfg(test)]
 mod tests {
@@ -602,8 +654,8 @@ mod tests {
         db.insert_embeddings(&[frame(5, 1), audio(4, 2)], &[], &[])
             .await
             .unwrap();
-        let s = |v: &[(i64, &str)]| -> Vec<(i64, String)> {
-            v.iter().map(|(id, t)| (*id, t.to_string())).collect()
+        let s = |v: &[(i64, &str)]| -> Vec<(i64, Option<String>)> {
+            v.iter().map(|(id, t)| (*id, Some(t.to_string()))).collect()
         };
         let frames = |before, after, limit| db.unembedded_frames(before, after, limit);
         assert_eq!(
@@ -620,6 +672,66 @@ mod tests {
         assert_eq!(
             db.unembedded_audio(Some(3), Some(0), 10).await.unwrap(),
             s(&[(1, "x")])
+        );
+        assert_eq!(db.unembedded_counts().await.unwrap(), (2, 2));
+        db.close().await;
+    }
+
+    /// With text privacy release on, a row is offered only once its receipt
+    /// for the current policy is certified, and then with the released text.
+    #[tokio::test]
+    async fn unembedded_rows_wait_for_privacy_release() {
+        use crate::privacy_release::ReleasePolicy;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("db.sqlite");
+        let db = DatabaseManager::new(path.to_str().unwrap(), Default::default())
+            .await
+            .unwrap();
+        db.configure_release(&ReleasePolicy {
+            identity: "test:model-v1".into(),
+            text: true,
+            images: false,
+        })
+        .await
+        .unwrap();
+        // A redaction timestamp alone confers no release authority.
+        db.execute_raw_sql_write(&format!(
+            "{SEED} UPDATE frames SET full_text_redacted_at = 1; \
+             UPDATE audio_transcriptions SET redacted_at = 1;"
+        ))
+        .await
+        .unwrap();
+        let none = |ids: &[i64]| -> Vec<(i64, Option<String>)> {
+            ids.iter().map(|id| (*id, None)).collect()
+        };
+        assert_eq!(
+            db.unembedded_frames(None, None, 10).await.unwrap(),
+            none(&[2, 1])
+        );
+        assert_eq!(
+            db.unembedded_audio(None, None, 10).await.unwrap(),
+            none(&[1])
+        );
+
+        for kind in ["frames", "audio"] {
+            let job = db.release_pending(kind, 10).await.unwrap().remove(0);
+            let mut values = job.values.clone();
+            let column = if kind == "frames" {
+                "full_text"
+            } else {
+                "transcription"
+            };
+            values.insert(column.into(), Some(format!("released {kind}")));
+            assert!(db.publish_release(&job, &values).await.unwrap());
+        }
+        // release_pending hands out the newest frame (2) first.
+        assert_eq!(
+            db.unembedded_frames(None, None, 10).await.unwrap(),
+            vec![(2, Some("released frames".to_string())), (1, None)]
+        );
+        assert_eq!(
+            db.unembedded_audio(None, None, 10).await.unwrap(),
+            vec![(1, Some("released audio".to_string()))]
         );
         db.close().await;
     }
@@ -676,7 +788,7 @@ mod tests {
             before,
             db.frame_payloads(&[1, 2], Projection::All).await.unwrap()
         );
-        let text = |id: i64, t: &str| (id, t.to_string());
+        let text = |id: i64, t: &str| (id, Some(t.to_string()));
         assert_eq!(
             db.unembedded_frames(None, None, 10).await.unwrap(),
             vec![text(2, "same screen"), text(1, "same screen")]

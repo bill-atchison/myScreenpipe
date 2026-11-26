@@ -9012,6 +9012,7 @@ dependencies = [
  "screenpipe-connect",
  "screenpipe-core",
  "screenpipe-db",
+ "screenpipe-embed",
  "screenpipe-events",
  "screenpipe-fs",
  "screenpipe-redact",

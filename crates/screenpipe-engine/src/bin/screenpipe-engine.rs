@@ -2356,6 +2356,12 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
         });
     }
 
+    // Opt-in semantic search (`--enable-semantic-search`): embeds stored text
+    // in the background for the engine's lifetime. Capture never waits on it.
+    if config.enable_semantic_search {
+        let _embedding_worker = screenpipe_engine::embedding_worker::spawn(Arc::clone(&db));
+    }
+
     // Image-PII reconciliation worker (issue #3185 follow-up).
     // Independent of the text worker — users can toggle either one
     // without the other. Requires the rfdetr_v9 model present and at
