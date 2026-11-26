@@ -29,13 +29,19 @@ public sealed class Tunnel
         // The helper itself joins the job so every descendant (ProxyCommand etc.)
         // is born inside it, with no assignment gap.
         _job = CreateJobObjectW(0, null);
+        if (_job == 0) throw JobFailure("CreateJobObjectW");
         var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
         info.BasicLimitInformation.LimitFlags = 0x2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         if (!SetInformationJobObject(_job, 9 /* ExtendedLimitInformation */, ref info,
-                Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
-            || !AssignProcessToJobObject(_job, Process.GetCurrentProcess().Handle))
-            throw new InvalidOperationException("job object setup failed");
+                Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()))
+            throw JobFailure("SetInformationJobObject");
+        using var self = Process.GetCurrentProcess();
+        if (!AssignProcessToJobObject(_job, self.Handle)) throw JobFailure("AssignProcessToJobObject");
     }
+
+    // Names the failing call and its Win32 error; the caller fails closed (no tunnel without the job).
+    static InvalidOperationException JobFailure(string call) =>
+        new($"job object setup failed: {call} error {Marshal.GetLastWin32Error()}");
 
     public async Task<bool> EnsureReadyAsync(CancellationToken ct)
     {
@@ -170,8 +176,8 @@ public sealed class Tunnel
         public nuint ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
     }
 
-    [DllImport("kernel32", CharSet = CharSet.Unicode)] static extern nint CreateJobObjectW(nint attrs, string? name);
-    [DllImport("kernel32")] static extern bool SetInformationJobObject(nint job, int cls, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION info, int size);
-    [DllImport("kernel32")] static extern bool AssignProcessToJobObject(nint job, nint process);
+    [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)] static extern nint CreateJobObjectW(nint attrs, string? name);
+    [DllImport("kernel32", SetLastError = true)] static extern bool SetInformationJobObject(nint job, int cls, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION info, int size);
+    [DllImport("kernel32", SetLastError = true)] static extern bool AssignProcessToJobObject(nint job, nint process);
     [DllImport("iphlpapi")] static extern uint GetExtendedTcpTable(nint table, ref int size, bool sort, int af, int tableClass, uint reserved);
 }

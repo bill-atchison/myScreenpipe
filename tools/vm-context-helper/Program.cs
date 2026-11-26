@@ -26,7 +26,14 @@ static class Program
         // The key is never logged; only a missing/unreadable file is reported (by exception type).
         string ReadKey() => File.ReadAllText(keyPath).Trim();
 
-        var tunnel = new Tunnel(Log.Write);
+        Tunnel tunnel;
+        try { tunnel = new Tunnel(Log.Write); }
+        catch (InvalidOperationException e)
+        {
+            // Fail closed: without the kill-on-close job we do not run at all.
+            Log.Write(e.Message);
+            return 1;
+        }
         var epoch = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         bool keyMissingLogged = false;
         // No key file: neither start the tunnel nor send; rechecked on each retry/heartbeat.
