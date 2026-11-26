@@ -158,6 +158,9 @@ async fn install_windows_update(
 /// The website's /rollback endpoint returns a manifest with a fake high version
 /// so the updater accepts it as an "update".
 pub async fn install_specific_version(app: &tauri::AppHandle, version: &str) -> Result<(), String> {
+    if updates_disabled(crate::personal::enabled()) {
+        return Err("rollback is unavailable in personal builds".to_string());
+    }
     if crate::enterprise_persistence::installed() {
         return Err(
             "rollback is unavailable for persistence-managed enterprise installations".to_string(),
@@ -242,6 +245,12 @@ fn get_target_arch() -> &'static str {
     {
         "unknown"
     }
+}
+
+/// Personal builds (PERSONAL.md) must never replace themselves with an upstream
+/// release, whatever the remote policy or the auto-update toggle says.
+fn updates_disabled(personal_build: bool) -> bool {
+    personal_build
 }
 
 /// Check if this is a source/community build (not an official release)
@@ -1178,6 +1187,12 @@ impl UpdatesManager {
         }
         let _guard = CheckGuard(&self.is_checking);
 
+        // Before the in-flight guard and before any remote/forced-policy read.
+        if updates_disabled(crate::personal::enabled()) {
+            debug!("updates disabled (personal build), skipping check");
+            return Ok(false);
+        }
+
         // Enterprise: honor the dashboard-selected external, ordinary in-app,
         // or privileged persistent-package transport for this install context.
         let enterprise_route = if is_enterprise_build(&self.app) {
@@ -2055,6 +2070,10 @@ pub fn start_update_check(
         }
     }
 
+    if updates_disabled(crate::personal::enabled()) {
+        info!("updates disabled (personal build)");
+    }
+
     // Check if the app was just upgraded and send a "what's new" notification
     check_whats_new(app);
 
@@ -2187,6 +2206,14 @@ pub(crate) mod tests {
         assert_eq!(sweep_sp_old_files(dir.path()), 0);
         assert!(dir.path().join("bun.exe").exists());
         assert!(dir.path().join("cache.sp-old").exists());
+    }
+
+    #[test]
+    fn personal_build_disables_updates_even_when_policy_forces_them() {
+        // Forced auto-update is resolved after this gate, so it cannot re-enable.
+        assert!(resolve_auto_update_enabled(false, true, false));
+        assert!(updates_disabled(true));
+        assert!(!updates_disabled(false));
     }
 
     #[test]

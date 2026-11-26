@@ -80,6 +80,10 @@ export default function GeneralSettings() {
     normalizeUserGoalCategory(settings.userGoalCategory) ??
     DEFAULT_USER_GOAL_CATEGORY;
   const autoUpdateRemotePolicy = getRemoteAutoUpdatePolicy(settings);
+  // Same flag as app/providers.tsx; the Rust updater refuses to run in this build.
+  const isPersonalBuild = /^(1|true|yes|on)$/i.test(
+    (process.env.NEXT_PUBLIC_SCREENPIPE_PERSONAL_BUILD ?? "").trim(),
+  );
   const autoUpdateForcedByRemote =
     enterpriseBuild.resolved &&
     !enterpriseBuild.isEnterprise &&
@@ -315,7 +319,9 @@ export default function GeneralSettings() {
                   <div>
                     <h3 className="text-sm font-medium text-foreground">Auto-update</h3>
                     <p className="text-xs text-muted-foreground">
-                      {autoUpdateForcedByRemote
+                      {isPersonalBuild
+                        ? gt("Updates are disabled for personal builds. Rebuild from your branch to update.")
+                        : autoUpdateForcedByRemote
                         ? gt("Required temporarily so this installation receives reliability fixes.")
                         : gt("Restart automatically when an update is downloaded. Off: a \"restart to update\" banner appears instead.")}
                     </p>
@@ -324,7 +330,7 @@ export default function GeneralSettings() {
                 <Switch
                   id="auto-update-toggle"
                   checked={settings?.autoUpdate ?? true}
-                  disabled={autoUpdateForcedByRemote}
+                  disabled={autoUpdateForcedByRemote || isPersonalBuild}
                   onCheckedChange={(checked) =>
                     handleSettingsChange({ autoUpdate: checked })
                   }

@@ -79,6 +79,22 @@ bun install --frozen-lockfile
 bun tauri build      # CONTRIBUTING.md "build the Tauri installer"; installer in src-tauri\target\release\bundle\nsis\
 ```
 
+### Updates, and installing a build on the Mac
+
+Personal builds never auto-update: the updater is disabled in Rust whatever the
+remote policy says (log line "updates disabled (personal build)"). To update,
+rebuild from `myScreenpipe`.
+
+When you copy a new build to `/Applications/screenpipe.app`:
+
+1. Quit the official screenpipe app fully before opening the new build.
+2. Seal the bundle after copying, then verify it:
+
+```bash
+codesign --force --deep --sign - --entitlements ~/Workspace/myScreenpipe/apps/screenpipe-app-tauri/src-tauri/entitlements.plist /Applications/screenpipe.app
+codesign --verify --deep --strict /Applications/screenpipe.app
+```
+
 ### Debug build (development)
 
 Windows (PowerShell, from `apps/screenpipe-app-tauri`; needs the machine-wide
