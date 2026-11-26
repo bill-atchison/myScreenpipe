@@ -556,6 +556,9 @@ pub async fn restart_for_update(
     app: tauri::AppHandle,
     timeout_secs: Option<u64>,
 ) -> Result<String, String> {
+    if updates_disabled(crate::personal::enabled()) {
+        return Err("updates are disabled in personal builds".to_string());
+    }
     let cap = Duration::from_secs(timeout_secs.unwrap_or(BANNER_GATE_TIMEOUT_SECS));
     #[cfg(target_os = "windows")]
     if !is_enterprise_build(&app) || enterprise_update_route(&app) == EnterpriseUpdateRoute::Tauri {
