@@ -53,6 +53,7 @@ pub mod crash_log;
 pub mod disk_pressure;
 pub mod drm_detector;
 pub mod event_driven_capture;
+pub mod external_context;
 pub mod external_memory_sync;
 pub mod fd_limit;
 pub mod focus_aware_controller;
