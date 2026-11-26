@@ -20,7 +20,8 @@ public static class Foreground
 
     // Like screenpipe-a11y, names are the exe stem, so the Mac ignore list keeps
     // matching; only a stem that names no app (Warp ships preview.exe) uses ProductName.
-    static readonly string[] GenericStems = { "preview", "app", "main", "launcher", "client" };
+    // Only stems seen in practice; add one when a real app needs it.
+    static readonly string[] GenericStems = { "preview" };
 
     static bool IsGenericStem(string stem) =>
         GenericStems.Contains(stem, StringComparer.OrdinalIgnoreCase);
