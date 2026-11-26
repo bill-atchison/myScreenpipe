@@ -18,12 +18,24 @@ public static class Foreground
 
     const string FrameHost = "ApplicationFrameHost";
 
-    /// <summary>"C:\x\Foo.exe" -> "Foo"; UWP apps live behind ApplicationFrameHost, so use the hosted app's name.</summary>
-    public static string NormalizeAppName(string imagePath, string? uwpAppName)
+    // Like screenpipe-a11y, names are the exe stem, so the Mac ignore list keeps
+    // matching; only a stem that names no app (Warp ships preview.exe) uses ProductName.
+    static readonly string[] GenericStems = { "preview", "app", "main", "launcher", "client" };
+
+    static bool IsGenericStem(string stem) =>
+        GenericStems.Contains(stem, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// "C:\x\Foo.exe" -> "Foo"; UWP apps live behind ApplicationFrameHost, so use the
+    /// hosted app's name; a generic stem uses the exe's ProductName when it has one.
+    /// </summary>
+    public static string NormalizeAppName(string imagePath, string? uwpAppName, string? productName = null)
     {
         var stem = Path.GetFileNameWithoutExtension(imagePath);
         if (stem.Equals(FrameHost, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(uwpAppName))
             return uwpAppName;
+        if (IsGenericStem(stem) && !string.IsNullOrWhiteSpace(productName))
+            return productName.Trim();
         return stem;
     }
 
@@ -44,9 +56,18 @@ public static class Foreground
         if (Path.GetFileNameWithoutExtension(image).Equals(FrameHost, StringComparison.OrdinalIgnoreCase))
             uwp = HostedAppName(hwnd, pid);
 
+        // Version info is read only for generic stems: name changes fire often.
+        string? product = IsGenericStem(Path.GetFileNameWithoutExtension(image)) ? ProductName(image) : null;
+
         var buf = new StringBuilder(2048);
         GetWindowTextW(hwnd, buf, buf.Capacity);
-        return new ForegroundInfo(NormalizeAppName(image, uwp), buf.ToString());
+        return new ForegroundInfo(NormalizeAppName(image, uwp, product), buf.ToString());
+    }
+
+    static string? ProductName(string image)
+    {
+        try { return System.Diagnostics.FileVersionInfo.GetVersionInfo(image).ProductName; }
+        catch (FileNotFoundException) { return null; } // fall back to the stem
     }
 
     static bool IsTransient(nint hwnd)

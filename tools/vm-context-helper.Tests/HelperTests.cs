@@ -25,6 +25,16 @@ public class HelperTests
             Foreground.NormalizeAppName(@"C:\Windows\System32\ApplicationFrameHost.exe", "CalculatorApp"));
 
     [Fact]
+    public void Normalize_UsesProductName_ForGenericStem() =>
+        Assert.Equal("Warp",
+            Foreground.NormalizeAppName(@"C:\Program Files\WarpPreview\preview.exe", null, "Warp"));
+
+    [Fact]
+    public void Normalize_KeepsStem_ForOrdinaryApp() =>
+        Assert.Equal("chrome",
+            Foreground.NormalizeAppName(@"C:\Program Files\Google\Chrome\Application\chrome.exe", null, "Google Chrome"));
+
+    [Fact]
     public void Body_SeqStrictlyIncreases()
     {
         var s = NewSender(() => "k");

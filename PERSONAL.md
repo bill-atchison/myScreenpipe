@@ -167,7 +167,7 @@ Privacy: the VM sends only the foreground app name and window title. Window
 titles are not written to the helper log (app names are). The Mac's ignore list
 and incognito check also apply to the guest app.
 
-Checks: `dotnet test tools/vm-context-helper.Tests` (VM, 8 tests);
+Checks: `dotnet test tools/vm-context-helper.Tests` (VM, 10 tests);
 `cargo test -p screenpipe-engine --lib external_context` (Mac).
 
 ## Change log: upstream files touched
