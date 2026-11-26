@@ -53,6 +53,7 @@ export const screenSearchIndex: SettingsField[] = [
   // conditional: hidden when screen recording is off (same gate as Recording quality).
   { label: msg("Capture frequency", {}), keywords: ["screenshot", "interval", "idle", "cadence", "every", "minimum"], conditional: true },
   { label: msg("HD recording for meetings", {}), keywords: ["hd", "meeting"] },
+  { label: msg("Semantic search", {}), keywords: ["meaning", "embeddings", "search", "ai"] },
   { label: msg("Chinese mirror", {}), keywords: ["china", "mirror"] },
 ];
 
@@ -317,6 +318,7 @@ const SERVER_RESTART_SETTINGS = new Set<keyof SettingsStore>([
   "useChineseMirror",
   "enableWorkflowEvents",
   "disableSnapshotCompaction",
+  "enableSemanticSearch",
 ]);
 
 type AudioPipelineSnapshot = {
@@ -4004,6 +4006,27 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
       {/* System */}
       <div className="space-y-2 pt-2">
         <h2 className="text-xs font-semibold text-muted-foreground normal-case tracking-wider px-1">System</h2>
+
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <Search className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground">{ui("Semantic search")}</h3>
+                  <p className="text-xs text-muted-foreground">
+                    {ui("Search your history by meaning. Embeds screen text and transcripts on this device in the background (one-time ~90 MB model download).")}
+                  </p>
+                </div>
+              </div>
+              <Switch
+                id="enableSemanticSearch"
+                checked={Boolean(settings.enableSemanticSearch ?? false)}
+                onCheckedChange={(checked) => handleSettingsChange({ enableSemanticSearch: checked }, true)}
+              />
+            </div>
+          </CardContent>
+        </Card>
 
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5">

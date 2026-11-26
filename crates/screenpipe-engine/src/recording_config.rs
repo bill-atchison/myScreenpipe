@@ -44,6 +44,8 @@ pub struct RecordingConfig {
     pub enable_semantic_context: bool,
     /// Which bounded AI projection to expose from the shared capture stream.
     pub semantic_context_mode: SemanticContextMode,
+    /// Opt in to the background embedding worker for semantic search.
+    pub enable_semantic_search: bool,
     /// Skip timeline cache warm-up and per-frame/audio buffering when capture
     /// is off or the legacy timeline gate is set. The streaming endpoint can
     /// still read saved history directly from the database.
@@ -306,6 +308,7 @@ impl RecordingConfig {
             disable_screenshots: settings.disable_screenshots,
             enable_semantic_context: settings.enable_semantic_context,
             semantic_context_mode: settings.semantic_context_mode,
+            enable_semantic_search: settings.enable_semantic_search,
             disable_timeline: settings.timeline_cache_disabled(),
             use_pii_removal: settings.use_pii_removal,
             async_pii_redaction: settings.async_pii_redaction,
@@ -661,6 +664,19 @@ mod tests {
             "semantic parsing must remain opt-in"
         );
         assert_eq!(c.semantic_context_mode, SemanticContextMode::Memory);
+        assert!(
+            !c.enable_semantic_search,
+            "semantic search must remain opt-in"
+        );
+    }
+
+    #[test]
+    fn semantic_search_setting_is_preserved_when_enabled() {
+        let settings = screenpipe_config::RecordingSettings {
+            enable_semantic_search: true,
+            ..Default::default()
+        };
+        assert!(build(&settings).enable_semantic_search);
     }
 
     #[test]

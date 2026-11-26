@@ -644,6 +644,12 @@ pub struct RecordArgs {
     )]
     pub enable_semantic_context: bool,
 
+    /// Search history by meaning: embed screen text and transcripts on this
+    /// device in a background worker (one-time ~90 MB model download). Never
+    /// touches the capture path. Off by default.
+    #[arg(long, default_value_t = false)]
+    pub enable_semantic_search: bool,
+
     /// Windows to ignore (case-insensitive contains). Use `App::Title` to
     /// scope to one window of one app (e.g. `Slack::#hr`). `::title` matches
     /// any app whose focused window title contains `title`. `App::` blocks
@@ -939,6 +945,7 @@ pub struct RecordArgSources {
     pub disable_screenshots: bool,
     pub app_context: bool,
     pub enable_semantic_context: bool,
+    pub enable_semantic_search: bool,
     pub ignored_windows: bool,
     pub included_windows: bool,
     pub ignored_urls: bool,
@@ -1010,6 +1017,7 @@ impl RecordArgSources {
                 record.value_source("enable_semantic_context"),
                 Some(ValueSource::CommandLine | ValueSource::EnvVariable)
             ),
+            enable_semantic_search: from_command_line(record, "enable_semantic_search"),
             ignored_windows: from_command_line(record, "ignored_windows"),
             included_windows: from_command_line(record, "included_windows"),
             ignored_urls: from_command_line(record, "ignored_urls"),
@@ -1067,6 +1075,7 @@ impl RecordArgSources {
             || self.disable_screenshots
             || self.app_context
             || self.enable_semantic_context
+            || self.enable_semantic_search
             || self.ignored_windows
             || self.included_windows
             || self.ignored_urls
@@ -1233,6 +1242,7 @@ impl RecordArgs {
             disable_screenshots: self.disable_screenshots,
             enable_semantic_context,
             semantic_context_mode,
+            enable_semantic_search: self.enable_semantic_search,
             // CLI has no --disable-timeline flag; the desktop app drives this
             // toggle. Default to enabled (timeline on) for the engine binary.
             disable_timeline: false,
@@ -1562,6 +1572,9 @@ impl RecordArgs {
             settings.semantic_context_mode = mode;
         } else if sources.enable_semantic_context {
             settings.enable_semantic_context = self.enable_semantic_context;
+        }
+        if sources.enable_semantic_search {
+            settings.enable_semantic_search = self.enable_semantic_search;
         }
         // An explicit --monitor-id or --use-all-monitors means the user wants
         // vision on, so it clears a persisted disable_vision:true (the #3648
@@ -2742,6 +2755,37 @@ mod tests {
                 assert!(sources.has_recording_override());
             }
         }
+    }
+
+    #[test]
+    fn semantic_search_flag_is_opt_in_and_preserves_saved_choice() {
+        let argv = ["screenpipe", "record"];
+        assert!(
+            !record_args(argv)
+                .to_recording_settings()
+                .enable_semantic_search
+        );
+        let mut saved = screenpipe_config::RecordingSettings {
+            enable_semantic_search: true,
+            ..Default::default()
+        };
+        record_args(argv).apply_explicit_overrides(&mut saved, &record_sources(argv));
+        assert!(
+            saved.enable_semantic_search,
+            "absent flag keeps saved choice"
+        );
+
+        let argv = ["screenpipe", "record", "--enable-semantic-search"];
+        assert!(
+            record_args(argv)
+                .to_recording_settings()
+                .enable_semantic_search
+        );
+        let sources = record_sources(argv);
+        assert!(sources.has_recording_override());
+        let mut saved = screenpipe_config::RecordingSettings::default();
+        record_args(argv).apply_explicit_overrides(&mut saved, &sources);
+        assert!(saved.enable_semantic_search);
     }
 
     #[test]
