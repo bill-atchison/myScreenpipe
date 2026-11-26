@@ -53,7 +53,7 @@ pub(crate) async fn post_external_context(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::external_context::{current_seq, override_for, TEST_LOCK};
+    use crate::external_context::{current_label_seq, override_for, TEST_LOCK};
     use axum::{body::Body, http::Request, Router};
     use screenpipe_audio::audio_manager::AudioManagerBuilder;
     use screenpipe_db::DatabaseManager;
@@ -127,6 +127,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // TEST_LOCK serializes GLOBAL across tests and is held across .await on purpose.
+    #[allow(clippy::await_holding_lock)]
     async fn rejects_when_auth_disabled() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let r = router(false).await;
@@ -135,6 +137,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // TEST_LOCK serializes GLOBAL across tests and is held across .await on purpose.
+    #[allow(clippy::await_holding_lock)]
     async fn rejects_missing_token() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let r = router(true).await;
@@ -143,6 +147,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // TEST_LOCK serializes GLOBAL across tests and is held across .await on purpose.
+    #[allow(clippy::await_holding_lock)]
     async fn rejects_wrong_token() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let r = router(true).await;
@@ -151,6 +157,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // TEST_LOCK serializes GLOBAL across tests and is held across .await on purpose.
+    #[allow(clippy::await_holding_lock)]
     async fn rejects_unknown_source() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let r = router(true).await;
@@ -159,6 +167,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // TEST_LOCK serializes GLOBAL across tests and is held across .await on purpose.
+    #[allow(clippy::await_holding_lock)]
     async fn rejects_oversized_app() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let r = router(true).await;
@@ -174,6 +184,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // TEST_LOCK serializes GLOBAL across tests and is held across .await on purpose.
+    #[allow(clippy::await_holding_lock)]
     async fn rejects_oversized_title() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let r = router(true).await;
@@ -183,6 +195,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // TEST_LOCK serializes GLOBAL across tests and is held across .await on purpose.
+    #[allow(clippy::await_holding_lock)]
     async fn empty_app_clears_via_route() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let r = router(true).await;
@@ -195,7 +209,7 @@ mod tests {
                 &GLOBAL,
                 Some("Parallels Desktop"),
                 true,
-                current_seq(&GLOBAL),
+                current_label_seq(&GLOBAL),
                 Instant::now()
             ),
             None
@@ -203,6 +217,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // TEST_LOCK serializes GLOBAL across tests and is held across .await on purpose.
+    #[allow(clippy::await_holding_lock)]
     async fn accepts_valid_post() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let r = router(true).await;
@@ -211,6 +227,6 @@ mod tests {
             post(&r, Some(KEY), "parallels-vm", e, "MultiTerminal", "tab").await,
             StatusCode::NO_CONTENT
         );
-        assert_eq!(current_seq(&GLOBAL), Some((e, 1)));
+        assert_eq!(current_label_seq(&GLOBAL), Some((e, 1)));
     }
 }

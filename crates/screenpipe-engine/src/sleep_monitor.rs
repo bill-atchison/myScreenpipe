@@ -980,7 +980,11 @@ mod tests {
         let _ec_guard = ec::TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (epoch, seq) = ec::current_seq(&ec::GLOBAL).unwrap_or((0, 0));
+        // Ordering needs the stored (epoch, seq), not the label `since`.
+        let (epoch, seq) = ec::GLOBAL
+            .load()
+            .as_ref()
+            .map_or((0, 0), |c| (c.epoch, c.seq));
         let now = std::time::Instant::now();
         ec::accept(&ec::GLOBAL, epoch, seq + 1, "A".into(), "t".into(), now);
         // Clear stale flags
@@ -1011,7 +1015,7 @@ mod tests {
                 &ec::GLOBAL,
                 Some("Parallels Desktop"),
                 true,
-                ec::current_seq(&ec::GLOBAL),
+                ec::current_label_seq(&ec::GLOBAL),
                 now
             ),
             None,

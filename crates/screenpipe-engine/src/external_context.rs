@@ -17,6 +17,10 @@ pub struct ExternalContext {
     pub window_title: String,
     pub epoch: u64,
     pub seq: u64,
+    /// (epoch, seq) at which these labels were first stored. Heartbeats re-post
+    /// the same labels under a new seq; frames compare against this, so a
+    /// heartbeat between screenshot and lookup does not drop the label.
+    pub since: (u64, u64),
     pub received_at: Instant,
 }
 
@@ -45,37 +49,47 @@ pub fn accept(
     window_title: String,
     now: Instant,
 ) -> Accept {
-    let new = Arc::new(ExternalContext {
-        app_name,
-        window_title,
-        epoch,
-        seq,
-        received_at: now,
-    });
     let mut stale = false;
     store.rcu(|cur| {
-        stale = cur.as_ref().is_some_and(|c| (c.epoch, c.seq) >= (epoch, seq));
+        stale = cur
+            .as_ref()
+            .is_some_and(|c| (c.epoch, c.seq) >= (epoch, seq));
         if stale {
-            cur.clone()
-        } else {
-            Some(new.clone())
+            return cur.clone();
         }
+        let since = match cur.as_deref() {
+            Some(c)
+                if c.epoch == epoch && c.app_name == app_name && c.window_title == window_title =>
+            {
+                c.since
+            }
+            _ => (epoch, seq),
+        };
+        Some(Arc::new(ExternalContext {
+            app_name: app_name.clone(),
+            window_title: window_title.clone(),
+            epoch,
+            seq,
+            since,
+            received_at: now,
+        }))
     });
     if stale {
         Accept::Stale
-    } else if new.app_name.is_empty() {
+    } else if app_name.is_empty() {
         Accept::Cleared
     } else {
         Accept::Stored
     }
 }
 
-pub fn current_seq(store: &ContextStore) -> Option<(u64, u64)> {
-    store.load().as_ref().map(|c| (c.epoch, c.seq))
+/// The `since` of the stored labels; snapshot it before the screenshot.
+pub fn current_label_seq(store: &ContextStore) -> Option<(u64, u64)> {
+    store.load().as_ref().map(|c| c.since)
 }
 
 /// Returns the VM app/title to use instead of the host app, only when the
-/// screenshot was taken at exactly the stored (epoch, seq) and it is fresh.
+/// stored labels are the ones in place at the screenshot and they are fresh.
 pub fn override_for(
     store: &ContextStore,
     host_app: Option<&str>,
@@ -88,7 +102,7 @@ pub fn override_for(
     if !monitor_hosts_focus
         || c.app_name.is_empty()
         || !host_app.is_some_and(|a| a.eq_ignore_ascii_case(HOST_APP))
-        || seq_at_screenshot != Some((c.epoch, c.seq))
+        || seq_at_screenshot != Some(c.since)
         || now.saturating_duration_since(c.received_at) > MAX_AGE
     {
         return None;
@@ -125,6 +139,7 @@ pub fn clear(store: &ContextStore) {
                 window_title: String::new(),
                 epoch: c.epoch,
                 seq: c.seq,
+                since: (c.epoch, c.seq),
                 received_at: c.received_at,
             })
         })
@@ -146,9 +161,12 @@ mod tests {
     fn stores_and_overrides() {
         let s = ContextStore::empty();
         let now = Instant::now();
-        assert!(matches!(put(&s, 1, 1, "MultiTerminal", now), Accept::Stored));
+        assert!(matches!(
+            put(&s, 1, 1, "MultiTerminal", now),
+            Accept::Stored
+        ));
         assert_eq!(
-            override_for(&s, Some(HOST), true, current_seq(&s), now),
+            override_for(&s, Some(HOST), true, current_label_seq(&s), now),
             Some(("MultiTerminal".into(), "t".into()))
         );
     }
@@ -158,7 +176,10 @@ mod tests {
         let s = ContextStore::empty();
         let now = Instant::now();
         put(&s, 1, 1, "MultiTerminal", now);
-        assert_eq!(override_for(&s, Some("Safari"), true, current_seq(&s), now), None);
+        assert_eq!(
+            override_for(&s, Some("Safari"), true, current_label_seq(&s), now),
+            None
+        );
     }
 
     #[test]
@@ -166,7 +187,10 @@ mod tests {
         let s = ContextStore::empty();
         let now = Instant::now();
         put(&s, 1, 1, "MultiTerminal", now);
-        assert_eq!(override_for(&s, Some(HOST), false, current_seq(&s), now), None);
+        assert_eq!(
+            override_for(&s, Some(HOST), false, current_label_seq(&s), now),
+            None
+        );
     }
 
     #[test]
@@ -174,12 +198,14 @@ mod tests {
         let s = ContextStore::empty();
         let now = Instant::now();
         put(&s, 1, 1, "MultiTerminal", now);
-        let seq = current_seq(&s);
+        let seq = current_label_seq(&s);
         assert_eq!(
             override_for(&s, Some(HOST), true, seq, now + Duration::from_millis(5001)),
             None
         );
-        assert!(override_for(&s, Some(HOST), true, seq, now + Duration::from_millis(4999)).is_some());
+        assert!(
+            override_for(&s, Some(HOST), true, seq, now + Duration::from_millis(4999)).is_some()
+        );
     }
 
     #[test]
@@ -189,7 +215,9 @@ mod tests {
         put(&s, 1, 5, "Five", now);
         assert!(matches!(put(&s, 1, 4, "Four", now), Accept::Stale));
         assert_eq!(
-            override_for(&s, Some(HOST), true, current_seq(&s), now).unwrap().0,
+            override_for(&s, Some(HOST), true, current_label_seq(&s), now)
+                .unwrap()
+                .0,
             "Five"
         );
     }
@@ -216,7 +244,10 @@ mod tests {
         let now = Instant::now();
         put(&s, 1, 1, "A", now);
         assert!(matches!(put(&s, 1, 2, "", now), Accept::Cleared));
-        assert_eq!(override_for(&s, Some(HOST), true, current_seq(&s), now), None);
+        assert_eq!(
+            override_for(&s, Some(HOST), true, current_label_seq(&s), now),
+            None
+        );
     }
 
     #[test]
@@ -234,7 +265,10 @@ mod tests {
         let now = Instant::now();
         put(&s, 1, 5, "A", now);
         clear(&s);
-        assert_eq!(override_for(&s, Some(HOST), true, current_seq(&s), now), None);
+        assert_eq!(
+            override_for(&s, Some(HOST), true, current_label_seq(&s), now),
+            None
+        );
         assert!(matches!(put(&s, 1, 5, "A", now), Accept::Stale));
         assert!(matches!(put(&s, 1, 6, "A", now), Accept::Stored));
     }
@@ -244,7 +278,14 @@ mod tests {
         let s = ContextStore::empty();
         let now = Instant::now();
         put(&s, 1, 1, "A", now);
-        assert!(override_for(&s, Some("parallels desktop"), true, current_seq(&s), now).is_some());
+        assert!(override_for(
+            &s,
+            Some("parallels desktop"),
+            true,
+            current_label_seq(&s),
+            now
+        )
+        .is_some());
     }
 
     #[test]
@@ -253,7 +294,7 @@ mod tests {
         let now = Instant::now();
         put(&s, 1, 1, "MultiTerminal", now);
         assert_eq!(
-            guest_labels(&s, Some(HOST), true, false, current_seq(&s), now),
+            guest_labels(&s, Some(HOST), true, false, current_label_seq(&s), now),
             Some(("MultiTerminal".into(), "t".into()))
         );
     }
@@ -264,7 +305,7 @@ mod tests {
         let now = Instant::now();
         put(&s, 1, 1, "MultiTerminal", now);
         assert_eq!(
-            guest_labels(&s, Some(HOST), true, true, current_seq(&s), now),
+            guest_labels(&s, Some(HOST), true, true, current_label_seq(&s), now),
             None
         );
     }
@@ -275,9 +316,28 @@ mod tests {
         let now = Instant::now();
         put(&s, 1, 1, "MultiTerminal", now);
         assert_eq!(
-            guest_labels(&s, Some("Safari"), true, false, current_seq(&s), now),
+            guest_labels(&s, Some("Safari"), true, false, current_label_seq(&s), now),
             None
         );
+    }
+
+    #[test]
+    fn heartbeat_same_labels_keeps_override() {
+        let s = ContextStore::empty();
+        let now = Instant::now();
+        put(&s, 1, 1, "A", now);
+        let snap = current_label_seq(&s);
+        put(&s, 1, 2, "A", now);
+        assert_eq!(
+            override_for(&s, Some(HOST), true, snap, now),
+            Some(("A".into(), "t".into()))
+        );
+        put(&s, 1, 3, "B", now);
+        assert_eq!(override_for(&s, Some(HOST), true, snap, now), None);
+        // A helper restart (new epoch) re-anchors even with the same labels.
+        let snap = current_label_seq(&s);
+        put(&s, 2, 1, "B", now);
+        assert_eq!(override_for(&s, Some(HOST), true, snap, now), None);
     }
 
     #[test]

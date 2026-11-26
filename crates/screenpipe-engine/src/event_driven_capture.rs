@@ -3151,7 +3151,7 @@ async fn do_capture(
     // VM guest context as of these pixels; a later post can't relabel them.
     // The host app is not known yet, so only focus and startup can skip it.
     let guest_seq_at_screenshot = if monitor_hosts_focus && !is_startup {
-        crate::external_context::current_seq(&crate::external_context::GLOBAL)
+        crate::external_context::current_label_seq(&crate::external_context::GLOBAL)
     } else {
         None
     };
