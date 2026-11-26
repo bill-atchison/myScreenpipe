@@ -97,7 +97,18 @@ pub fn override_for(
 }
 
 pub fn clear(store: &ContextStore) {
-    store.store(None);
+    // Tombstone, not None: a late post with an old (epoch, seq) must stay Stale.
+    store.rcu(|cur| {
+        cur.as_ref().map(|c| {
+            Arc::new(ExternalContext {
+                app_name: String::new(),
+                window_title: String::new(),
+                epoch: c.epoch,
+                seq: c.seq,
+                received_at: c.received_at,
+            })
+        })
+    });
 }
 
 #[cfg(test)]
@@ -194,6 +205,17 @@ mod tests {
         let now = Instant::now();
         assert!(matches!(put(&s, 1, 5, "", now), Accept::Cleared));
         assert!(matches!(put(&s, 1, 4, "A", now), Accept::Stale));
+        assert!(matches!(put(&s, 1, 6, "A", now), Accept::Stored));
+    }
+
+    #[test]
+    fn clear_keeps_tombstone_ordering() {
+        let s = ContextStore::empty();
+        let now = Instant::now();
+        put(&s, 1, 5, "A", now);
+        clear(&s);
+        assert_eq!(override_for(&s, Some(HOST), true, current_seq(&s), now), None);
+        assert!(matches!(put(&s, 1, 5, "A", now), Accept::Stale));
         assert!(matches!(put(&s, 1, 6, "A", now), Accept::Stored));
     }
 
