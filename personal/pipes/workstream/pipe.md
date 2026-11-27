@@ -1,7 +1,7 @@
 ---
 schedule: 5 * * * *
 enabled: true
-effort: low
+effort: medium
 preset:
 - codex
 - claude code
@@ -41,15 +41,25 @@ Use only screenpipe's recorded data via the local API at `http://localhost:3030`
    Decided: <decisions made, or "none seen">
    Open: <what was left unfinished or blocked, or "none seen">
    ```
-   When the hour included a meeting, add one line per meeting before `Did:` and let the meeting's
-   decisions and action items (who owns what) feed `Decided:` and `Open:`. The meeting line may
-   take the content up to 200 words:
+   **When the hour included a meeting, the memory MUST have a meeting block** (one per meeting,
+   before `Did:`). Read the whole transcript for the window before writing it. With a meeting the
+   content may run to 250 words:
    ```
-   Meeting: <title or app>, <HH:MM>–<HH:MM>, with <participants if known>: <what was discussed>
+   Meeting: <title>, <HH:MM>–<HH:MM> (<app>)
+   Discussed: <the main topics, one short clause each>
+   Decisions: <each decision, or "none">
+   Actions:
+   - <owner>: <action> (<due, if said>)
    ```
+   - Speaker labels ("speaker 1", "?") are anonymous and can be wrong. Name an owner only when the same exchange shows who it is: someone is addressed by name just before they commit ("Hey, Don… Yes, sir, will do" → Don), or they name themselves. William is called "Bill" by others; give William an action only when he is addressed or clearly speaking as the one who will do it ("I'll get something set up for today" in his exchange with Don). Otherwise use the speaker's role as it shows in the meeting ("offshore lead", "tester", "support"), and "owner unclear" only when even that is unknown.
+   - Include every follow-up someone commits to out loud ("I'll follow up with him", "I'll send you the reports", "email us if you need a replacement"), not only formal decisions. Walk the transcript to the very end: commitments often come in the last minutes after the main meeting ends.
+   - When several defects or tickets are discussed, keep each outcome attached to the right one; if you cannot tell which outcome belongs to which, say so instead of guessing.
+   - Name any blocker raised in the meeting under `Open:`, with who is waiting on whom.
+   - Still fill `Did:` with the non-meeting work of the hour.
 
 # Rules
 
 - Only report what the data shows. No guesses about intent, no advice.
+- Transcripts mis-hear names. Correct a mis-hearing only when the meeting itself shows the right word (for example "Nordstar" or "all star" when the meeting is about Northstar); never copy a garbled phrase into a summary. If unsure, leave it out.
 - Never put passwords, tokens, API keys or other secrets in a memory, even if they appear on screen.
 - Write nothing else: no files, no notifications, no messages.
