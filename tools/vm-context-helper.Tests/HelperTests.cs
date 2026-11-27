@@ -97,6 +97,16 @@ public class HelperTests
         }
     }
 
+    [Theory]
+    [InlineData(400, true)]
+    [InlineData(403, true)]
+    [InlineData(409, false)] // Mac app restarting into search-only mode
+    [InlineData(404, false)]
+    [InlineData(500, false)]
+    [InlineData(503, false)]
+    public void OnlyPermanentRejectionsBlock(int status, bool blocks) =>
+        Assert.Equal(blocks, Sender.BlocksUntilStateChange(status));
+
     [Fact]
     public async Task Send_RereadsKeyOnceOn403()
     {

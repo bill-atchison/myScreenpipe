@@ -134,8 +134,9 @@ public sealed class Sender
             int status = await SendAsync(info, ct);
             if (status == NotReady) return false;
             if (status == 204) { _lastError = null; return true; }
-            lock (_lock) _blocked = true; // 403 twice or 400: wait for the next state change
             LogError($"post rejected: HTTP {status}");
+            if (!BlocksUntilStateChange(status)) return false; // retry on the next heartbeat
+            lock (_lock) _blocked = true;
             return true;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { return true; }
@@ -145,6 +146,13 @@ public sealed class Sender
             return false;
         }
     }
+
+    /// <summary>
+    /// 400 (bad body) and 403 (bad key, after a re-read) won't fix themselves, so
+    /// wait for the next state change. Anything else (409 while the Mac app is in
+    /// search-only mode, 404 from a build without the route, 5xx) is transient.
+    /// </summary>
+    public static bool BlocksUntilStateChange(int status) => status is 400 or 403;
 
     void LogError(string msg)
     {
