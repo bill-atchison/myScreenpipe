@@ -8950,6 +8950,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "screenpipe-embed"
+version = "0.4.52"
+dependencies = [
+ "anyhow",
+ "dirs 6.0.0",
+ "hf-hub 0.3.2",
+ "ndarray 0.17.2",
+ "ort",
+ "sha2 0.10.9",
+ "tokenizers 0.21.4",
+ "tokio",
+]
+
+[[package]]
 name = "screenpipe-engine"
 version = "0.4.52"
 dependencies = [
@@ -8998,6 +9012,7 @@ dependencies = [
  "screenpipe-connect",
  "screenpipe-core",
  "screenpipe-db",
+ "screenpipe-embed",
  "screenpipe-events",
  "screenpipe-fs",
  "screenpipe-redact",

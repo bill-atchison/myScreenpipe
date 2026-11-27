@@ -2356,6 +2356,13 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
         });
     }
 
+    // Opt-in semantic search (`--enable-semantic-search`): embeds stored text
+    // in the background until shutdown, which aborts it before closing the
+    // database. Capture never waits on it.
+    let embedding_worker = config
+        .enable_semantic_search
+        .then(|| screenpipe_engine::embedding_worker::spawn(Arc::clone(&db)));
+
     // Image-PII reconciliation worker (issue #3185 follow-up).
     // Independent of the text worker — users can toggle either one
     // without the other. Requires the rfdetr_v9 model present and at
@@ -2479,6 +2486,10 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
         }
     };
 
+    // Every exit, including the database-restart path, passes here.
+    if let Some(worker) = &embedding_worker {
+        worker.abort();
+    }
     let _ = shutdown_tx.send(());
     if let Some(ref handle) = ui_recorder_handle {
         handle.stop();

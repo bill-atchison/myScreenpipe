@@ -440,6 +440,12 @@ pub struct RecordingSettings {
     #[serde(rename = "semanticContextMode", default)]
     pub semantic_context_mode: SemanticContextMode,
 
+    /// Search history by meaning: a background worker embeds screen text
+    /// and transcripts on this device (one-time ~90 MB model download).
+    /// Opt-in; capture is unaffected either way. Takes effect on restart.
+    #[serde(rename = "enableSemanticSearch", default)]
+    pub enable_semantic_search: bool,
+
     /// Legacy timeline gate retained for managed deployments and compatibility.
     /// Consumer installs migrate visibility to sidebarNavLayout. Screenshot
     /// capture controls cache work through `timeline_cache_disabled`.
@@ -965,6 +971,7 @@ impl Default for RecordingSettings {
             disable_screenshots: false,
             enable_semantic_context: false,
             semantic_context_mode: SemanticContextMode::Memory,
+            enable_semantic_search: false,
             disable_timeline: false,
             monitor_ids: vec![],
             use_all_monitors: true,
@@ -1612,6 +1619,22 @@ mod tests {
         .unwrap();
         assert!(!computer_use.semantic_context_mode.includes_memory());
         assert!(computer_use.semantic_context_mode.includes_computer_use());
+    }
+
+    #[test]
+    fn semantic_search_defaults_off_and_round_trips() {
+        let legacy: RecordingSettings = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.enable_semantic_search);
+        assert!(!RecordingSettings::default().enable_semantic_search);
+        let on: RecordingSettings =
+            serde_json::from_str(r#"{"enableSemanticSearch":true}"#).unwrap();
+        assert!(on.enable_semantic_search);
+        let json = serde_json::to_value(&on).unwrap();
+        assert_eq!(json["enableSemanticSearch"], true);
+        assert_eq!(
+            serde_json::from_value::<RecordingSettings>(json).unwrap(),
+            on
+        );
     }
 
     #[test]

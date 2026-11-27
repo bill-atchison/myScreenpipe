@@ -461,6 +461,7 @@ mod activity_ledger;
 mod audio;
 mod display_layout;
 mod elements;
+mod embeddings;
 mod feedback;
 mod frames;
 mod maintenance;
@@ -486,6 +487,10 @@ mod write_ops;
 pub use self::activity_ledger::{
     ActivityActionDraft, ActivityActionRecord, ActivityEvidenceDraft, ActivityEvidenceRecord,
     ActivityIntervalDraft, ActivityIntervalRecord, ActivityLedgerObservation, ActivityTaskDraft,
+};
+pub use self::embeddings::{
+    EmbeddingChunk, EmbeddingRelease, EmbeddingSource, EmbeddingSourceType, SemanticRow,
+    EMBEDDING_DIMS,
 };
 pub use self::semantic::{
     SemanticActor, SemanticActorAlias, SemanticActorReference, SemanticAttachResult,

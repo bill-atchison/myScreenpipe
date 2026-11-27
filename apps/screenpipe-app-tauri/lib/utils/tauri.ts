@@ -3948,6 +3948,12 @@ enableSemanticContext?: boolean;
  */
 semanticContextMode?: SemanticContextMode;
 /**
+ * Search history by meaning: a background worker embeds screen text
+ * and transcripts on this device (one-time ~90 MB model download).
+ * Opt-in; capture is unaffected either way. Takes effect on restart.
+ */
+enableSemanticSearch?: boolean;
+/**
  * Legacy timeline gate retained for managed deployments and compatibility.
  * Consumer installs migrate visibility to sidebarNavLayout. Screenshot
  * capture controls cache work through `timeline_cache_disabled`.

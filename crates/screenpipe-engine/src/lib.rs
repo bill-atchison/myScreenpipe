@@ -52,6 +52,7 @@ pub mod core;
 pub mod crash_log;
 pub mod disk_pressure;
 pub mod drm_detector;
+pub mod embedding_worker;
 pub mod event_driven_capture;
 pub mod external_context;
 pub mod external_memory_sync;

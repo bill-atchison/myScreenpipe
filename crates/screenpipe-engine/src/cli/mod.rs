@@ -644,6 +644,20 @@ pub struct RecordArgs {
     )]
     pub enable_semantic_context: bool,
 
+    /// Search history by meaning: embed screen text and transcripts on this
+    /// device in a background worker (one-time ~90 MB model download). Never
+    /// touches the capture path. Off by default. `--enable-semantic-search=false`
+    /// or the environment variable overrides a saved choice; CLI flags win.
+    #[arg(
+        long,
+        env = "SCREENPIPE_ENABLE_SEMANTIC_SEARCH",
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true"
+    )]
+    pub enable_semantic_search: bool,
+
     /// Windows to ignore (case-insensitive contains). Use `App::Title` to
     /// scope to one window of one app (e.g. `Slack::#hr`). `::title` matches
     /// any app whose focused window title contains `title`. `App::` blocks
@@ -939,6 +953,7 @@ pub struct RecordArgSources {
     pub disable_screenshots: bool,
     pub app_context: bool,
     pub enable_semantic_context: bool,
+    pub enable_semantic_search: bool,
     pub ignored_windows: bool,
     pub included_windows: bool,
     pub ignored_urls: bool,
@@ -1010,6 +1025,10 @@ impl RecordArgSources {
                 record.value_source("enable_semantic_context"),
                 Some(ValueSource::CommandLine | ValueSource::EnvVariable)
             ),
+            enable_semantic_search: matches!(
+                record.value_source("enable_semantic_search"),
+                Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+            ),
             ignored_windows: from_command_line(record, "ignored_windows"),
             included_windows: from_command_line(record, "included_windows"),
             ignored_urls: from_command_line(record, "ignored_urls"),
@@ -1067,6 +1086,7 @@ impl RecordArgSources {
             || self.disable_screenshots
             || self.app_context
             || self.enable_semantic_context
+            || self.enable_semantic_search
             || self.ignored_windows
             || self.included_windows
             || self.ignored_urls
@@ -1233,6 +1253,7 @@ impl RecordArgs {
             disable_screenshots: self.disable_screenshots,
             enable_semantic_context,
             semantic_context_mode,
+            enable_semantic_search: self.enable_semantic_search,
             // CLI has no --disable-timeline flag; the desktop app drives this
             // toggle. Default to enabled (timeline on) for the engine binary.
             disable_timeline: false,
@@ -1562,6 +1583,9 @@ impl RecordArgs {
             settings.semantic_context_mode = mode;
         } else if sources.enable_semantic_context {
             settings.enable_semantic_context = self.enable_semantic_context;
+        }
+        if sources.enable_semantic_search {
+            settings.enable_semantic_search = self.enable_semantic_search;
         }
         // An explicit --monitor-id or --use-all-monitors means the user wants
         // vision on, so it clears a persisted disable_vision:true (the #3648
@@ -2707,6 +2731,7 @@ mod tests {
     fn test_new_default_flags_accept_explicit_false_and_bare_true() {
         for flag in [
             "--enable-semantic-context",
+            "--enable-semantic-search",
             "--experimental-meeting-piggyback",
             "--disable-clipboard-capture",
             "--disable-keyboard-capture",
@@ -2726,6 +2751,7 @@ mod tests {
                 // Start with opposite saved values to prove false is an explicit override.
                 let mut settings = screenpipe_config::RecordingSettings {
                     enable_semantic_context: !enabled,
+                    enable_semantic_search: !enabled,
                     experimental_meeting_piggyback: !enabled,
                     disable_clipboard_capture: !enabled,
                     disable_keyboard_capture: !enabled,
@@ -2734,6 +2760,7 @@ mod tests {
                 args.apply_defaults_and_overrides(&mut settings, None, &sources);
                 let actual = match flag {
                     "--enable-semantic-context" => settings.enable_semantic_context,
+                    "--enable-semantic-search" => settings.enable_semantic_search,
                     "--experimental-meeting-piggyback" => settings.experimental_meeting_piggyback,
                     "--disable-clipboard-capture" => settings.disable_clipboard_capture,
                     _ => settings.disable_keyboard_capture,
@@ -2742,6 +2769,79 @@ mod tests {
                 assert!(sources.has_recording_override());
             }
         }
+    }
+
+    #[test]
+    fn semantic_search_flag_is_opt_in_and_preserves_saved_choice() {
+        let argv = ["screenpipe", "record"];
+        assert!(
+            !record_args(argv)
+                .to_recording_settings()
+                .enable_semantic_search
+        );
+        let mut saved = screenpipe_config::RecordingSettings {
+            enable_semantic_search: true,
+            ..Default::default()
+        };
+        record_args(argv).apply_explicit_overrides(&mut saved, &record_sources(argv));
+        assert!(
+            saved.enable_semantic_search,
+            "absent flag keeps saved choice"
+        );
+
+        let argv = ["screenpipe", "record", "--enable-semantic-search"];
+        assert!(
+            record_args(argv)
+                .to_recording_settings()
+                .enable_semantic_search
+        );
+        let sources = record_sources(argv);
+        assert!(sources.has_recording_override());
+        let mut saved = screenpipe_config::RecordingSettings::default();
+        record_args(argv).apply_explicit_overrides(&mut saved, &sources);
+        assert!(saved.enable_semantic_search);
+    }
+
+    #[test]
+    fn semantic_search_environment_overrides_saved_but_not_flags() {
+        // Real clap environment parsing in child processes, as above.
+        const CHILD: &str = "SCREENPIPE_TEST_SEMANTIC_SEARCH_CHILD";
+        let Ok(value) = std::env::var(CHILD) else {
+            for value in ["true", "false"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "cli::tests::semantic_search_environment_overrides_saved_but_not_flags",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, value)
+                    .env("SCREENPIPE_ENABLE_SEMANTIC_SEARCH", value)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "environment={value}\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let enabled: bool = value.parse().unwrap();
+        let argv = ["screenpipe", "record"];
+        let sources = record_sources(argv);
+        assert!(sources.enable_semantic_search);
+        let mut settings = screenpipe_config::RecordingSettings {
+            enable_semantic_search: !enabled,
+            ..Default::default()
+        };
+        record_args(argv).apply_explicit_overrides(&mut settings, &sources);
+        assert_eq!(settings.enable_semantic_search, enabled);
+
+        let flag = format!("--enable-semantic-search={}", !enabled);
+        let argv = ["screenpipe", "record", flag.as_str()];
+        record_args(argv).apply_explicit_overrides(&mut settings, &record_sources(argv));
+        assert_eq!(settings.enable_semantic_search, !enabled);
     }
 
     #[test]

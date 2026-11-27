@@ -186,6 +186,111 @@ and incognito check also apply to the guest app.
 Checks: `dotnet test tools/vm-context-helper.Tests` (VM, 10 tests);
 `cargo test -p screenpipe-engine --lib external_context` (Mac).
 
+## Semantic memory search
+
+Search your history by meaning, so "bill is past due" finds the text "invoice
+overdue". It is **off by default**. Capture is unaffected either way.
+
+Turn it on with any of these (the saved choice is kept unless a flag or the
+environment variable overrides it; CLI flags win):
+
+- Settings > Screen > System > Semantic search (a switch).
+- `screenpipe record --enable-semantic-search` (or `=false` to force it off).
+- Environment variable `SCREENPIPE_ENABLE_SEMANTIC_SEARCH=true|false`.
+
+It takes effect on the next server restart (Settings lists it as a
+restart-required setting).
+
+**Model.** all-MiniLM-L6-v2 (ONNX) from the Hugging Face repo
+`Xenova/all-MiniLM-L6-v2` at a pinned revision, so every install shares one
+vector space. The first run downloads about 90 MB into
+`<OS cache dir>/screenpipe/models`; after that it loads from disk. It runs on
+the CPU on this device only (one ONNX thread); nothing is sent anywhere except
+that download.
+
+**What is embedded.** Screen text (`frames.full_text`) and audio transcripts.
+Identical texts are embedded once. A text is split into at most 8 chunks of
+about 256 tokens, and anything past the eighth chunk is not embedded. A
+background worker does the work: new rows first, newest first, then it backfills
+older history. Each batch takes the shared background-CPU lane with an adaptive
+slice (at most 32 rows) and a 50 ms to 60 s cooldown, and it pauses while
+background work is suspended. If the model cannot load, the worker logs one line
+and stops.
+
+**Privacy.**
+
+- With text privacy release (redaction) on, only released text is embedded, from
+  the released (redacted) copy.
+- When the release setting or its policy changes (the `receipt_key` changes), all
+  vectors are deleted and rebuilt.
+- Deleting a frame or transcript deletes its vectors (database triggers).
+- A transcript rewritten by overlap cleanup loses its vector at once (database
+  trigger) and the worker embeds it again from the new text. Rewriting it with
+  the same text changes nothing.
+- The route re-reads every hit through the release gate and drops a vector hit
+  whose current text no longer hashes to the text it was embedded from, and any
+  row that is gone or unreleased.
+- Pipes with data restrictions or the privacy filter get 403.
+- The history-access cutoff (for example 24 h on the free plan) applies.
+
+### `GET /search/semantic`
+
+Hybrid: nearest vectors and keyword (FTS) matches are fused by reciprocal rank.
+
+| Param | Meaning |
+| --- | --- |
+| `q` | Required, 1 to 1000 characters. |
+| `limit` | Default 20, max 100. |
+| `content_type` | `frame`, `audio` or `all` (default). |
+| `start_time`, `end_time` | Optional RFC 3339 timestamps. |
+
+Response: `{"data": [...]}`; each item has `source_type` (`frame` or `audio`),
+`id`, `timestamp`, `text` (first 300 characters), `app_name`, `window_name`,
+`device`, `speaker`, `score` and `matched_by` (`vector`, `keyword` or `both`).
+
+Errors: 503 when semantic search is off (including right after turning the
+setting off, once the server restarts), the worker has stopped, or the model is
+not loaded yet; 409 in
+search-only mode (Screenpipe quit, serving saved history); 403 for restricted
+pipes; 400 for a bad `q`.
+
+```bash
+curl -G "http://localhost:3030/search/semantic" \
+  -H "Authorization: Bearer $(screenpipe auth token)" \
+  --data-urlencode "q=invoice overdue payment" --data-urlencode "limit=5"
+```
+
+Eval (needs the real model; downloads it once). On a 30-frame, 4-transcript
+paraphrase fixture, hybrid recall@5 was 11/11 against 0/11 for keyword only.
+That gap is partly the fixture's design: the keyword side requires every query
+word to match. Run it from the Mac worktree:
+
+```bash
+cargo test -p screenpipe-engine --lib recall_eval -- --ignored --nocapture
+```
+
+### Known limits
+
+- The keyword side scores only the newest 5000 matches (`KEYWORD_SCAN`), so older
+  keyword matches drop out; the vector side can still find them.
+- With release off, an edited frame is protected only by the route's hash
+  check and is never re-embedded (a frames trigger would fire when sealing
+  moves `full_text` into payloads and re-embed all history). Edited transcripts
+  are re-embedded (see Privacy).
+- A time range, the history cutoff and `content_type` apply after the global
+  nearest-neighbour read, so with any of them set it reads 10 chunks per
+  requested result (at most 1000) instead of 4 (at most 200). A narrow range whose rows all rank below that can still miss
+  vector hits; the keyword side still finds them.
+- Turning the setting off stops the worker but keeps the vectors on disk.
+  Deleting a frame or transcript still deletes its vectors.
+- An external `sqlite3` session that deletes frames or transcripts, or edits a
+  transcript's text, fails with `no such module: vec0`: the embedding triggers
+  touch the vector table, and
+  sqlite-vec is loaded only inside Screenpipe.
+- Only the first chunk (about 254 tokens) of the query is embedded.
+- Any `receipt_key` bump deletes and rebuilds every vector, which takes a while
+  on a long history.
+
 ## Change log: upstream files touched
 
 Keep this list complete so upstream merges stay easy to review.
@@ -196,15 +301,32 @@ Keep this list complete so upstream merges stay easy to review.
 | `apps/screenpipe-app-tauri/src-tauri/src/store.rs` | `init_store`: call `personal::apply_new_profile_defaults(&mut store, is_new_store)` after the settings migrations, just before the save (+7 lines) |
 | `apps/screenpipe-app-tauri/app/providers.tsx` | skip `posthog.init` when the flag is set (+5/-1 lines) |
 | `crates/screenpipe-engine/src/event_driven_capture.rs` | capture hook: guest labels override stored and hot-cache app/window only; host values still drive admission |
-| `crates/screenpipe-engine/src/server.rs` | register `POST /context/external` |
-| `crates/screenpipe-engine/src/routes/mod.rs` | `pub mod external_context;` |
-| `crates/screenpipe-engine/src/lib.rs` | `pub mod external_context;` |
+| `crates/screenpipe-engine/src/server.rs` | register `POST /context/external` and `GET /search/semantic` |
+| `crates/screenpipe-engine/src/routes/mod.rs` | `pub mod external_context;`, `pub mod semantic_search;` |
+| `crates/screenpipe-engine/src/lib.rs` | `pub mod external_context;`, `pub mod embedding_worker;` |
 | `crates/screenpipe-engine/src/sleep_monitor.rs` | clear the external context on wake |
 | `crates/screenpipe-capture/src/paired_capture.rs` | optional stored labels for the frame's app/window |
 | `packages/sdk/recorder-core/src/platform/recorder.rs` | `stored_labels: None` for the new field |
+| `crates/screenpipe-engine/src/routes/search.rs` | `apply_search_history_access` made `pub(crate)`; `/search/semantic` joins the storage-snapshot read paths |
+| `crates/screenpipe-engine/src/cli/mod.rs` | `--enable-semantic-search` / `SCREENPIPE_ENABLE_SEMANTIC_SEARCH` flag, override tracking, tests |
+| `crates/screenpipe-engine/src/recording_config.rs` | `enable_semantic_search` field and tests |
+| `crates/screenpipe-engine/src/bin/screenpipe-engine.rs` | spawn the embedding worker when enabled; abort it at shutdown (+11 lines) |
+| `crates/screenpipe-engine/Cargo.toml` | `screenpipe-embed` dependency |
+| `crates/screenpipe-config/src/recording.rs` | `enable_semantic_search` setting (`enableSemanticSearch`, default off) and test |
+| `crates/screenpipe-db/src/db/mod.rs` | `mod embeddings;` and its re-exports |
+| `crates/screenpipe-db/src/lib.rs` | re-export the embedding types and `EMBEDDING_DIMS` |
+| `apps/screenpipe-app-tauri/src-tauri/src/server_core.rs` | spawn the embedding worker when enabled (+6 lines) |
+| `apps/screenpipe-app-tauri/components/settings/recording-settings.tsx` | Semantic search switch, search index entry, restart-required entry (+23 lines) |
+| `apps/screenpipe-app-tauri/lib/utils/tauri.ts` | `enableSemanticSearch` in the generated settings type (+6 lines) |
+| `Cargo.lock`, `apps/screenpipe-app-tauri/src-tauri/Cargo.lock` | new dependencies of `screenpipe-embed` |
+| `docs/COVERAGE.md`, `docs/coverage/CORE.md`, `docs/coverage/core-engine-map.json` | coverage entries for the embedding files |
 
 Files added by this fork (not upstream): `PERSONAL.md`,
 `apps/screenpipe-app-tauri/src-tauri/src/personal.rs`, `personal/mac.sh`,
 `crates/screenpipe-engine/src/external_context.rs`,
 `crates/screenpipe-engine/src/routes/external_context.rs`, `tools/.gitignore`,
-`tools/vm-context-helper/`, `tools/vm-context-helper.Tests/`.
+`tools/vm-context-helper/`, `tools/vm-context-helper.Tests/`,
+`crates/screenpipe-embed/`, `crates/screenpipe-engine/src/embedding_worker.rs`,
+`crates/screenpipe-engine/src/routes/semantic_search.rs`,
+`crates/screenpipe-db/src/db/embeddings.rs`,
+`crates/screenpipe-db/src/migrations/20261126120000_text_embeddings.sql`.
