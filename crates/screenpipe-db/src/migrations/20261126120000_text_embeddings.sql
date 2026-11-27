@@ -34,11 +34,13 @@ CREATE TABLE IF NOT EXISTS embedding_cursor (
 
 -- The text privacy release the stored vectors were built under (receipt key,
 -- NULL while release is off) and the worker's position in the ready feed.
--- A different release invalidates every vector.
+-- A different release invalidates every vector; `wiping` marks a wipe in
+-- progress so an interrupted one is finished on restart.
 CREATE TABLE IF NOT EXISTS embedding_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     release_key INTEGER,
-    ready_after INTEGER NOT NULL DEFAULT 0
+    ready_after INTEGER NOT NULL DEFAULT 0,
+    wiping INTEGER NOT NULL DEFAULT 0
 );
 
 -- Keep derived vectors inside the source capture's deletion/privacy boundary

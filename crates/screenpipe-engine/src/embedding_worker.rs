@@ -15,9 +15,10 @@
 //! off, each row type is scanned around its cursors. Switching release or
 //! changing its policy deletes every vector and re-embeds from scratch.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use screenpipe_db::{
-    DatabaseManager, EmbeddingChunk, EmbeddingSource, EmbeddingSourceType, EMBEDDING_DIMS,
+    DatabaseManager, EmbeddingChunk, EmbeddingRelease, EmbeddingSource, EmbeddingSourceType,
+    EMBEDDING_DIMS,
 };
 use screenpipe_embed::{chunk, text_hash, Embedder};
 use screenpipe_resource::{
@@ -144,6 +145,52 @@ fn embed_chunks(
         .collect())
 }
 
+/// Marks an error from the model (tokenizer, ONNX) rather than the database.
+#[derive(Debug)]
+struct EmbedFailed;
+
+impl std::fmt::Display for EmbedFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("embedding model failed")
+    }
+}
+
+/// Only model failures can be caused by the rows themselves.
+fn counts_toward_poison(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<EmbedFailed>().is_some()
+}
+
+/// The release to embed under. When the stored vectors were built under
+/// another one, wipes them first, one short slice per background CPU permit
+/// (which also waits while background work is suspended).
+pub async fn sync_release(
+    db: &DatabaseManager,
+    governor: &Arc<ResourceGovernor>,
+) -> Result<EmbeddingRelease> {
+    let release = db.embedding_release().await?;
+    if !release.needs_wipe {
+        return Ok(release);
+    }
+    info!("semantic search: text privacy release changed; deleting vectors to re-embed");
+    db.begin_embedding_wipe().await?;
+    loop {
+        let permit = governor.acquire_background_cpu().await;
+        let started = Instant::now();
+        if !db.delete_embedding_slice().await? {
+            break;
+        }
+        let cooldown = permit
+            .finish(started.elapsed(), MIN_COOLDOWN, MAX_COOLDOWN)
+            .cooldown;
+        tokio::time::sleep(cooldown).await;
+    }
+    db.finish_embedding_wipe(release.release_key).await?;
+    Ok(EmbeddingRelease {
+        needs_wipe: false,
+        ..release
+    })
+}
+
 fn slot(job: Job) -> usize {
     match job {
         Job::Released { .. } => 0,
@@ -170,13 +217,13 @@ async fn run(db: Arc<DatabaseManager>, embed: Arc<EmbedFn>) {
         }
     };
     loop {
-        let jobs = match db.sync_embedding_release().await {
+        let jobs = match sync_release(&db, &governor).await {
             Ok(release) if release.release_key.is_some() => vec![Job::Released {
                 after: release.ready_after,
             }],
             Ok(_) => SOURCES.map(Job::Scan).to_vec(),
             Err(e) => {
-                report(e.into());
+                report(e);
                 tokio::time::sleep(IDLE).await;
                 continue;
             }
@@ -217,7 +264,10 @@ async fn run(db: Arc<DatabaseManager>, embed: Arc<EmbedFn>) {
                 }
                 Err(e) => {
                     failed = true;
-                    failures[i] += 1;
+                    // A database or writer error says nothing about the rows.
+                    if counts_toward_poison(&e) {
+                        failures[i] += 1;
+                    }
                     report(e);
                 }
             }
@@ -267,8 +317,18 @@ async fn released_batch(
             if (picked[0].len() + picked[1].len()) as i64 >= limit {
                 break;
             }
-            if let Ok(id) = change.id.parse() {
-                picked[source].push(id);
+            match change.id.parse() {
+                Ok(id) => picked[source].push(id),
+                Err(_) => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        warn!(
+                            kind = %change.kind,
+                            id = %change.id,
+                            "semantic search: skipping release-feed entry with a non-numeric id"
+                        )
+                    });
+                }
             }
         }
         position = change.sequence;
@@ -441,19 +501,25 @@ async fn embed_new(
             .collect();
         Ok((vectors, failed))
     })
-    .await??;
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result)
+    .and_then(|(vectors, failed): (Vec<Vec<Vector>>, usize)| {
+        anyhow::ensure!(
+            vectors.len() == hashes.len(),
+            "embedder returned {} results for {} texts",
+            vectors.len(),
+            hashes.len()
+        );
+        Ok((vectors, failed))
+    })
+    .context(EmbedFailed)?;
     if failed > 0 {
         warn!(
             "semantic search: {failed} text(s) failed to embed {POISON_AFTER} times in a row; \
              recorded without vectors"
         );
     }
-    anyhow::ensure!(
-        vectors.len() == hashes.len(),
-        "embedder returned {} results for {} texts",
-        vectors.len(),
-        hashes.len()
-    );
     Ok(hashes
         .iter()
         .zip(vectors)
@@ -534,7 +600,7 @@ mod tests {
     }
 
     async fn released(db: &DatabaseManager, embed: &Arc<EmbedFn>) -> Batch {
-        let release = db.sync_embedding_release().await.unwrap();
+        let release = sync_release(db, &governor()).await.unwrap();
         assert!(release.release_key.is_some());
         let job = Job::Released {
             after: release.ready_after,
@@ -793,12 +859,7 @@ mod tests {
             .unwrap();
         frames(&db, &[(1, "alice@example.com")]).await;
         let (embed, calls) = fake();
-        assert!(db
-            .sync_embedding_release()
-            .await
-            .unwrap()
-            .release_key
-            .is_none());
+        assert!(db.embedding_release().await.unwrap().release_key.is_none());
         assert_eq!(scan(&db, 10, &embed).await, 1);
         assert_eq!(
             source_hashes(&db).await[0].1,
@@ -806,7 +867,7 @@ mod tests {
         );
 
         configure(&db, "test:model-v1").await;
-        let before = db.sync_embedding_release().await.unwrap();
+        let before = sync_release(&db, &governor()).await.unwrap();
         assert_eq!(count(&db, "embedding_sources").await, 0);
         assert_eq!(count(&db, "text_embeddings_vec").await, 0);
         release_frames(&db, "[v1]", &[]).await;
@@ -814,7 +875,7 @@ mod tests {
         assert_eq!(source_hashes(&db).await, [(1, text_hash("[v1] 1"))]);
 
         configure(&db, "test:model-v2").await;
-        let after = db.sync_embedding_release().await.unwrap();
+        let after = sync_release(&db, &governor()).await.unwrap();
         assert_ne!(after.release_key, before.release_key);
         assert_eq!(after.ready_after, 0);
         assert_eq!(count(&db, "embedding_sources").await, 0);
@@ -863,5 +924,49 @@ mod tests {
         assert_eq!(out.iter().map(Vec::len).collect::<Vec<_>>(), [2, 1]);
         let short = |run: &[&str]| Ok(vec![[0.0; EMBEDDING_DIMS]; run.len() - 1]);
         assert!(embed_chunks(&chunks, short).is_err());
+    }
+
+    fn governor() -> Arc<ResourceGovernor> {
+        ResourceGovernor::new(Default::default())
+    }
+
+    /// A wipe deletes nothing while another background subsystem holds the
+    /// CPU lane, and finishes once it is released.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wipe_waits_for_the_background_cpu_lane() {
+        let db = Arc::new(memory_db().await);
+        frames(&db, &[(1, "a"), (2, "b"), (3, "c")]).await;
+        let (embed, _) = fake();
+        assert_eq!(scan(&db, 10, &embed).await, 3);
+        let governor = governor();
+        let held = governor.acquire_background_cpu().await;
+        let wipe = tokio::spawn({
+            let (db, governor) = (Arc::clone(&db), Arc::clone(&governor));
+            async move { sync_release(&db, &governor).await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!wipe.is_finished());
+        assert_eq!(count(&db, "embedding_sources").await, 3);
+        drop(held);
+        assert!(!wipe.await.unwrap().needs_wipe);
+        assert_eq!(count(&db, "embedding_sources").await, 0);
+        db.close().await;
+    }
+
+    /// Model failures count toward isolating a batch; database errors do not.
+    #[tokio::test]
+    async fn only_model_failures_count_toward_poison() {
+        let db = memory_db().await;
+        frames(&db, &[(1, "poison")]).await;
+        let (embed, _) = fake();
+        let model = embed_batch(&db, Job::Scan(FRAME), 10, &embed, false)
+            .await
+            .unwrap_err();
+        assert!(counts_toward_poison(&model), "{model:#}");
+        db.close().await;
+        let database = embed_batch(&db, Job::Scan(FRAME), 10, &embed, false)
+            .await
+            .unwrap_err();
+        assert!(!counts_toward_poison(&database), "{database:#}");
     }
 }

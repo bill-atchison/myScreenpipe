@@ -56,13 +56,16 @@ impl EmbeddingSourceType {
 /// Sources deleted per transaction when a release change invalidates vectors.
 const INVALIDATE_SLICE: i64 = 500;
 
-/// What [`DatabaseManager::sync_embedding_release`] found current.
+/// What [`DatabaseManager::embedding_release`] found current.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmbeddingRelease {
     /// Receipt key while text privacy release is on; `None` while it is off.
     pub release_key: Option<i64>,
     /// Position in `ready_changes` already embedded.
     pub ready_after: i64,
+    /// The stored vectors were built under another release, or a wipe was
+    /// interrupted: wipe before embedding anything.
+    pub needs_wipe: bool,
 }
 
 /// A capture row and the hash of the text it was embedded from.
@@ -90,9 +93,15 @@ impl DatabaseManager {
     /// `sources` are recorded as given: their text's chunks are in `chunks`,
     /// or the text has none (nothing to embed). `reused` are sources whose
     /// text the caller found via [`Self::known_text_hashes`] and did not
-    /// re-embed. If a deletion removed that text's chunks in the meantime,
-    /// recording them would leave the row unsearchable for good, so they are
-    /// skipped and returned for the caller to embed again.
+    /// re-embed. If that text's chunks are gone by commit time (a deletion,
+    /// or a remap in this same batch), recording them would leave the row
+    /// unsearchable for good, so they are skipped and returned for the
+    /// caller to embed again.
+    ///
+    /// A source whose capture row no longer exists is not recorded, and
+    /// chunks left with no source are not kept. Once the worker has synced a
+    /// release ([`Self::embedding_release`]), a batch built under another
+    /// release (or during a wipe) is rejected without writing anything.
     pub async fn insert_embeddings(
         &self,
         sources: &[EmbeddingSource],
@@ -100,6 +109,35 @@ impl DatabaseManager {
         chunks: &[EmbeddingChunk],
     ) -> Result<Vec<EmbeddingSource>, SqlxError> {
         let mut tx = self.begin_immediate_with_retry().await?;
+        let state: Option<(Option<i64>, bool)> =
+            sqlx::query_as("SELECT release_key, wiping FROM embedding_state WHERE id = 1")
+                .fetch_optional(&mut **tx.conn())
+                .await?;
+        if let Some((key, wiping)) = state {
+            if wiping || key != release_key_on(tx.conn()).await? {
+                tx.rollback().await?;
+                return Err(SqlxError::Protocol(RELEASE_CHANGED.into()));
+            }
+        }
+        // Sources first: a remap here may orphan (and delete) a text that a
+        // reused source below still needs; that is checked after.
+        for source in sources.iter().chain(reused) {
+            let table = match source.source_type {
+                EmbeddingSourceType::Frame => "frames",
+                EmbeddingSourceType::Audio => "audio_transcriptions",
+            };
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO embedding_sources (source_type, source_id, text_hash) \
+                 SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM {table} WHERE id = ?2) \
+                 ON CONFLICT (source_type, source_id) DO UPDATE \
+                 SET text_hash = excluded.text_hash WHERE text_hash != excluded.text_hash"
+            )))
+            .bind(source.source_type.as_str())
+            .bind(source.source_id)
+            .bind(source.text_hash)
+            .execute(&mut **tx.conn())
+            .await?;
+        }
         for chunk in chunks {
             let id: Option<i64> = sqlx::query_scalar(
                 "INSERT INTO embedding_chunks (text_hash, chunk_index) VALUES (?1, ?2) \
@@ -119,31 +157,32 @@ impl DatabaseManager {
         }
         let mut stale = Vec::new();
         for source in reused {
-            let stored: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM embedding_chunks WHERE text_hash = ?1)",
-            )
-            .bind(source.text_hash)
-            .fetch_one(&mut **tx.conn())
-            .await?;
-            if !stored {
-                stale.push(*source);
-            }
-        }
-        for source in sources
-            .iter()
-            .chain(reused.iter().filter(|s| !stale.contains(s)))
-        {
-            sqlx::query(
-                "INSERT INTO embedding_sources (source_type, source_id, text_hash) \
-                 VALUES (?1, ?2, ?3) ON CONFLICT (source_type, source_id) DO UPDATE \
-                 SET text_hash = excluded.text_hash WHERE text_hash != excluded.text_hash",
+            // Unmap a recorded reused source whose text has no chunks.
+            let unmapped = sqlx::query(
+                "DELETE FROM embedding_sources WHERE source_type = ?1 AND source_id = ?2 \
+                 AND text_hash = ?3 \
+                 AND NOT EXISTS (SELECT 1 FROM embedding_chunks WHERE text_hash = ?3)",
             )
             .bind(source.source_type.as_str())
             .bind(source.source_id)
             .bind(source.text_hash)
             .execute(&mut **tx.conn())
-            .await?;
+            .await?
+            .rows_affected();
+            if unmapped > 0 {
+                stale.push(*source);
+            }
         }
+        // Chunks of a text whose every source was skipped (row deleted).
+        let hashes: Vec<i64> = chunks.iter().map(|c| c.text_hash).collect();
+        sqlx::query(
+            "DELETE FROM embedding_chunks WHERE text_hash IN (SELECT value FROM json_each(?1)) \
+             AND NOT EXISTS (SELECT 1 FROM embedding_sources s \
+                             WHERE s.text_hash = embedding_chunks.text_hash)",
+        )
+        .bind(serde_json::to_string(&hashes).map_err(|e| SqlxError::Protocol(e.to_string()))?)
+        .execute(&mut **tx.conn())
+        .await?;
         tx.commit().await?;
         Ok(stale)
     }
@@ -356,58 +395,82 @@ impl DatabaseManager {
         )
     }
 
-    /// The text privacy release to read rows under, and the ready-feed
-    /// position. When release was switched or its policy changed since the
-    /// stored vectors were built, every vector is deleted first (in bounded
-    /// slices) and the cursors and position reset, so history re-embeds from
-    /// text released under the current policy.
-    pub async fn sync_embedding_release(&self) -> Result<EmbeddingRelease, SqlxError> {
-        let current = self.text_release_key().await?;
-        let stored: Option<(Option<i64>, i64)> =
-            sqlx::query_as("SELECT release_key, ready_after FROM embedding_state WHERE id = 1")
-                .fetch_optional(&mut *self.acquire_read().await?)
-                .await?;
-        if let Some((key, ready_after)) = stored {
-            if key == current {
-                return Ok(EmbeddingRelease {
-                    release_key: current,
-                    ready_after,
-                });
-            }
-        }
-        // Each slice commits, so capture writes interleave with the cleanup.
-        // State is written last: an interrupted cleanup resumes on restart.
-        loop {
-            let mut tx = self.begin_immediate_with_retry().await?;
-            let deleted = sqlx::query(
-                "DELETE FROM embedding_sources WHERE rowid IN \
-                 (SELECT rowid FROM embedding_sources LIMIT ?1)",
-            )
-            .bind(INVALIDATE_SLICE)
-            .execute(&mut **tx.conn())
-            .await?
-            .rows_affected();
-            tx.commit().await?;
-            if deleted == 0 {
-                break;
-            }
-        }
+    /// The current text privacy release, the ready-feed position, and
+    /// whether the stored vectors must be wiped: they were built under
+    /// another release (switched, or its policy changed), or a wipe was
+    /// interrupted. The worker then wipes with [`Self::begin_embedding_wipe`],
+    /// [`Self::delete_embedding_slice`] and [`Self::finish_embedding_wipe`].
+    pub async fn embedding_release(&self) -> Result<EmbeddingRelease, SqlxError> {
+        let mut conn = self.acquire_read().await?;
+        let current = release_key_on(&mut conn).await?;
+        let stored: Option<(Option<i64>, i64, bool)> = sqlx::query_as(
+            "SELECT release_key, ready_after, wiping FROM embedding_state WHERE id = 1",
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(match stored {
+            Some((key, ready_after, false)) if key == current => EmbeddingRelease {
+                release_key: current,
+                ready_after,
+                needs_wipe: false,
+            },
+            _ => EmbeddingRelease {
+                release_key: current,
+                ready_after: 0,
+                needs_wipe: true,
+            },
+        })
+    }
+
+    /// Mark a wipe in progress before deleting anything, so an interrupted
+    /// wipe is finished on restart whatever the release is by then. Inserts
+    /// are rejected while it is set.
+    pub async fn begin_embedding_wipe(&self) -> Result<(), SqlxError> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        sqlx::query(
+            "INSERT INTO embedding_state (id, release_key, ready_after, wiping) \
+             VALUES (1, NULL, 0, 1) ON CONFLICT (id) DO UPDATE SET wiping = 1",
+        )
+        .execute(&mut **tx.conn())
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Delete up to [`INVALIDATE_SLICE`] sources in one short transaction;
+    /// chunks and vectors follow through the triggers. Returns whether more
+    /// may remain (a full slice was deleted).
+    pub async fn delete_embedding_slice(&self) -> Result<bool, SqlxError> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        let deleted = sqlx::query(
+            "DELETE FROM embedding_sources WHERE rowid IN \
+             (SELECT rowid FROM embedding_sources LIMIT ?1)",
+        )
+        .bind(INVALIDATE_SLICE)
+        .execute(&mut **tx.conn())
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(deleted as i64 == INVALIDATE_SLICE)
+    }
+
+    /// Reset the cursors and feed position and record `release_key` as the
+    /// release new vectors are built under.
+    pub async fn finish_embedding_wipe(&self, release_key: Option<i64>) -> Result<(), SqlxError> {
         let mut tx = self.begin_immediate_with_retry().await?;
         sqlx::query("DELETE FROM embedding_cursor")
             .execute(&mut **tx.conn())
             .await?;
         sqlx::query(
-            "INSERT INTO embedding_state (id, release_key, ready_after) VALUES (1, ?1, 0) \
-             ON CONFLICT (id) DO UPDATE SET release_key = excluded.release_key, ready_after = 0",
+            "INSERT INTO embedding_state (id, release_key, ready_after, wiping) \
+             VALUES (1, ?1, 0, 0) ON CONFLICT (id) DO UPDATE \
+             SET release_key = excluded.release_key, ready_after = 0, wiping = 0",
         )
-        .bind(current)
+        .bind(release_key)
         .execute(&mut **tx.conn())
         .await?;
         tx.commit().await?;
-        Ok(EmbeddingRelease {
-            release_key: current,
-            ready_after: 0,
-        })
+        Ok(())
     }
 
     pub async fn set_embedding_ready_after(&self, sequence: i64) -> Result<(), SqlxError> {
@@ -418,16 +481,6 @@ impl DatabaseManager {
             .await?;
         tx.commit().await?;
         Ok(())
-    }
-
-    /// The current receipt key while text privacy release is on.
-    async fn text_release_key(&self) -> Result<Option<i64>, SqlxError> {
-        if !self.release_policy().await?.text {
-            return Ok(None);
-        }
-        sqlx::query_scalar("SELECT receipt_key FROM _privacy_policy WHERE id = 1")
-            .fetch_optional(&mut *self.acquire_read().await?)
-            .await
     }
 
     /// SQL that is true when the `kind` row `id` may be embedded. With text
@@ -446,6 +499,27 @@ impl DatabaseManager {
             "1".into()
         })
     }
+}
+
+/// Error text when a batch was built under a release that is no longer current.
+const RELEASE_CHANGED: &str = "text privacy release changed; embedding batch discarded";
+
+/// The current receipt key while text privacy release is on.
+async fn release_key_on(conn: &mut sqlx::SqliteConnection) -> Result<Option<i64>, SqlxError> {
+    let configured: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = '_privacy_policy')",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if !configured {
+        return Ok(None);
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT CASE WHEN text_required = 1 THEN receipt_key END FROM _privacy_policy WHERE id = 1",
+    )
+    .fetch_optional(&mut *conn)
+    .await?
+    .flatten())
 }
 
 const UNEMBEDDED_AUDIO: &str = "FROM audio_transcriptions a WHERE a.transcription != '' \
@@ -492,6 +566,17 @@ mod tests {
             .fetch_one(&db.pool)
             .await
             .unwrap()
+    }
+
+    /// Frames 1..=n (sources are only recorded for rows that exist).
+    async fn frames_upto(db: &DatabaseManager, n: i64) {
+        db.execute_raw_sql_write(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<{n}) \
+             INSERT OR IGNORE INTO frames(id,timestamp,full_text) \
+             SELECT i,'2026-11-26T12:00:00Z','t' FROM n"
+        ))
+        .await
+        .unwrap();
     }
 
     const SEED: &str = "INSERT INTO frames(id,timestamp,full_text) VALUES \
@@ -601,6 +686,8 @@ mod tests {
             .await
             .unwrap();
         // One static screen shared by 5k frames, plus a second text.
+        db.execute_raw_sql_write(SEED).await.unwrap();
+        frames_upto(&db, 5000).await;
         let mut sources: Vec<_> = (1..=5000).map(|id| frame(id, 10)).collect();
         sources.push(audio(1, 20));
         db.insert_embeddings(&sources, &[], &[chunk(10, 0, 0), chunk(20, 0, 1)])
@@ -665,9 +752,13 @@ mod tests {
         db.execute_raw_sql_write(SEED).await.unwrap();
         embed_seed(&db).await;
         assert!(db.known_text_hashes(&[10]).await.unwrap().contains(&10));
-        db.execute_raw_sql_write("DELETE FROM frames WHERE id IN (1,2)")
-            .await
-            .unwrap();
+        db.execute_raw_sql_write(
+            "DELETE FROM frames WHERE id IN (1,2); \
+             INSERT INTO frames(id,timestamp,full_text) VALUES \
+             (3,'2026-11-26T12:00:02Z','x'),(4,'2026-11-26T12:00:03Z','y');",
+        )
+        .await
+        .unwrap();
         let stale = db
             .insert_embeddings(&[], &[frame(3, 10), frame(4, 20)], &[])
             .await
@@ -817,6 +908,7 @@ mod tests {
         let db = DatabaseManager::new("sqlite::memory:", Default::default())
             .await
             .unwrap();
+        frames_upto(&db, 2).await;
         db.insert_embeddings(
             &[frame(1, 10), frame(2, 30)],
             &[],
@@ -827,37 +919,124 @@ mod tests {
         db.insert_embeddings(&[frame(1, 20), frame(2, 30)], &[], &[chunk(20, 0, 1)])
             .await
             .unwrap();
-        let hashes: Vec<i64> =
-            sqlx::query_scalar("SELECT text_hash FROM embedding_sources ORDER BY source_id")
-                .fetch_all(&db.pool)
-                .await
-                .unwrap();
-        assert_eq!(hashes, [20, 30]);
+        assert_eq!(hashes(&db).await, [(1, 20), (2, 30)]);
         assert_eq!(count(&db, "embedding_chunks").await, 2);
         assert_eq!(count(&db, "text_embeddings_vec").await, 2);
         assert_eq!(db.knn(&unit(1), 1).await.unwrap()[0].1, 1);
         db.close().await;
     }
 
-    /// Switching text privacy release on (or changing its policy) deletes
-    /// every vector across several slices and resets the cursors and feed
-    /// position; an unchanged release keeps them.
+    async fn hashes(db: &DatabaseManager) -> Vec<(i64, i64)> {
+        sqlx::query_as("SELECT source_id, text_hash FROM embedding_sources ORDER BY source_id")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Row 1 ("Inbox") is re-released as "Inbox (1)" while row 2 reuses
+    /// "Inbox" in the same batch. The remap orphans "Inbox"; row 2 must come
+    /// back stale, never be recorded without chunks.
     #[tokio::test]
-    async fn release_change_invalidates_every_vector() {
-        use crate::privacy_release::ReleasePolicy;
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("db.sqlite");
-        let db = DatabaseManager::new(path.to_str().unwrap(), Default::default())
+    async fn reused_source_stranded_by_a_remap_is_returned() {
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
             .await
             .unwrap();
-        let off = db.sync_embedding_release().await.unwrap();
+        frames_upto(&db, 2).await;
+        let (inbox, inbox_1) = (10, 11);
+        db.insert_embeddings(&[frame(1, inbox)], &[], &[chunk(inbox, 0, 0)])
+            .await
+            .unwrap();
+        assert!(db
+            .known_text_hashes(&[inbox])
+            .await
+            .unwrap()
+            .contains(&inbox));
+        let stale = db
+            .insert_embeddings(
+                &[frame(1, inbox_1)],
+                &[frame(2, inbox)],
+                &[chunk(inbox_1, 0, 1)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale, [frame(2, inbox)]);
+        assert_eq!(hashes(&db).await, [(1, inbox_1)]);
+        let stale = db
+            .insert_embeddings(&[frame(2, inbox)], &[], &[chunk(inbox, 0, 0)])
+            .await
+            .unwrap();
+        assert!(stale.is_empty());
+        assert_eq!(db.knn(&unit(0), 1).await.unwrap()[0].1, 2);
+        db.close().await;
+    }
+
+    /// A row deleted between the read and the insert gets no source, and the
+    /// chunks embedded only for it are not kept.
+    #[tokio::test]
+    async fn deleted_row_gets_no_source_and_leaves_no_vectors() {
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
+        frames_upto(&db, 1).await;
+        db.insert_embeddings(
+            &[frame(1, 10), frame(99, 50), audio(7, 60)],
+            &[],
+            &[chunk(10, 0, 0), chunk(50, 0, 1), chunk(60, 0, 2)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(hashes(&db).await, [(1, 10)]);
+        assert_eq!(count(&db, "embedding_chunks").await, 1);
+        assert_eq!(count(&db, "text_embeddings_vec").await, 1);
+        db.close().await;
+    }
+
+    async fn file_db(root: &tempfile::TempDir) -> DatabaseManager {
+        let path = root.path().join("db.sqlite");
+        DatabaseManager::new(path.to_str().unwrap(), Default::default())
+            .await
+            .unwrap()
+    }
+
+    async fn configure(db: &DatabaseManager, identity: &str, text: bool) {
+        db.configure_release(&crate::privacy_release::ReleasePolicy {
+            identity: identity.into(),
+            text,
+            images: false,
+        })
+        .await
+        .unwrap();
+    }
+
+    /// What the worker does when `needs_wipe` (minus its CPU permits).
+    async fn wipe(db: &DatabaseManager) -> EmbeddingRelease {
+        let release = db.embedding_release().await.unwrap();
+        if release.needs_wipe {
+            db.begin_embedding_wipe().await.unwrap();
+            while db.delete_embedding_slice().await.unwrap() {}
+            db.finish_embedding_wipe(release.release_key).await.unwrap();
+        }
+        db.embedding_release().await.unwrap()
+    }
+
+    /// Switching text privacy release on (or changing its policy) calls for
+    /// a wipe of every vector across several slices and resets the cursors
+    /// and feed position; an unchanged release keeps them.
+    #[tokio::test]
+    async fn release_change_invalidates_every_vector() {
+        let root = tempfile::tempdir().unwrap();
+        let db = file_db(&root).await;
+        let off = wipe(&db).await;
         assert_eq!(
             off,
             EmbeddingRelease {
                 release_key: None,
-                ready_after: 0
+                ready_after: 0,
+                needs_wipe: false,
             }
         );
+        db.execute_raw_sql_write(SEED).await.unwrap();
+        frames_upto(&db, 1_200).await;
         let sources: Vec<_> = (1..=1_200).map(|id| frame(id, id % 7)).collect();
         let chunks: Vec<_> = (0..7).map(|h| chunk(h, 0, h as usize)).collect();
         db.insert_embeddings(&sources, &[audio(1, 3)], &chunks)
@@ -867,20 +1046,17 @@ mod tests {
             .await
             .unwrap();
         db.set_embedding_ready_after(9).await.unwrap();
-        assert_eq!(db.sync_embedding_release().await.unwrap().ready_after, 9);
+        assert_eq!(wipe(&db).await.ready_after, 9);
         assert_eq!(count(&db, "embedding_sources").await, 1_201);
 
+        let mut previous = off.release_key;
         for identity in ["test:model-v1", "test:model-v2"] {
-            db.configure_release(&ReleasePolicy {
-                identity: identity.into(),
-                text: true,
-                images: false,
-            })
-            .await
-            .unwrap();
-            let on = db.sync_embedding_release().await.unwrap();
-            assert!(on.release_key.is_some() && on.release_key != off.release_key);
-            assert_eq!(on.ready_after, 0);
+            configure(&db, identity, true).await;
+            assert!(db.embedding_release().await.unwrap().needs_wipe);
+            let on = wipe(&db).await;
+            assert!(on.release_key.is_some() && on.release_key != previous);
+            previous = on.release_key;
+            assert_eq!((on.ready_after, on.needs_wipe), (0, false));
             for table in [
                 "embedding_sources",
                 "embedding_chunks",
@@ -889,14 +1065,132 @@ mod tests {
             ] {
                 assert_eq!(count(&db, table).await, 0, "{identity} {table}");
             }
-            // Vectors built under this policy survive an unchanged sync.
+            // Vectors built under this policy survive an unchanged check.
             db.insert_embeddings(&[frame(1, 1)], &[], &[chunk(1, 0, 1)])
                 .await
                 .unwrap();
-            assert_eq!(db.sync_embedding_release().await.unwrap(), on);
+            assert_eq!(wipe(&db).await, on);
             assert_eq!(count(&db, "embedding_sources").await, 1);
         }
         db.close().await;
+    }
+
+    /// A batch built under one release cannot commit after another took
+    /// over: it is rejected and writes nothing.
+    #[tokio::test]
+    async fn insert_built_under_an_old_release_writes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let db = file_db(&root).await;
+        frames_upto(&db, 2).await;
+        configure(&db, "test:model-v1", true).await;
+        wipe(&db).await;
+        db.insert_embeddings(&[frame(1, 10)], &[], &[chunk(10, 0, 0)])
+            .await
+            .unwrap();
+        configure(&db, "test:model-v2", true).await;
+        let err = db
+            .insert_embeddings(&[frame(2, 20)], &[], &[chunk(20, 0, 1)])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(RELEASE_CHANGED), "{err}");
+        assert_eq!(hashes(&db).await, [(1, 10)]);
+        assert_eq!(count(&db, "embedding_chunks").await, 1);
+        // Turning release off is a change too.
+        wipe(&db).await;
+        configure(&db, "test:model-v2", false).await;
+        assert!(db
+            .insert_embeddings(&[frame(2, 20)], &[], &[chunk(20, 0, 1)])
+            .await
+            .is_err());
+        assert_eq!(count(&db, "embedding_sources").await, 0);
+        db.close().await;
+    }
+
+    /// A wipe interrupted after its first slice is finished on restart even
+    /// when the release is back to what the state row records.
+    #[tokio::test]
+    async fn interrupted_wipe_is_finished_on_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let db = file_db(&root).await;
+        frames_upto(&db, 1_000).await;
+        wipe(&db).await;
+        let sources: Vec<_> = (1..=1_000).map(|id| frame(id, id)).collect();
+        let chunks: Vec<_> = (1..=1_000).map(|h| chunk(h, 0, 0)).collect();
+        db.insert_embeddings(&sources, &[], &chunks).await.unwrap();
+        db.set_embedding_cursor(EmbeddingSourceType::Frame, Some(1_000), Some(1))
+            .await
+            .unwrap();
+        // Release on asks for a wipe; it stops after one slice and release
+        // is switched off again before the restart.
+        configure(&db, "test:model-v1", true).await;
+        assert!(db.embedding_release().await.unwrap().needs_wipe);
+        db.begin_embedding_wipe().await.unwrap();
+        assert!(db.delete_embedding_slice().await.unwrap());
+        configure(&db, "test:model-v1", false).await;
+        let release = db.embedding_release().await.unwrap();
+        assert!(release.needs_wipe, "a half-done wipe must be finished");
+        assert!(db
+            .insert_embeddings(&[frame(1, 1)], &[], &[chunk(1, 0, 0)])
+            .await
+            .is_err());
+        wipe(&db).await;
+        assert_eq!(count(&db, "embedding_sources").await, 0);
+        assert_eq!(count(&db, "text_embeddings_vec").await, 0);
+        assert_eq!(
+            db.embedding_cursor(EmbeddingSourceType::Frame)
+                .await
+                .unwrap(),
+            (None, None)
+        );
+        db.close().await;
+    }
+
+    /// Wipe cost: ~10k sources with vectors, both storage modes. Reports the
+    /// longest single slice (how long one transaction holds the writer).
+    #[tokio::test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    async fn wipe_cost() {
+        const SOURCES: i64 = 10_000;
+        for hybrid in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let db = if hybrid {
+                DatabaseManager::new_hybrid(root.path(), Default::default(), Default::default())
+                    .await
+                    .unwrap()
+            } else {
+                file_db(&root).await
+            };
+            frames_upto(&db, SOURCES).await;
+            // 2k distinct texts, 5 frames each, 2 chunks per text.
+            let sources: Vec<_> = (1..=SOURCES).map(|id| frame(id, id % 2_000)).collect();
+            let chunks: Vec<_> = (0..2_000)
+                .flat_map(|h| [chunk(h, 0, h as usize % 384), chunk(h, 1, 0)])
+                .collect();
+            for batch in sources.chunks(1_000) {
+                db.insert_embeddings(batch, &[], &chunks).await.unwrap();
+            }
+            assert_eq!(count(&db, "text_embeddings_vec").await, 4_000);
+            db.begin_embedding_wipe().await.unwrap();
+            let (started, mut longest, mut slices) = (std::time::Instant::now(), 0u128, 0);
+            loop {
+                let t = std::time::Instant::now();
+                let more = db.delete_embedding_slice().await.unwrap();
+                longest = longest.max(t.elapsed().as_micros());
+                slices += 1;
+                if !more {
+                    break;
+                }
+            }
+            assert_eq!(count(&db, "text_embeddings_vec").await, 0);
+            eprintln!(
+                "WIPE mode={} sources={SOURCES} vectors=4000 slices={slices} \
+                 total_ms={} longest_slice_ms={:.1}",
+                if hybrid { "compressed" } else { "sqlite" },
+                started.elapsed().as_millis(),
+                longest as f64 / 1000.0
+            );
+            db.close().await;
+        }
     }
 
     /// With text privacy release on, a row is offered only once its receipt
