@@ -53,6 +53,22 @@ CREATE TRIGGER IF NOT EXISTS embedding_audio_ad AFTER DELETE ON audio_transcript
     DELETE FROM embedding_sources WHERE source_type = 'audio' AND source_id = OLD.id;
 END;
 
+-- Overlap cleanup rewrites a transcript after it may have been embedded.
+-- Forget its old text and, with release off, move the high-water mark below
+-- it so the scan, which reads ids above high_water, embeds it again.
+-- embedding_cursor covers [low_water, high_water]; editing the low-water row
+-- leaves high below low, an empty range the next scan repairs. With release
+-- on the edit is released again through the feed and cursors are NULL. Runs once per transcript UPDATE, never per frame: one primary-key
+-- delete and a one-row update. No frames twin: sealing rewrites full_text
+-- into payloads and would re-embed all history.
+CREATE TRIGGER IF NOT EXISTS embedding_audio_au AFTER UPDATE OF transcription ON audio_transcriptions
+WHEN OLD.transcription IS NOT NEW.transcription
+BEGIN
+    DELETE FROM embedding_sources WHERE source_type = 'audio' AND source_id = OLD.id;
+    UPDATE embedding_cursor SET high_water = OLD.id - 1
+     WHERE source_type = 'audio' AND low_water <= OLD.id AND high_water >= OLD.id;
+END;
+
 CREATE TRIGGER IF NOT EXISTS embedding_sources_ad AFTER DELETE ON embedding_sources
 WHEN NOT EXISTS (SELECT 1 FROM embedding_sources WHERE text_hash = OLD.text_hash)
 BEGIN

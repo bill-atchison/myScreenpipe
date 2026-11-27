@@ -25,6 +25,7 @@ use screenpipe_resource::{
     background_work, ResourceGovernor, WorkSliceConfig, WorkSliceController,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
@@ -54,9 +55,36 @@ const SOURCES: [EmbeddingSourceType; 2] = [EmbeddingSourceType::Frame, Embedding
 /// One session per process, shared with the search route.
 static MODEL: OnceCell<Arc<Embedder>> = OnceCell::const_new();
 
-/// The embedding model, once the worker has loaded it.
+/// Worker tasks alive. `MODEL` outlives a worker: turning the setting off
+/// restarts only the server, which aborts the worker. A count, not a flag,
+/// so an old worker's late drop cannot hide a new one's model.
+static LIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// The embedding model, once loaded, while a worker is running.
 pub fn model() -> Option<Arc<Embedder>> {
-    MODEL.get().cloned()
+    live(&MODEL)
+}
+
+fn live<T: Clone>(cell: &OnceCell<T>) -> Option<T> {
+    (LIVE_WORKERS.load(Ordering::Acquire) > 0)
+        .then(|| cell.get().cloned())
+        .flatten()
+}
+
+/// Counts its worker task as live until the task ends or is aborted.
+struct Live;
+
+impl Live {
+    fn start() -> Self {
+        LIVE_WORKERS.fetch_add(1, Ordering::AcqRel);
+        Live
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        LIVE_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// What one batch reads.
@@ -80,6 +108,7 @@ pub struct Batch {
 /// that cannot load logs one line and stops the worker; capture is unaffected.
 pub fn spawn(db: Arc<DatabaseManager>) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let _live = Live::start();
         background_work::wait_until_resumed().await;
         let embedder = match load_model().await {
             Ok(embedder) => embedder,
@@ -735,6 +764,113 @@ mod tests {
         assert_eq!(count(&db, "embedding_sources").await, 4);
         assert_eq!(count(&db, "embedding_chunks").await, 1);
         db.close().await;
+    }
+
+    /// With release off, a transcript rewritten by overlap cleanup is
+    /// embedded again from its new text, wherever it sits in the covered
+    /// range; rewriting it with the same text changes nothing.
+    #[tokio::test]
+    async fn edited_audio_is_reembedded() {
+        use crate::history_access::HistoryAccessPolicy;
+        use crate::routes::semantic_search::{hybrid_search, ContentFilter, SemanticSearchParams};
+        const AUDIO: EmbeddingSourceType = EmbeddingSourceType::Audio;
+        let db = memory_db().await;
+        for id in 1..=3 {
+            db.execute_raw_sql_write(&format!(
+                "INSERT INTO audio_chunks(id,file_path) VALUES({id},'{id}.wav'); \
+                 INSERT INTO audio_transcriptions(id,audio_chunk_id,offset_index,timestamp,transcription,device) \
+                   VALUES({id},{id},0,'2026-11-26T12:00:0{id}Z','said {id}','mic');"
+            ))
+            .await
+            .unwrap();
+        }
+        let (embed, calls) = fake();
+        let (db_ref, embed_ref) = (&db, &embed);
+        let scan_audio = || async move {
+            embed_batch(db_ref, Job::Scan(AUDIO), 10, embed_ref, false)
+                .await
+                .unwrap()
+                .recorded
+        };
+        assert_eq!(scan_audio().await, 3);
+        assert_eq!(
+            db.embedding_cursor(AUDIO).await.unwrap(),
+            (Some(3), Some(1))
+        );
+        let vector_hits = || async move {
+            let params = SemanticSearchParams {
+                q: "zzz".into(),
+                limit: 10,
+                content_type: ContentFilter::Audio,
+                start_time: None,
+                end_time: None,
+            };
+            let mut v = [0.0; EMBEDDING_DIMS];
+            v[0] = 1.0;
+            let mut hits: Vec<(i64, String)> = hybrid_search(
+                db_ref,
+                "zzz",
+                Some(&v),
+                &params,
+                &HistoryAccessPolicy::unrestricted(),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| (i.id, i.text))
+            .collect();
+            hits.sort();
+            hits
+        };
+
+        // Same text: the source and cursors stay.
+        db.update_audio_transcription(2, "said 2").await.unwrap();
+        assert_eq!(count(&db, "embedding_sources").await, 3);
+        assert_eq!(
+            db.embedding_cursor(AUDIO).await.unwrap(),
+            (Some(3), Some(1))
+        );
+
+        // The oldest covered row (the low-water mark) and a middle one.
+        db.update_audio_transcription(1, "edited 1").await.unwrap();
+        db.update_audio_transcription(2, "edited 2").await.unwrap();
+        assert_eq!(count(&db, "embedding_sources").await, 1);
+        assert_eq!(vector_hits().await, [(3, "said 3".to_string())]);
+        assert_eq!(scan_audio().await, 2);
+        assert_eq!(scan_audio().await, 0);
+        assert_eq!(texts(&calls).len(), 2);
+        assert_eq!(sorted(texts(&calls)[1].clone()), ["edited 1", "edited 2"]);
+        assert_eq!(
+            vector_hits().await,
+            [
+                (1, "edited 1".to_string()),
+                (2, "edited 2".to_string()),
+                (3, "said 3".to_string())
+            ]
+        );
+        db.close().await;
+    }
+
+    /// The route sees the model only while a worker task is alive: the
+    /// setting turned off aborts the worker, not the process-wide model.
+    #[tokio::test]
+    async fn model_is_hidden_without_a_live_worker() {
+        let cell: OnceCell<u8> = OnceCell::new_with(Some(7));
+        assert_eq!(live(&cell), None);
+        let worker = tokio::spawn(async {
+            let _live = Live::start();
+            std::future::pending::<()>().await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while live(&cell).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker never went live");
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        assert_eq!(live(&cell), None);
     }
 
     #[tokio::test]

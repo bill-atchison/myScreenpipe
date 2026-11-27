@@ -33,6 +33,10 @@ const MAX_LIMIT: u32 = 100;
 /// Each side contributes this many candidates per requested result.
 const DEPTH_PER_RESULT: u32 = 4;
 const MAX_DEPTH: u32 = 200;
+/// Nearest chunks read per requested result when a type or time filter
+/// (including the history cutoff) narrows the search.
+const NARROW_K_PER_RESULT: u32 = 10;
+const NARROW_MAX_K: u32 = 1000;
 /// The usual reciprocal-rank-fusion constant.
 const RRF_K: f64 = 60.0;
 const EXCERPT_CHARS: usize = 300;
@@ -159,14 +163,23 @@ pub(crate) async fn hybrid_search(
         ContentFilter::Audio => &[Audio],
         ContentFilter::All => &[Frame, Audio],
     };
+    // KNN is global; type and time filters apply after it, so a narrow
+    // search reads deeper to keep hits that rank below rows it filters out.
+    // ponytail: still capped at NARROW_MAX_K chunks, so a range holding only
+    // far rows can miss; filter inside the vec0 query if that matters.
+    let narrow = start.is_some() || end.is_some() || params.content_type != ContentFilter::All;
+    let k = if narrow {
+        (limit as u32 * NARROW_K_PER_RESULT).min(NARROW_MAX_K) as usize
+    } else {
+        depth
+    };
 
     // Nearest rows first, each with the hash of the text it was embedded from.
     let mut embedded: HashMap<Key, i64> = HashMap::new();
     let mut nearest: Vec<Key> = Vec::new();
     if let Some(vector) = vector {
-        for (kind, id, _, _, hash) in db.knn(vector, depth as i64).await? {
-            if nearest.len() < depth && types.contains(&kind) && !embedded.contains_key(&(kind, id))
-            {
+        for (kind, id, _, _, hash) in db.knn(vector, k as i64).await? {
+            if nearest.len() < k && types.contains(&kind) && !embedded.contains_key(&(kind, id)) {
                 embedded.insert((kind, id), hash);
                 nearest.push((kind, id));
             }
@@ -199,6 +212,7 @@ pub(crate) async fn hybrid_search(
             row.embedded_text.as_deref().map(text_hash) == embedded.get(key).copied()
         })
     });
+    nearest.truncate(depth);
     for list in &mut keyword {
         list.retain(|key| rows.contains_key(key));
     }
@@ -691,6 +705,53 @@ mod tests {
         assert!(search(before, limited()).await.is_empty());
     }
 
+    /// A time range narrower than the global nearest neighbours still finds
+    /// the nearest row inside it.
+    #[tokio::test]
+    async fn narrow_range_still_finds_vector_hits() {
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
+        let mut sql = String::new();
+        for id in 1..=6 {
+            let day = if id == 6 { 2 } else { 1 };
+            sql += &format!(
+                "INSERT INTO frames(id,timestamp,full_text) VALUES({id},'2026-11-0{day}T12:00:0{id}Z','text {id}');"
+            );
+        }
+        db.execute_raw_sql_write(&sql).await.unwrap();
+        let mut far = unit(0);
+        far[1] = 1.0;
+        let (mut sources, mut chunks) = (Vec::new(), Vec::new());
+        for id in 1..=6 {
+            let hash = text_hash(&format!("text {id}"));
+            sources.push(EmbeddingSource {
+                source_type: FRAME,
+                source_id: id,
+                text_hash: hash,
+            });
+            chunks.push(EmbeddingChunk {
+                text_hash: hash,
+                chunk_index: 0,
+                embedding: if id == 6 { far } else { unit(0) },
+            });
+        }
+        db.insert_embeddings(&sources, &[], &chunks).await.unwrap();
+        // limit 1: the five nearer rows fill the default depth of 4.
+        let mut narrow = params("zzz");
+        narrow.limit = 1;
+        narrow.start_time = Some("2026-11-02T00:00:00Z".parse().unwrap());
+        let hits = hybrid_search(&db, "zzz", Some(&unit(0)), &narrow, &open())
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter()
+                .map(|h| (h.id, h.matched_by))
+                .collect::<Vec<_>>(),
+            [(6, "vector")]
+        );
+    }
+
     const EVAL_FRAMES: [&str; 30] = [
         "fn retry_with_backoff(attempts: u32) { sleep(Duration::from_secs(2u64.pow(attempts))); } // wait longer after each failed request",
         "Subject: Statement from Acme Corp. Hi, the bill from Acme is past due by 14 days. Please remit the balance of $2,300 to avoid late fees.",
@@ -734,7 +795,10 @@ mod tests {
     /// (query, target). Frame ids are 1-based positions in `EVAL_FRAMES`.
     const EVAL_QUERIES: [(&str, Key); 11] = [
         ("invoice overdue payment", (FRAME, 2)),
-        ("why does my service keep crashing out of memory", (FRAME, 17)),
+        (
+            "why does my service keep crashing out of memory",
+            (FRAME, 17),
+        ),
         ("can't push my code changes", (FRAME, 5)),
         ("groceries to pick up", (AUDIO, 2)),
         ("when does the plane arrive", (FRAME, 11)),
@@ -782,7 +846,11 @@ mod tests {
         let audio = EVAL_AUDIO.iter().map(|t| (AUDIO, *t));
         for (n, (kind, text)) in frames.chain(audio).enumerate() {
             // Frames take ids 1..=30; audio restarts at 1.
-            let id = if kind == FRAME { n + 1 } else { n + 1 - EVAL_FRAMES.len() } as i64;
+            let id = if kind == FRAME {
+                n + 1
+            } else {
+                n + 1 - EVAL_FRAMES.len()
+            } as i64;
             let pieces = chunk(text, model.tokenizer());
             let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
             sources.push(EmbeddingSource {

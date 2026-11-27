@@ -208,6 +208,9 @@ and stops.
 - When the release setting or its policy changes (the `receipt_key` changes), all
   vectors are deleted and rebuilt.
 - Deleting a frame or transcript deletes its vectors (database triggers).
+- A transcript rewritten by overlap cleanup loses its vector at once (database
+  trigger) and the worker embeds it again from the new text. Rewriting it with
+  the same text changes nothing.
 - The route re-reads every hit through the release gate and drops a vector hit
   whose current text no longer hashes to the text it was embedded from, and any
   row that is gone or unreleased.
@@ -229,7 +232,9 @@ Response: `{"data": [...]}`; each item has `source_type` (`frame` or `audio`),
 `id`, `timestamp`, `text` (first 300 characters), `app_name`, `window_name`,
 `device`, `speaker`, `score` and `matched_by` (`vector`, `keyword` or `both`).
 
-Errors: 503 when semantic search is off or the model is not loaded yet; 409 in
+Errors: 503 when semantic search is off (including right after turning the
+setting off, once the server restarts), the worker has stopped, or the model is
+not loaded yet; 409 in
 search-only mode (Screenpipe quit, serving saved history); 403 for restricted
 pipes; 400 for a bad `q`.
 
@@ -252,8 +257,20 @@ cargo test -p screenpipe-engine --lib recall_eval -- --ignored --nocapture
 
 - The keyword side scores only the newest 5000 matches (`KEYWORD_SCAN`), so older
   keyword matches drop out; the vector side can still find them.
-- With release off, an edited row is protected only by the route's hash check
-  until the worker re-embeds it.
+- With release off, an edited frame is protected only by the route's hash
+  check and is never re-embedded (a frames trigger would fire when sealing
+  moves `full_text` into payloads and re-embed all history). Edited transcripts
+  are re-embedded (see Privacy).
+- A time range, the history cutoff and `content_type` apply after the global
+  nearest-neighbour read, so with any of them set it reads 10 chunks per
+  requested result (at most 1000) instead of 4 (at most 200). A narrow range whose rows all rank below that can still miss
+  vector hits; the keyword side still finds them.
+- Turning the setting off stops the worker but keeps the vectors on disk.
+  Deleting a frame or transcript still deletes its vectors.
+- An external `sqlite3` session that deletes frames or transcripts, or edits a
+  transcript's text, fails with `no such module: vec0`: the embedding triggers
+  touch the vector table, and
+  sqlite-vec is loaded only inside Screenpipe.
 - Only the first chunk (about 254 tokens) of the query is embedded.
 - Any `receipt_key` bump deletes and rebuilds every vector, which takes a while
   on a long history.
@@ -277,7 +294,7 @@ Keep this list complete so upstream merges stay easy to review.
 | `crates/screenpipe-engine/src/routes/search.rs` | `apply_search_history_access` made `pub(crate)`; `/search/semantic` joins the storage-snapshot read paths |
 | `crates/screenpipe-engine/src/cli/mod.rs` | `--enable-semantic-search` / `SCREENPIPE_ENABLE_SEMANTIC_SEARCH` flag, override tracking, tests |
 | `crates/screenpipe-engine/src/recording_config.rs` | `enable_semantic_search` field and tests |
-| `crates/screenpipe-engine/src/bin/screenpipe-engine.rs` | spawn the embedding worker when enabled (+6 lines) |
+| `crates/screenpipe-engine/src/bin/screenpipe-engine.rs` | spawn the embedding worker when enabled; abort it at shutdown (+11 lines) |
 | `crates/screenpipe-engine/Cargo.toml` | `screenpipe-embed` dependency |
 | `crates/screenpipe-config/src/recording.rs` | `enable_semantic_search` setting (`enableSemanticSearch`, default off) and test |
 | `crates/screenpipe-db/src/db/mod.rs` | `mod embeddings;` and its re-exports |
