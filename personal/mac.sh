@@ -8,7 +8,7 @@
 #   personal/mac.sh stop                 quit the dev build and reopen the installed app
 #   personal/mac.sh logs [-f] [lines]    tail the dev build's newest log
 #   personal/mac.sh status               Mac checkout, installed + dev instances, build queue
-#   personal/mac.sh install              swap the Mac's release build into /Applications and start it
+#   personal/mac.sh install              swap the Mac's personal release build (personal/mac-build.sh) into /Applications and start it
 #
 # TCC: the dev build runs inside Terminal.app, so Screen Recording, Accessibility and
 # Microphone are granted to Terminal once and survive rebuilds (verified 2026-10-22);
@@ -128,7 +128,12 @@ case "$cmd" in
       setopt err_exit
       new='apps/screenpipe-app-tauri/src-tauri/target/release/bundle/macos/screenpipe.app'
       ent='apps/screenpipe-app-tauri/src-tauri/entitlements.plist'
-      [ -d \"\$new\" ] || { echo \"error: no release build at \$new; run bun tauri build first\" >&2; exit 1; }
+      [ -d \"\$new\" ] || { echo \"error: no release build at \$new; run personal/mac-build.sh first\" >&2; exit 1; }
+      # Only a personal build bakes its commit into the binary (build.rs); an upstream build
+      # would bring auto-update back and could be replaced by the official app.
+      commit=\$(git rev-parse --short HEAD)
+      grep -aqF \"\$commit\" \"\$new/Contents/MacOS/screenpipe-app\" || {
+        echo \"error: \$new is not a personal build of \$commit (built without the personal flag, or from another commit); run personal/mac-build.sh\" >&2; exit 1; }
       # Same identity every build keeps the handoff working and TCC grants across rebuilds.
       id='$SIGN_IDENTITY'
       if ! security find-identity -v -p codesigning | grep -qF \"\\\"\$id\\\"\"; then

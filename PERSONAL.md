@@ -89,17 +89,30 @@ Build on the Mac, then install from the Windows VM:
 
 ```bash
 # Mac, in ~/Workspace/myScreenpipe
-git pull --ff-only origin myScreenpipe
-cd apps/screenpipe-app-tauri
-export NEXT_PUBLIC_SCREENPIPE_PERSONAL_BUILD=1
-bun install --frozen-lockfile
-bun tauri build
+personal/mac-build.sh     # pulls myScreenpipe, sets the personal flag, bun tauri build
 ```
 
 ```bash
 # Windows VM
 personal/mac.sh install
 ```
+
+`mac-build.sh` always sets `NEXT_PUBLIC_SCREENPIPE_PERSONAL_BUILD=1`. Without
+it you get a plain upstream build, with auto-update and telemetry back on.
+`install` refuses any bundle whose binary does not carry the Mac checkout's
+commit, which only a personal build bakes in.
+
+#### Taking upstream updates
+
+The official updates can't be installed: they are upstream's app and would
+replace yours. Bring upstream in through the fork instead, about weekly so
+conflicts stay small:
+
+1. Ask an agent to "merge upstream". It merges `upstream/main` into a branch
+   from `myScreenpipe`, runs the Mac test suites and coverage checks, gets the
+   conflict resolutions reviewed, then fast-forwards and pushes `myScreenpipe`.
+2. On the Mac: `personal/mac-build.sh`.
+3. From the VM: `personal/mac.sh install`.
 
 `install` stops the running app with SIGTERM, keeps the old copy in
 `/tmp/screenpipe-previous.app`, copies the new bundle into `/Applications`,
