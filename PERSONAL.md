@@ -85,15 +85,52 @@ Personal builds never auto-update: the updater is disabled in Rust whatever the
 remote policy says (log line "updates disabled (personal build)"). To update,
 rebuild from `myScreenpipe`.
 
-When you copy a new build to `/Applications/screenpipe.app`:
-
-1. Quit the official screenpipe app fully before opening the new build.
-2. Seal the bundle after copying, then verify it:
+Build on the Mac, then install from the Windows VM:
 
 ```bash
-codesign --force --deep --sign - --entitlements ~/Workspace/myScreenpipe/apps/screenpipe-app-tauri/src-tauri/entitlements.plist /Applications/screenpipe.app
-codesign --verify --deep --strict /Applications/screenpipe.app
+# Mac, in ~/Workspace/myScreenpipe
+git pull --ff-only origin myScreenpipe
+cd apps/screenpipe-app-tauri
+export NEXT_PUBLIC_SCREENPIPE_PERSONAL_BUILD=1
+bun install --frozen-lockfile
+bun tauri build
 ```
+
+```bash
+# Windows VM
+personal/mac.sh install
+```
+
+`install` stops the running app with SIGTERM, keeps the old copy in
+`/tmp/screenpipe-previous.app`, copies the new bundle into `/Applications`,
+signs it, opens it, and waits up to two minutes for `/health`. It deletes the
+old copy only once the new one is healthy.
+
+Don't just copy the app and open it. **Quit screenpipe** only stops recording
+and keeps the app in the tray, and that running copy refuses to hand over to a
+build signed with a different identity ("Screenpipe couldn't switch versions …
+code requirement"). An ad hoc signature (`--sign -`) is different on every
+build, and macOS also asks for Screen Recording, Accessibility and Microphone
+again each time.
+
+#### One-time: a stable signing certificate
+
+With a self-signed code-signing certificate every build has the same identity,
+so the handoff works and macOS keeps your permissions across rebuilds. No Apple
+developer account is needed. On the Mac:
+
+1. Open **Keychain Access**, then **Keychain Access > Certificate Assistant >
+   Create a Certificate…**
+2. Name: `screenpipe personal` (exactly; `install` looks for this name).
+   Identity Type: **Self-Signed Root**. Certificate Type: **Code Signing**.
+   Click **Create**, then **Done**. It goes into your login keychain.
+3. Check it: `security find-identity -v -p codesigning` lists
+   `"screenpipe personal"`.
+
+`install` signs with it automatically (override with `SIGN_IDENTITY=...`) and
+falls back to ad hoc, with a warning, when it isn't there. The first build
+signed with it still asks for permissions once, because the identity changed.
+After that they stay.
 
 ### Debug build (development)
 

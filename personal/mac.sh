@@ -8,6 +8,7 @@
 #   personal/mac.sh stop                 quit the dev build and reopen the installed app
 #   personal/mac.sh logs [-f] [lines]    tail the dev build's newest log
 #   personal/mac.sh status               Mac checkout, installed + dev instances, build queue
+#   personal/mac.sh install              swap the Mac's release build into /Applications and start it
 #
 # TCC: the dev build runs inside Terminal.app, so Screen Recording, Accessibility and
 # Microphone are granted to Terminal once and survive rebuilds (verified 2026-10-22);
@@ -18,6 +19,8 @@ set -euo pipefail
 
 MAC_HOST="${MAC_HOST:-mac}"
 MAC_REPO="${MAC_REPO:-Workspace/myScreenpipe}"
+# Self-signed code-signing certificate in the Mac's login keychain (PERSONAL.md).
+SIGN_IDENTITY="${SIGN_IDENTITY:-screenpipe personal}"
 DEV_BIN="apps/screenpipe-app-tauri/src-tauri/target/debug-dev/screenpipe-app"
 # Brackets keep pgrep/pkill from matching the `zsh -lc` that carries these patterns.
 DEV_PAT="target/debug-dev/[s]creenpipe-app"
@@ -114,6 +117,45 @@ case "$cmd" in
       logs=(~/.screenpipe-dev/screenpipe-app.*.log(N))
       [ \${#logs} -gt 0 ] || { echo 'no dev logs yet' >&2; exit 1; }
       tail -n $(printf '%q' "$lines") $follow \"\$(ls -t \$logs | head -1)\"
+    "
+    ;;
+  install)
+    # The Owner builds the release bundle on the Mac (`bun tauri build`); this only installs it.
+    # Quit from the menu keeps the app alive in the tray, and the running app only hands over
+    # to a copy with the same signing identity (manual_handoff/signing.rs), so: stop it by
+    # SIGTERM, swap the bundle, sign with the stable certificate if there is one, then open.
+    onmac "
+      setopt err_exit
+      new='apps/screenpipe-app-tauri/src-tauri/target/release/bundle/macos/screenpipe.app'
+      ent='apps/screenpipe-app-tauri/src-tauri/entitlements.plist'
+      [ -d \"\$new\" ] || { echo \"error: no release build at \$new; run bun tauri build first\" >&2; exit 1; }
+      # Same identity every build keeps the handoff working and TCC grants across rebuilds.
+      id='$SIGN_IDENTITY'
+      if ! security find-identity -v -p codesigning | grep -qF \"\\\"\$id\\\"\"; then
+        echo \"warning: no '\$id' code-signing certificate (see PERSONAL.md); signing ad hoc, so macOS will ask for permissions again\" >&2
+        id=-
+      fi
+      if pgrep -f '$PROD_PAT' >/dev/null; then
+        echo 'stopping screenpipe (recording pauses until the new build starts)'
+        pkill -TERM -f '$PROD_PAT'
+        for i in {1..30}; do pgrep -f '$PROD_PAT' >/dev/null || break; sleep 1; done
+        if pgrep -f '$PROD_PAT' >/dev/null; then echo 'error: screenpipe did not exit; nothing changed' >&2; exit 1; fi
+      fi
+      # Keep the previous copy outside /Applications until the new one is up.
+      prev=/tmp/screenpipe-previous.app
+      rm -rf \"\$prev\"
+      [ -d /Applications/screenpipe.app ] && mv /Applications/screenpipe.app \"\$prev\"
+      ditto \"\$new\" /Applications/screenpipe.app
+      codesign --force --deep --sign \"\$id\" --entitlements \"\$ent\" /Applications/screenpipe.app
+      codesign --verify --deep --strict /Applications/screenpipe.app
+      open /Applications/screenpipe.app
+      for i in {1..60}; do curl -s http://127.0.0.1:3030/health | grep -q '\"status\":\"healthy\"' && break; sleep 2; done
+      if ! curl -s http://127.0.0.1:3030/health | grep -q '\"status\":\"healthy\"'; then
+        echo \"error: new build not healthy after 2 minutes (macOS may be asking for permissions); previous copy kept at \$prev\" >&2
+        exit 1
+      fi
+      echo \"installed \$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' /Applications/screenpipe.app/Contents/Info.plist), signed with: \$id\"
+      rm -rf \"\$prev\"
     "
     ;;
   status)
