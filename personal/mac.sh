@@ -139,23 +139,48 @@ case "$cmd" in
         fi
         id=-
       fi
+      # Recording is the critical path: sign and verify a staged copy BEFORE stopping the app,
+      # so a signing failure never pauses capture.
+      staged=/tmp/screenpipe-staged.app
+      rm -rf \"\$staged\"
+      ditto \"\$new\" \"\$staged\"
+      if [ \"\$id\" = - ]; then
+        codesign --force --deep --sign - --entitlements \"\$PWD/\$ent\" \"\$staged\"
+      else
+        # An ssh session cannot use the login keychain's private key (errSecInternalComponent),
+        # so sign inside the desktop session. First use asks to let codesign use the key:
+        # Always Allow makes that one-time.
+        st=/tmp/screenpipe-sign.status; rm -f \"\$st\"
+        printf '%s\n' '#!/bin/zsh' \"codesign --force --deep --sign '\$id' --entitlements '\$PWD/\$ent' '\$staged'\" \"echo \\\$? > '\$st'\" 'exit' > /tmp/screenpipe-sign.command
+        chmod 700 /tmp/screenpipe-sign.command
+        open -a Terminal /tmp/screenpipe-sign.command
+        echo 'signing in the desktop session (allow codesign to use the key if macOS asks)...'
+        for i in {1..90}; do [ -s \"\$st\" ] && break; sleep 2; done
+        [ \"\$(cat \"\$st\" 2>/dev/null)\" = 0 ] || { echo 'error: signing with the certificate failed or timed out; nothing changed, screenpipe still running' >&2; exit 1; }
+      fi
+      codesign --verify --deep --strict \"\$staged\"
       if pgrep -f '$PROD_PAT' >/dev/null; then
         echo 'stopping screenpipe (recording pauses until the new build starts)'
         pkill -TERM -f '$PROD_PAT'
         for i in {1..30}; do pgrep -f '$PROD_PAT' >/dev/null || break; sleep 1; done
         if pgrep -f '$PROD_PAT' >/dev/null; then echo 'error: screenpipe did not exit; nothing changed' >&2; exit 1; fi
       fi
-      # Keep the previous copy outside /Applications until the new one is up.
+      # Keep the previous copy outside /Applications until the new one is up; on any failure,
+      # put it back and reopen it so the recorder does not stay down.
       prev=/tmp/screenpipe-previous.app
       rm -rf \"\$prev\"
       [ -d /Applications/screenpipe.app ] && mv /Applications/screenpipe.app \"\$prev\"
-      ditto \"\$new\" /Applications/screenpipe.app
-      codesign --force --deep --sign \"\$id\" --entitlements \"\$ent\" /Applications/screenpipe.app
-      codesign --verify --deep --strict /Applications/screenpipe.app
+      mv \"\$staged\" /Applications/screenpipe.app
       open /Applications/screenpipe.app
       for i in {1..60}; do curl -s http://127.0.0.1:3030/health | grep -q '\"status\":\"healthy\"' && break; sleep 2; done
       if ! curl -s http://127.0.0.1:3030/health | grep -q '\"status\":\"healthy\"'; then
-        echo \"error: new build not healthy after 2 minutes (macOS may be asking for permissions); previous copy kept at \$prev\" >&2
+        echo 'error: new build not healthy after 2 minutes (macOS may be asking for permissions)' >&2
+        if [ -d \"\$prev\" ] && ! pgrep -f '$PROD_PAT' >/dev/null; then
+          rm -rf /Applications/screenpipe.app && mv \"\$prev\" /Applications/screenpipe.app && open /Applications/screenpipe.app
+          echo 'restored and reopened the previous build' >&2
+        else
+          echo \"new build left running; previous copy kept at \$prev\" >&2
+        fi
         exit 1
       fi
       echo \"installed \$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' /Applications/screenpipe.app/Contents/Info.plist), signed with: \$id\"
