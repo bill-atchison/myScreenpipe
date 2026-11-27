@@ -220,13 +220,16 @@ pub struct CapturedWindow {
     pub window_height: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowFilters {
     ignore_patterns: Vec<WindowPattern>,
     include_patterns: Vec<WindowPattern>,
     legacy_ignored_urls: Vec<String>,
     title_block_patterns: Vec<String>,
     url_policy: screenpipe_a11y::url_filter::UrlPolicy,
+    streaming_mode: bool,
+    #[cfg(feature = "screenshot-benchmark")]
+    benchmark_cpu_masks: bool,
 }
 
 impl WindowFilters {
@@ -262,15 +265,56 @@ impl WindowFilters {
             legacy_ignored_urls,
             title_block_patterns,
             url_policy: screenpipe_a11y::url_filter::UrlPolicy::new(ignored_urls, included_urls),
+            streaming_mode: false,
+            #[cfg(feature = "screenshot-benchmark")]
+            benchmark_cpu_masks: false,
         }
     }
 
     /// Apps that are always excluded — system lock screen processes.
     const BUILTIN_IGNORED: &'static [&'static str] = &["loginwindow", "logonui"];
 
-    /// True when no user-configured filters exist — resolving exclusion ids
-    /// is then a no-op that needs no WindowServer call (mirrors the early
-    /// return in `get_excluded_sck_window_ids`).
+    /// Streaming mode relaxes geometry only for window exclusions. URL and
+    /// window allowlists keep the existing screenshot privacy path.
+    pub fn with_streaming_mode(mut self, enabled: bool) -> Self {
+        #[cfg(not(target_os = "macos"))]
+        let supported = cfg!(target_os = "windows");
+        #[cfg(target_os = "macos")]
+        let supported = cidre::api::macos_available("14.0");
+        self.streaming_mode = enabled
+            && supported
+            && self.include_patterns.is_empty()
+            && !self.url_policy.is_active();
+        self
+    }
+
+    pub fn streaming_mode(&self) -> bool {
+        self.streaming_mode
+    }
+
+    #[cfg(feature = "screenshot-benchmark")]
+    #[doc(hidden)]
+    pub fn with_benchmark_cpu_masks(mut self) -> Self {
+        self.benchmark_cpu_masks = true;
+        self
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub(crate) fn uses_streaming_gpu(&self) -> bool {
+        #[cfg(feature = "screenshot-benchmark")]
+        if self.benchmark_cpu_masks {
+            return false;
+        }
+        self.streaming_mode()
+    }
+
+    /// Explicit include/exclude patterns require isolated window pixels.
+    pub fn has_window_patterns(&self) -> bool {
+        !self.ignore_patterns.is_empty() || !self.include_patterns.is_empty()
+    }
+
+    /// True when no user-configured filters exist; exclusion resolution is
+    /// then a no-op unless an independent privacy source is enabled.
     pub fn is_empty(&self) -> bool {
         self.ignore_patterns.is_empty()
             && self.include_patterns.is_empty()
@@ -1285,6 +1329,24 @@ pub async fn capture_all_visible_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn streaming_mode_selects_gpu_masks() {
+        let filters = WindowFilters::new(&[], &[], &[]);
+        assert!(!filters.uses_streaming_gpu());
+
+        #[cfg(target_os = "macos")]
+        if !cidre::api::macos_available("14.0") {
+            return;
+        }
+
+        let streaming = filters.with_streaming_mode(true);
+        assert!(streaming.uses_streaming_gpu());
+
+        #[cfg(feature = "screenshot-benchmark")]
+        assert!(!streaming.with_benchmark_cpu_masks().uses_streaming_gpu());
+    }
 
     fn domain_rule(
         domain: &str,

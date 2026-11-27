@@ -174,8 +174,10 @@ export function StandaloneChat({
   chatShortcutsEnabled = true,
   sidebarCollapsed,
   firstRunLearningEnabled = false,
+  statusNotice,
 }: {
   className?: string;
+  statusNotice?: React.ReactNode;
   /**
    * Presents the post-setup summary owned by the persistent main layout.
    * Home opts in; the separate Chat window stays read-only for that state.
@@ -2409,6 +2411,8 @@ export function StandaloneChat({
         }
       />
 
+      {statusNotice}
+
       <div className="flex-1 flex min-h-0" data-browser-panel-host>
       <div ref={primaryPaneRef} className={cn("relative flex-1 basis-0 flex flex-col min-w-0", splitChatId && splitChatId !== conversationId && "min-w-[280px]")} data-firstrun-target="messages" data-chat-pane-id={conversationId}>
       {splitChatId && splitChatId !== conversationId ? (
@@ -2470,7 +2474,6 @@ export function StandaloneChat({
           onUpdateCustomTemplate: updateCustomTemplate,
           onDeleteCustomTemplate: deleteCustomTemplate,
           userName: settings.userName,
-          userGoalCategory: settings.userGoalCategory,
           templatePipes,
           existingPipes: pipes
             .filter((pipe) => pipe.config.config?.template !== true)

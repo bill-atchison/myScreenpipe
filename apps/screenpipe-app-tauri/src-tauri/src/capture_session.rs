@@ -5,8 +5,8 @@
 //! Short-lived capture session: vision, audio, UI recording, meetings.
 //!
 //! Can be started and stopped independently of [`ServerCore`].
-//! Borrows shared `Arc`s from `ServerCore` (DB, AudioManager, etc.)
-//! without taking ownership — the server stays alive across capture cycles.
+//! Native capture can run while `ServerCore` initializes SQLite. Search and
+//! other database-backed workers attach through the normal server session.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,13 +35,15 @@ use crate::server_core::ServerCore;
 
 /// Handle for a running capture session.
 ///
-/// Dropping this without calling [`CaptureSession::stop`] will leak tasks.
+/// Dropping this without calling [`CaptureSession::stop_with_reason`] will leak tasks.
 /// Always use `stop()` for clean shutdown.
 ///
 /// Holds its own `Arc<AudioManager>` so `stop()` is self-contained —
 /// callers don't need to reach into `ServerCore` to stop capture.
 pub struct CaptureSession {
     shutdown_tx: broadcast::Sender<()>,
+    runtime_lifetime: Option<tokio::sync::oneshot::Sender<()>>,
+    without_database: bool,
     disk_pressure_data_dir: PathBuf,
     vision_task: Option<tokio::task::JoinHandle<()>>,
     schedule_task: Option<tokio::task::JoinHandle<()>>,
@@ -66,14 +68,59 @@ impl CaptureSession {
     /// - Schedule monitor
     /// - Snapshot compaction
     pub async fn start(
+        _app: &tauri::AppHandle,
         server: &ServerCore,
         config: &RecordingConfig,
         close_orphaned_meetings_on_start: bool,
     ) -> Result<Self, String> {
-        info!("Starting capture session");
+        Self::start_inner(_app, Some(server), config, close_orphaned_meetings_on_start).await
+    }
+
+    pub(crate) async fn start_without_database(
+        app: &tauri::AppHandle,
+        config: &RecordingConfig,
+    ) -> Result<Self, String> {
+        let _native_startup = crate::update_restart::RESTART_SAFETY.native_startup().await;
+        Self::start_inner(app, None, config, false).await
+    }
+
+    pub(crate) fn runs_without_database(&self) -> bool {
+        self.without_database
+    }
+
+    pub(crate) fn hold_runtime_until_stopped(&mut self) -> tokio::sync::oneshot::Receiver<()> {
+        let (owner, finished) = tokio::sync::oneshot::channel();
+        self.runtime_lifetime = Some(owner);
+        finished
+    }
+
+    async fn start_inner(
+        _app: &tauri::AppHandle,
+        server: Option<&ServerCore>,
+        config: &RecordingConfig,
+        close_orphaned_meetings_on_start: bool,
+    ) -> Result<Self, String> {
+        info!(
+            database_ready = server.is_some(),
+            "Starting capture session"
+        );
 
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
-        reconfigure_audio_manager(server, config).await?;
+        let data_path =
+            server.map_or_else(|| config.data_dir.join("data"), |s| s.data_path.clone());
+        let audio_manager = if let Some(server) = server {
+            reconfigure_audio_manager(server, config).await?;
+            server.audio_manager.clone()
+        } else {
+            std::fs::create_dir_all(&data_path).map_err(|error| error.to_string())?;
+            Arc::new(
+                capture_audio_builder(config, data_path.clone())
+                    .await
+                    .build_with_optional_db(None)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+        };
 
         // A capture restart keeps this process alive. Disabling the schedule
         // must clear the previous session's pause before starting capture.
@@ -134,10 +181,13 @@ impl CaptureSession {
         }
 
         if !config.disable_vision && screen_recording_permitted {
-            let db_clone = server.db.clone();
-            let output_path = server.data_path.to_string_lossy().into_owned();
-            let vision_config =
-                config.to_vision_manager_config(output_path, server.vision_metrics.clone());
+            let db = server.map(|s| s.db.clone());
+            let output_path = data_path.to_string_lossy().into_owned();
+            let metrics = server.map_or_else(
+                || Arc::new(screenpipe_screen::PipelineMetrics::new()),
+                |s| s.vision_metrics.clone(),
+            );
+            let vision_config = config.to_vision_manager_config(output_path, metrics);
 
             // Only the timeline streaming endpoint reads the hot frame cache.
             // When the timeline is disabled, don't buffer captured frames into
@@ -145,29 +195,41 @@ impl CaptureSession {
             let hot_cache_for_capture = if config.disable_timeline {
                 None
             } else {
-                Some(server.hot_frame_cache.clone())
+                server.map(|s| s.hot_frame_cache.clone())
             };
-            let vision_manager = Arc::new(
-                VisionManager::new(vision_config, db_clone, tokio::runtime::Handle::current())
-                    .with_hot_frame_cache(hot_cache_for_capture)
+            #[cfg(feature = "enterprise-support")]
+            let recording_stream = config
+                .streaming_mode
+                .then(|| crate::enterprise_sync::recording_stream_endpoint(_app))
+                .flatten();
+            #[cfg(not(feature = "enterprise-support"))]
+            let recording_stream = None;
+            let mut vision_manager = VisionManager::new_with_optional_db(
+                vision_config,
+                db,
+                tokio::runtime::Handle::current(),
+            )
+            .with_recording_stream(recording_stream)
+            .with_hot_frame_cache(hot_cache_for_capture);
+            if let Some(server) = server {
+                vision_manager = vision_manager
                     .with_power_profile(server.power_manager.subscribe())
-                    .with_high_fps_controller(server.high_fps_controller.clone()),
-            );
-
-            // Wire the live manager into AppState so tray/popover `/vision/device/*`
-            // calls hit the instance that is actually capturing (mirrors how
-            // high_fps_controller is shared across HTTP and capture).
-            server
-                .vision_manager_handle
-                .store(Arc::new(Some(vision_manager.clone())));
-            vision_manager_handle = Some(server.vision_manager_handle.clone());
+                    .with_high_fps_controller(server.high_fps_controller.clone());
+            }
+            let vision_manager = Arc::new(vision_manager);
+            if let Some(server) = server {
+                server
+                    .vision_manager_handle
+                    .store(Arc::new(Some(vision_manager.clone())));
+                vision_manager_handle = Some(server.vision_manager_handle.clone());
+            }
 
             capture_trigger_tx = Some(vision_manager.trigger_sender());
             linker_tx = Some(vision_manager.linker_sender());
 
             let shutdown_rx = shutdown_tx.subscribe();
             let audio_manager_for_drm = if !config.disable_audio {
-                Some((*server.audio_manager).clone())
+                Some((*audio_manager).clone())
             } else {
                 None
             };
@@ -228,10 +290,14 @@ impl CaptureSession {
 
         // --- Audio recording ---
         if !config.disable_audio {
-            let audio_manager_clone = server.audio_manager.clone();
+            let audio_manager_clone = audio_manager.clone();
             let drm_pause = config.pause_on_drm_content;
+            let mut stop = shutdown_tx.subscribe();
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::select! {
+                    _ = stop.recv() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                }
                 if let Err(e) = audio_manager_clone.start().await {
                     error!("Failed to start audio manager: {}", e);
                 }
@@ -263,7 +329,7 @@ impl CaptureSession {
                 PermissionEvent::needed(PermissionKind::Accessibility),
             );
             None
-        } else {
+        } else if let Some(server) = server {
             let ui_config = config.to_ui_recorder_config();
             let db_clone = server.db.clone();
             match start_ui_recording(
@@ -288,58 +354,65 @@ impl CaptureSession {
                     None
                 }
             }
+        } else {
+            None
         };
 
-        // --- Meeting watcher ---
-        if let Some(meeting_detector) = server.audio_manager.meeting_detector().await {
-            let v2_in_meeting = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let _meeting_watcher = start_meeting_watcher(
-                server.db.clone(),
-                v2_in_meeting,
-                server.manual_meeting.clone(),
-                shutdown_tx.subscribe(),
-                Some(meeting_detector),
-                close_orphaned_meetings_on_start,
-                config.ignored_meeting_apps.clone(),
-            );
-            info!("meeting watcher started (v2 UI scanning)");
-        } else {
-            info!("meeting watcher skipped because meeting detection is disabled");
-        }
+        if let Some(server) = server {
+            // --- Meeting watcher ---
+            if let Some(meeting_detector) = server.audio_manager.meeting_detector().await {
+                let v2_in_meeting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let _meeting_watcher = start_meeting_watcher(
+                    server.db.clone(),
+                    v2_in_meeting,
+                    server.manual_meeting.clone(),
+                    shutdown_tx.subscribe(),
+                    Some(meeting_detector),
+                    close_orphaned_meetings_on_start,
+                    config.ignored_meeting_apps.clone(),
+                );
+                info!("meeting watcher started (v2 UI scanning)");
+            } else {
+                info!("meeting watcher skipped because meeting detection is disabled");
+            }
 
-        // --- Speaker identification ---
-        let _speaker_id_handle = screenpipe_engine::start_speaker_identification(
-            server.db.clone(),
-            config.user_name.clone(),
-        );
-
-        // --- Snapshot compaction ---
-        if config.disable_snapshot_compaction {
-            info!("snapshot compaction disabled by recording settings");
-        } else {
-            screenpipe_engine::start_snapshot_compaction(
+            // --- Speaker identification ---
+            let _speaker_id_handle = screenpipe_engine::start_speaker_identification(
                 server.db.clone(),
-                config.video_quality.clone(),
-                shutdown_tx.subscribe(),
-                server.power_manager.clone(),
-                Some(server.hot_frame_cache.clone()),
+                config.user_name.clone(),
             );
+
+            // --- Snapshot compaction ---
+            if config.disable_snapshot_compaction {
+                info!("snapshot compaction disabled by recording settings");
+            } else {
+                screenpipe_engine::start_snapshot_compaction(
+                    server.db.clone(),
+                    config.video_quality.clone(),
+                    shutdown_tx.subscribe(),
+                    server.power_manager.clone(),
+                    Some(server.hot_frame_cache.clone()),
+                );
+            }
         }
 
         screenpipe_engine::meeting_watcher::set_capture_stopped(false);
         info!("Capture session started successfully");
-        #[cfg(feature = "enterprise-build")]
-        crate::enterprise::recording_events::record(
+        #[cfg(feature = "enterprise-support")]
+        crate::enterprise::recording_events::record_reason(
             crate::enterprise::recording_events::State::Started,
+            "session_started",
         );
 
         Ok(Self {
             shutdown_tx,
-            disk_pressure_data_dir: server.data_path.clone(),
+            runtime_lifetime: None,
+            without_database: server.is_none(),
+            disk_pressure_data_dir: data_path,
             vision_task,
             schedule_task,
             ui_recorder_handle,
-            audio_manager: server.audio_manager.clone(),
+            audio_manager,
             audio_disabled: config.disable_audio,
             vision_manager_handle,
         })
@@ -362,14 +435,20 @@ impl CaptureSession {
     /// This is self-contained — no external references needed.
     /// Audio is stopped (not shutdown), keeping the `Arc<AudioManager>` valid
     /// for the next capture session or for HTTP API queries.
-    pub async fn stop(self) {
-        if let Err(error) = self.stop_checked().await {
+    pub async fn stop_with_reason(self, reason: &'static str) {
+        if let Err(error) = self.stop_checked_with_reason(reason).await {
             warn!("Capture shutdown incomplete: {error}");
         }
     }
 
     /// Quit-to-search must report failures before claiming capture is stopped.
-    pub async fn stop_checked(mut self) -> Result<(), String> {
+    pub async fn stop_checked_with_reason(mut self, reason: &'static str) -> Result<(), String> {
+        // Persist the trigger before teardown can fail, hang, or exit midway.
+        #[cfg(feature = "enterprise-support")]
+        crate::enterprise::recording_events::record_reason(
+            crate::enterprise::recording_events::State::Stopping,
+            reason,
+        );
         info!("Stopping capture session");
         screenpipe_engine::meeting_watcher::set_capture_stopped(true);
         let mut failures = Vec::new();
@@ -435,16 +514,19 @@ impl CaptureSession {
 
         info!("Capture session stopped");
         if failures.is_empty() {
-            #[cfg(feature = "enterprise-build")]
-            crate::enterprise::recording_events::record(
-                crate::enterprise::recording_events::State::Paused,
+            #[cfg(feature = "enterprise-support")]
+            crate::enterprise::recording_events::record_reason(
+                crate::enterprise::recording_events::State::Stopped,
+                reason,
             );
             Ok(())
         } else {
-            #[cfg(feature = "enterprise-build")]
-            crate::enterprise::recording_events::record(
-                crate::enterprise::recording_events::State::Unknown,
+            #[cfg(feature = "enterprise-support")]
+            crate::enterprise::recording_events::record_reason(
+                crate::enterprise::recording_events::State::Error,
+                "stop_failed",
             );
+            record_stop_failure(&self.disk_pressure_data_dir, reason, &failures);
             Err(failures.join("; "))
         }
     }
@@ -516,10 +598,10 @@ fn log_capture_transcription_config(config: &RecordingConfig, options: &AudioMan
     }
 }
 
-async fn reconfigure_audio_manager(
-    server: &ServerCore,
+async fn capture_audio_builder(
     config: &RecordingConfig,
-) -> Result<(), String> {
+    data_path: PathBuf,
+) -> screenpipe_audio::audio_manager::AudioManagerBuilder {
     let openai_compatible_config =
         if config.audio_transcription_engine == AudioTranscriptionEngine::OpenAICompatible {
             Some(OpenAICompatibleConfig {
@@ -548,7 +630,7 @@ async fn reconfigure_audio_manager(
     };
 
     let mut audio_manager_builder = config
-        .to_audio_manager_builder(server.data_path.clone(), audio_devices)
+        .to_audio_manager_builder(data_path, audio_devices)
         .transcription_mode(config.transcription_mode.clone())
         .openai_compatible_config(openai_compatible_config);
 
@@ -566,6 +648,14 @@ async fn reconfigure_audio_manager(
         audio_manager_builder = audio_manager_builder.meeting_detector(detector.clone());
     }
 
+    audio_manager_builder
+}
+
+async fn reconfigure_audio_manager(
+    server: &ServerCore,
+    config: &RecordingConfig,
+) -> Result<(), String> {
+    let mut audio_manager_builder = capture_audio_builder(config, server.data_path.clone()).await;
     let options = audio_manager_builder
         .build_options()
         .await
@@ -578,4 +668,16 @@ async fn reconfigure_audio_manager(
         .map_err(|e| format!("Failed to apply audio options: {}", e))?;
 
     Ok(())
+}
+
+/// Keep the original stop failure in the normal rotated/redacted support path.
+pub(crate) fn record_stop_failure(root: &std::path::Path, reason: &str, failures: &[String]) {
+    crate::recording::recovery_log::append(
+        root,
+        "capture_stop_failed",
+        &format!(
+            "trigger={reason}; cause={}; outcome=capture_shutdown_incomplete",
+            failures.join("; ")
+        ),
+    );
 }

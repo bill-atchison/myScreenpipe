@@ -5,38 +5,37 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Building2, CreditCard, Download, KeyRound, LogIn, RefreshCw } from "lucide-react";
+import { Building2, CreditCard, LogIn, RefreshCw } from "lucide-react";
 import posthog from "posthog-js";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
-import {
-  arch as getOsArch,
-  platform as getOsPlatform,
-} from "@tauri-apps/plugin-os";
 import { Button } from "@/components/ui/button";
 import {
   AppUser,
-  ENTERPRISE_BUILDS_URL,
-  ENTERPRISE_DOWNLOAD_URL,
+  getDeviceLimitStatus,
   getEnterpriseAccount,
   getLocalPlanPolicy,
+  getOrgSeatAvailable,
   getPaidPlanPolicyDeadlineMs,
   hasAppEntitlement,
-  hasConsumerAppSubscription,
   isDevBillingBypassEnabled,
   isDevLoginSkipEnabled,
   isDevLoginEnabled,
+  isDeviceLimitExceeded,
   isTokenHydrationCandidate,
   isTokenHydrationPending,
   needsAppEntitlementRefresh,
   normalizePlanLabel,
   PRICING_URL,
+  TEAM_SEAT_REQUEST_URL,
   TOKEN_HYDRATION_GRACE_MS,
 } from "@/lib/app-entitlement";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { useManagedPolicy } from "@/lib/hooks/use-managed-policy";
+import { invalidateEnterpriseBuildStatus } from "@/lib/hooks/use-is-enterprise-build";
 import { isPrimaryWindow } from "@/lib/utils/is-primary-window";
 import { commands } from "@/lib/utils/tauri";
-import { EnterpriseLicensePrompt } from "@/components/enterprise-license-prompt";
+import { SwitchToPersonalAccount } from "@/components/switch-to-personal-account";
+import { StartupLoader } from "@/components/startup-loader";
 import { useGT } from "gt-react";
 
 
@@ -55,31 +54,6 @@ export type StartupAuthenticationStatus =
 
 export const StartupAuthenticationContext =
   React.createContext<StartupAuthenticationStatus>("authenticated");
-
-function getDownloadPlatform(): string | null {
-  try {
-    const os = getOsPlatform();
-    if (os === "windows")
-      return getOsArch() === "aarch64" ? "windows-arm" : "windows";
-    if (os === "macos")
-      return getOsArch() === "aarch64" ? "macos-arm" : "macos-intel";
-    if (os === "linux") return "linux";
-  } catch {}
-  return null;
-}
-
-function getEnterpriseDownloadUrl() {
-  try {
-    const url = new URL(ENTERPRISE_DOWNLOAD_URL);
-    url.searchParams.set("token", "verified");
-    url.searchParams.set("channel", "enterprise");
-    const platform = getDownloadPlatform();
-    if (platform) url.searchParams.set("platform", platform);
-    return url.toString();
-  } catch {
-    return ENTERPRISE_BUILDS_URL;
-  }
-}
 
 function EntitlementShell({
   title,
@@ -129,15 +103,13 @@ export function AppEntitlementGate({
     authenticationError,
     isManagedAuthenticated,
     selectAuthenticationMethod,
-    submitLicenseKey,
-    policy: managedPolicy,
   } = useManagedPolicy();
-  // When the org policy requires account sign-in, the license key can't
-  // authenticate — don't offer it. Best-effort: known from the last fetched
-  // or cached policy, and always known right after a key was refused.
-  const licenseKeyAllowed = !managedPolicy?.requireAccountLogin;
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [seatRequestSubmitting, setSeatRequestSubmitting] = useState(false);
+  const [seatRequestSent, setSeatRequestSent] = useState(false);
+  const [seatRequestError, setSeatRequestError] = useState<string | null>(null);
+  const [isClaimingDevice, setIsClaimingDevice] = useState(false);
   const [devToken, setDevToken] = useState("");
   const [devSubmitting, setDevSubmitting] = useState(false);
   const [devError, setDevError] = useState<string | null>(null);
@@ -163,12 +135,19 @@ export function AppEntitlementGate({
   // them; computing it last could observe "expired" after they observed paid.
   const paidPolicyDeadlineMs = getPaidPlanPolicyDeadlineMs(user, Date.now());
   const isEntitled = hasAppEntitlement(user);
-  const hasConsumerSubscription = hasConsumerAppSubscription(user);
   const localPlanPolicy = getLocalPlanPolicy(user);
   const needsRefresh = needsAppEntitlementRefresh(user);
   const enterpriseAccount = getEnterpriseAccount(user);
+  const orgSeatAvailable = getOrgSeatAvailable(user);
+  const deviceLimitStatus = getDeviceLimitStatus(user);
+  const deviceLimitExceeded = isDeviceLimitExceeded(user);
   const isOnboardingRoute =
     typeof window !== "undefined" && window.location.pathname === "/onboarding";
+
+  useEffect(() => {
+    setSeatRequestSent(orgSeatAvailable?.request_status === "pending");
+    setSeatRequestError(null);
+  }, [orgSeatAvailable?.team_id, orgSeatAvailable?.license_id, orgSeatAvailable?.request_status]);
 
   // loadUser is re-created on every render (it is NOT memoized), so the
   // background re-verify poll below can't depend on its identity without
@@ -250,8 +229,13 @@ export function AppEntitlementGate({
   // read failure, getCloudToken() may return nothing while verified plan truth
   // remains in store.bin. Keep retrying locally, but gate unknown evidence
   // immediately so restarting the webview cannot reset an access grace period.
+  // A device key can authorize managed recording independently of the
+  // person using the desktop. Opening the desktop still requires a session.
+  const needsManagedAccountSession =
+    isManagedDeployment && isManagedAuthenticated && !user?.token;
   const shouldGateForEnterpriseLogin =
-    isManagedDeployment && authenticationState === "account";
+    isManagedDeployment &&
+    (authenticationState === "account" || needsManagedAccountSession);
   const shouldGateForConsumerLogin =
     !devBypass &&
     !devLoginSkip &&
@@ -269,22 +253,39 @@ export function AppEntitlementGate({
     !devLoginSkip &&
     !isManagedDeployment &&
     Boolean(user?.token) &&
-    enterpriseAccount?.requires_enterprise_app === true &&
-    (!hasConsumerSubscription ||
-      enterpriseAccount.restrict_consumer_build_access === true);
+    enterpriseAccount?.requires_enterprise_app === true;
+  const shouldGateForOrgSeat =
+    !devBypass &&
+    !devLoginSkip &&
+    !isManagedDeployment &&
+    Boolean(user?.token) &&
+    !shouldGateForEnterpriseApp &&
+    localPlanPolicy === "verified-free" &&
+    Boolean(orgSeatAvailable);
+  const shouldGateForDeviceLimit =
+    !devBypass &&
+    !devLoginSkip &&
+    !isManagedDeployment &&
+    Boolean(user?.token) &&
+    !shouldGateForEnterpriseApp &&
+    deviceLimitExceeded;
   const shouldGateForEntitlement = shouldGateForUnknownConsumerPolicy;
   // Onboarding owns ordinary consumer sign-in and Enterprise-build auth.
   // Once build detection confirms this is the consumer app, however, a
-  // restricted enterprise member must not advance into consumer setup.
+  // restricted enterprise member or a shadow-seat corporate signup must not
+  // advance into standalone consumer setup.
   const shouldGate = authenticationStatus === "not_required"
     ? false
     : isOnboardingRoute
-    ? isManagedDeploymentResolved && shouldGateForEnterpriseApp
+    ? isManagedDeploymentResolved &&
+      (shouldGateForEnterpriseApp || shouldGateForOrgSeat)
     : !isManagedDeploymentResolved
       ? true
       : isManagedDeployment
-        ? !isManagedAuthenticated
+        ? !isManagedAuthenticated || needsManagedAccountSession
         : shouldGateForEnterpriseApp ||
+          shouldGateForOrgSeat ||
+          shouldGateForDeviceLimit ||
           shouldGateForConsumerLogin ||
           shouldGateForUnknownConsumerPolicy;
   const enterpriseAuthenticationPending =
@@ -340,9 +341,13 @@ export function AppEntitlementGate({
         ? "enterprise_login_required"
         : shouldGateForEnterpriseApp
           ? "enterprise_app_required"
-          : shouldGateForConsumerLogin
-            ? "consumer_login_required"
-            : "plan_verification_required",
+          : shouldGateForOrgSeat
+            ? "org_seat_available"
+            : shouldGateForDeviceLimit
+              ? "device_limit_exceeded"
+              : shouldGateForConsumerLogin
+                ? "consumer_login_required"
+                : "plan_verification_required",
       plan: user?.subscription_plan ?? null,
       app_entitled: user?.app_entitled ?? null,
       // Diagnostics for the enterprise post-update loop (SCR-132).
@@ -352,7 +357,11 @@ export function AppEntitlementGate({
         ? "enterprise_login"
         : shouldGateForEnterpriseApp
           ? "enterprise_app"
-          : "entitlement",
+          : shouldGateForOrgSeat
+            ? "org_seat"
+            : shouldGateForDeviceLimit
+              ? "device_limit"
+              : "entitlement",
     });
   }, [
     isSettingsLoaded,
@@ -361,6 +370,8 @@ export function AppEntitlementGate({
     shouldGateForConsumerLogin,
     shouldGateForUnknownConsumerPolicy,
     shouldGateForEnterpriseApp,
+    shouldGateForOrgSeat,
+    shouldGateForDeviceLimit,
     isManagedDeployment,
     authenticationStatus,
     enterpriseAuthenticationPending,
@@ -472,6 +483,25 @@ export function AppEntitlementGate({
     }
   }, [loadUser, user?.token]);
 
+  const claimThisDevice = useCallback(async () => {
+    const token = user?.token;
+    if (!token) return;
+    setIsClaimingDevice(true);
+    setRefreshError(null);
+    try {
+      await loadUser(token, false, { claimDevice: true });
+      posthog.capture("app_entitlement_device_claimed", {
+        plan: user?.subscription_plan ?? null,
+        limit: deviceLimitStatus?.limit ?? null,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "could not activate this device";
+      setRefreshError(message);
+    } finally {
+      setIsClaimingDevice(false);
+    }
+  }, [deviceLimitStatus?.limit, loadUser, user?.subscription_plan, user?.token]);
+
   const useDifferentAccount = useCallback(async () => {
     await updateSettings({ user: null as any });
     try {
@@ -487,13 +517,37 @@ export function AppEntitlementGate({
     commands.openLoginWindow(true, null);
   }, [updateSettings]);
 
-  const downloadEnterpriseApp = useCallback(() => {
-    const url = getEnterpriseDownloadUrl();
-    posthog.capture("app_entitlement_enterprise_download_clicked", {
-      org_name: enterpriseAccount?.org_name ?? null,
-    });
-    openUrl(url).catch(() => window.open(url, "_blank"));
-  }, [enterpriseAccount?.org_name]);
+  const requestOrgSeat = useCallback(async () => {
+    const token = user?.token;
+    if (!token) return;
+    setSeatRequestSubmitting(true);
+    setSeatRequestError(null);
+    try {
+      const response = await fetch(TEAM_SEAT_REQUEST_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.error || `request failed (${response.status})`);
+      }
+      setSeatRequestSent(true);
+      posthog.capture("app_entitlement_org_seat_requested", {
+        org_name: orgSeatAvailable?.org_name ?? null,
+        domain: orgSeatAvailable?.domain ?? null,
+      });
+      await loadUser(token, false).catch(() => {});
+    } catch (err) {
+      setSeatRequestError(
+        err instanceof Error ? err.message : "could not send seat request",
+      );
+    } finally {
+      setSeatRequestSubmitting(false);
+    }
+  }, [loadUser, orgSeatAvailable?.domain, orgSeatAvailable?.org_name, user?.token]);
 
   // Dev/preview only: deep links do not reach the `bun tauri dev` binary on
   // macOS, so paste the login token (or the whole screenpipe://...api_key=...
@@ -691,12 +745,10 @@ export function AppEntitlementGate({
 
   if (!isSettingsLoaded) {
     return (
-      <EntitlementShell
-        title={ui("Loading")}
-        description={ui("Checking local settings before starting screenpipe.")}
-      >
-        <div className="h-10 w-full animate-pulse bg-muted" />
-      </EntitlementShell>
+      <StartupLoader
+        label={ui("Starting Screenpipe…")}
+        vision={ui("Turn what people know into what computers can scale")}
+      />
     );
   }
 
@@ -726,31 +778,27 @@ export function AppEntitlementGate({
       );
     }
     return (
-      <EntitlementShell
-        title={ui("Checking access")}
-        description={ui("Checking which screenpipe build is installed on this device.")}
-      >
-        <div className="h-10 w-full animate-pulse bg-muted" />
-      </EntitlementShell>
+      <StartupLoader
+        label={ui("Starting Screenpipe…")}
+        vision={ui("Turn what people know into what computers can scale")}
+      />
     );
   }
 
   if (isManagedDeployment && authenticationState === "checking") {
     return (
-      <EntitlementShell
-        title={ui("Checking enterprise access")}
-        description={ui("Checking this device for an existing account or enterprise key.")}
-      >
-        <div className="h-10 w-full animate-pulse bg-muted" />
-      </EntitlementShell>
+      <StartupLoader
+        label={ui("Starting Screenpipe…")}
+        vision={ui("Turn what people know into what computers can scale")}
+      />
     );
   }
 
-  if (isManagedDeployment && authenticationState === "choice") {
+  if (isManagedDeployment && (authenticationState === "choice" || authenticationState === "license_key")) {
     return (
       <EntitlementShell
         title={ui("Enterprise access")}
-        description={ui("Use your organization account or the enterprise key provided by your administrator.")}
+        description={ui("Sign in with your workspace account.")}
       >
         <div className="flex flex-col gap-3">
           <Button
@@ -761,38 +809,11 @@ export function AppEntitlementGate({
             className="w-full gap-2"
           >
             <LogIn className="h-4 w-4" />
-            Sign in with enterprise account
+            Sign in
           </Button>
-          {licenseKeyAllowed && (
-            <Button
-              onClick={() => selectAuthenticationMethod("license_key")}
-              variant="outline"
-              className="w-full gap-2"
-            >
-              <KeyRound className="h-4 w-4" />
-              Use enterprise key
-            </Button>
-          )}
+          <SwitchToPersonalAccount />
         </div>
         {devLoginBlock}
-      </EntitlementShell>
-    );
-  }
-
-  if (isManagedDeployment && authenticationState === "license_key") {
-    return (
-      <EntitlementShell
-        title={ui("Enterprise key")}
-        description={authenticationError || ui("Enter the key provided by your administrator.")}
-      >
-        <EnterpriseLicensePrompt
-          embedded
-          onSubmit={submitLicenseKey}
-          onSignIn={() => {
-            selectAuthenticationMethod("account");
-            openLogin();
-          }}
-        />
       </EntitlementShell>
     );
   }
@@ -815,16 +836,7 @@ export function AppEntitlementGate({
             <LogIn className="h-4 w-4" />
             {signedIn ? ui("Use different account") : ui("Sign in")}
           </Button>
-          {licenseKeyAllowed && (
-            <Button
-              onClick={() => selectAuthenticationMethod("license_key")}
-              variant="outline"
-              className="w-full gap-2"
-            >
-              <KeyRound className="h-4 w-4" />
-              Use enterprise key
-            </Button>
-          )}
+          <SwitchToPersonalAccount />
         </div>
         {devLoginBlock}
       </EntitlementShell>
@@ -834,26 +846,26 @@ export function AppEntitlementGate({
   if (shouldGateForEnterpriseApp) {
     return (
       <EntitlementShell
-        title={ui("Enterprise app required")}
-        description={ui("{value1} belongs to {value2}. download the screenpipe enterprise app so this device follows workspace policy and uploads to your org storage.", { value1: email, value2: enterpriseOrgName })}
+        title={ui("Workspace access required")}
+        description={ui("{value1} belongs to {value2}. Screenpipe is verifying your workspace’s recording and upload policies.", { value1: email, value2: enterpriseOrgName })}
       >
         <div className="flex flex-col gap-3">
-          <Button onClick={downloadEnterpriseApp} className="w-full gap-2">
-            <Download className="h-4 w-4" />
-            Download enterprise app
-          </Button>
           <Button
-            onClick={() =>
-              openUrl(ENTERPRISE_BUILDS_URL).catch(() =>
-                window.open(ENTERPRISE_BUILDS_URL, "_blank"),
-              )
-            }
-            variant="outline"
+            onClick={() => {
+              invalidateEnterpriseBuildStatus();
+              void refreshUser();
+            }}
+            disabled={isRefreshing}
             className="w-full gap-2"
           >
-            <Building2 className="h-4 w-4" />
-            Open enterprise builds
+            <RefreshCw className="h-4 w-4" />
+            {ui("Refresh workspace access")}
           </Button>
+          {refreshError && (
+            <p role="alert" className="text-xs text-destructive">
+              {refreshError}
+            </p>
+          )}
           <Button
             onClick={useDifferentAccount}
             variant="ghost"
@@ -861,6 +873,112 @@ export function AppEntitlementGate({
           >
             Use different account
           </Button>
+        </div>
+        {devLoginBlock}
+      </EntitlementShell>
+    );
+  }
+
+  if (shouldGateForOrgSeat && orgSeatAvailable) {
+    const targetOrgName =
+      orgSeatAvailable.org_name || orgSeatAvailable.domain || "your organization";
+    return (
+      <EntitlementShell
+        title={
+          seatRequestSent
+            ? ui("Seat request sent")
+            : ui("Your team is already on Screenpipe")
+        }
+        description={
+          seatRequestSent
+            ? ui(
+                "We notified your {value1} admin about {value2}. Once they invite you, click Refresh access to unlock Screenpipe.",
+                { value1: targetOrgName, value2: email },
+              )
+            : ui(
+                "{value1} belongs to {value2}. Request a seat from your admin instead of starting a standalone free account.",
+                { value1: email, value2: targetOrgName },
+              )
+        }
+      >
+        <div className="flex flex-col gap-3">
+          {!seatRequestSent && (
+            <Button
+              onClick={() => void requestOrgSeat()}
+              disabled={seatRequestSubmitting}
+              className="w-full gap-2"
+            >
+              <Building2 className="h-4 w-4" />
+              {seatRequestSubmitting
+                ? ui("Sending request…")
+                : ui("Request a seat from your admin")}
+            </Button>
+          )}
+          <Button
+            onClick={() => void refreshUser()}
+            variant={seatRequestSent ? "default" : "outline"}
+            disabled={isRefreshing}
+            className="w-full gap-2"
+          >
+            <RefreshCw className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`} />
+            {isRefreshing ? ui("Checking…") : ui("Refresh access")}
+          </Button>
+          <Button
+            onClick={useDifferentAccount}
+            variant="ghost"
+            className="w-full"
+          >
+            {ui("Use different account")}
+          </Button>
+          {(seatRequestError || refreshError) && (
+            <p className="font-mono text-[11px] leading-5 text-destructive">
+              {seatRequestError || refreshError}
+            </p>
+          )}
+        </div>
+        {devLoginBlock}
+      </EntitlementShell>
+    );
+  }
+
+  if (shouldGateForDeviceLimit) {
+    const deviceLimit = deviceLimitStatus?.limit ?? 1;
+    const deviceNoun = deviceLimit === 1 ? "active device" : "active devices";
+    return (
+      <EntitlementShell
+        title={ui("Device limit reached")}
+        description={ui(
+          "Your {value1} plan includes {value2} {value3}. Screenpipe is active on another device, so capture is paused here.",
+          { value1: planLabel, value2: String(deviceLimit), value3: deviceNoun },
+        )}
+      >
+        <div className="flex flex-col gap-3">
+          <Button onClick={openPricing} className="w-full gap-2">
+            <CreditCard className="h-4 w-4" />
+            {ui("Upgrade plan")}
+          </Button>
+          <Button
+            onClick={() => void claimThisDevice()}
+            variant="outline"
+            disabled={isClaimingDevice || isRefreshing}
+            className="w-full gap-2"
+          >
+            <RefreshCw className={`h-4 w-4 ${isClaimingDevice ? "animate-spin" : ""}`} />
+            {isClaimingDevice ? ui("Switching device…") : ui("Use this device instead")}
+          </Button>
+          <Button
+            onClick={() => void refreshUser()}
+            variant="ghost"
+            disabled={isRefreshing || isClaimingDevice}
+            className="w-full"
+          >
+            {isRefreshing ? ui("Checking…") : ui("Refresh status")}
+          </Button>
+          {refreshError && (
+            <p className="font-mono text-[11px] leading-5 text-destructive">
+              {refreshError}
+            </p>
+          )}
         </div>
         {devLoginBlock}
       </EntitlementShell>
@@ -877,6 +995,9 @@ export function AppEntitlementGate({
           <Button onClick={openLogin} className="w-full gap-2">
             <LogIn className="h-4 w-4" />
             Sign in
+          </Button>
+          <Button variant="outline" onClick={() => commands.openLoginWindow(true, null)}>
+            {ui("Use a different account")}
           </Button>
         </div>
         {devLoginBlock}

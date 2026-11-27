@@ -25,29 +25,40 @@ try {
   async function authenticate(path = '/home') {
     await page.goto(base + path, { waitUntil: 'domcontentloaded', timeout: 120_000 });
     await page.getByRole('button', { name: 'Use enterprise key', exact: true }).click();
-    assert.equal(await page.getByRole('button', { name: 'Switch workspace', exact: true }).count(), 0,
+    assert.equal(await page.getByRole('group', { name: 'Switch workspace', exact: true }).count(), 0,
       'Unauthenticated enterprise devices must remain behind the workspace gate');
     await page.getByPlaceholder('ENT-XXXX-XXXX-XXXX-XXXX').fill('ENT-TEST-TEST-TEST-TEST');
     await page.getByRole('button', { name: 'Activate', exact: true }).click();
+    await page.getByRole('heading', { name: 'Sign in required', exact: true }).waitFor();
+    assert.equal(await page.getByRole('group', { name: 'Switch workspace', exact: true }).count(), 0,
+      'Device key authorization must leave the desktop locked until the user signs in');
+    await page.evaluate(() => {
+      localStorage.setItem('screenpipe_e2e_account_fixture_active', '1');
+      localStorage.setItem('screenpipe_e2e_account_user', JSON.stringify({
+        id: 'example-user',
+        email: 'recorder@example.test',
+        token: 'e2e-fake-token-workflow-entry',
+        __e2eSkipAccountRefresh: true,
+      }));
+      window.dispatchEvent(new Event('screenpipe-e2e-seed-account-user'));
+    });
     await page.getByRole('button', { name: 'Do later', exact: true }).click({ timeout: 5000 }).catch(() => {});
   }
   const capture = name => page.screenshot({ path: `${out}/${name}.png`, animations: 'disabled', style: 'nextjs-portal { display: none; }' });
   await authenticate();
-  await page.getByRole('button', { name: 'Switch workspace', exact: true }).waitFor();
+  await page.getByRole('group', { name: 'Switch workspace', exact: true }).waitFor();
   await capture('enterprise-home-after');
-  await page.getByRole('button', { name: 'Switch workspace', exact: true }).click();
-  await page.getByRole('menuitemradio', { name: /^Workflows/ }).click();
+  await page.getByRole('group', {name: 'Switch workspace', exact: true}).getByRole('button', {name: 'Workflows', exact: true}).click();
   await page.getByRole('button', { name: 'Keep local processing', exact: true }).click();
   await page.getByRole('dialog', { name: 'Turn off local workflow processing?' }).waitFor({ state: 'hidden' });
   assert.equal(await page.getByRole('combobox', { name: 'Workflow source' }).inputValue(), 'cloud',
     'Enterprise entry must default to the cloud catalog without a query-string source override');
-  await page.getByRole('heading', { name: 'Your workflows', exact: true }).waitFor();
+  await page.getByRole('heading', { name: 'Workflows', exact: true }).waitFor();
   await capture('enterprise-cloud-after');
-  await page.locator('article').filter({ has: page.getByRole('heading', { name: 'Research synthesis', exact: true }) }).getByRole('button', { name: 'Open map' }).click();
+  await page.locator('article').filter({ has: page.getByRole('heading', { name: 'Research synthesis', exact: true }) }).getByRole('button').click();
   await page.getByRole('heading', { name: 'Collect sources', exact: true }).waitFor();
-  await page.getByRole('button', { name: 'Switch workspace', exact: true }).click();
-  await page.getByRole('menuitemradio', { name: /^Memory/ }).click();
-  await page.getByRole('button', { name: 'Switch workspace', exact: true }).waitFor();
+  await page.getByRole('group', {name: 'Switch workspace', exact: true}).getByRole('button', {name: 'Memory', exact: true}).click();
+  await page.getByRole('group', { name: 'Switch workspace', exact: true }).waitFor();
   assert.equal(await page.getByRole('heading', { name: 'Collect sources', exact: true }).isVisible(), false);
   await authenticate('/home?mode=workflows&cloudWorkflowState=error');
   await page.getByRole('button', { name: 'Keep local processing', exact: true }).click();

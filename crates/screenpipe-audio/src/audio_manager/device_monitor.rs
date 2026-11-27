@@ -34,7 +34,7 @@ fn is_legacy_display_output(device_name: &str) -> bool {
 ///
 /// `DeviceManager::is_running` flips true when the record pipeline attaches — before
 /// the first audio frame — so we also require a live stream handle. Streams that
-/// failed to open never get inserted; streams that died (timeout, zero-fill hijack)
+/// failed to open never get inserted; streams that died (timeout, backend failure)
 /// set `is_disconnected` and are treated as not running so recovery can retry.
 ///
 /// `pub(crate)` so the piggyback sweep can observe stream liveness through the
@@ -1608,22 +1608,23 @@ pub async fn start_device_monitor(
                 // This handles cases where audio stream was hijacked by another app
                 let stale_devices = audio_manager.check_stale_recording_handles().await;
                 let user_disabled_for_stale = audio_manager.user_disabled_devices().await;
-                for device_name in stale_devices {
+                for stale in stale_devices {
+                    let device_name = &stale.device_name;
                     // Don't restart user-disabled devices — they're supposed to be stopped
-                    if user_disabled_for_stale.contains(&device_name) {
+                    if user_disabled_for_stale.contains(device_name) {
                         debug!(
                             "[DEVICE_RECOVERY] stale handle for user-disabled device {}, cleaning up only",
                             device_name
                         );
-                        let _ = audio_manager.cleanup_stale_device(&device_name).await;
+                        let _ = audio_manager.cleanup_stale_device(&stale).await;
                         continue;
                     }
                     warn!(
                         "[DEVICE_RECOVERY] detected stale recording handle for {}, cleaning up for restart",
                         device_name
                     );
-                    let _ = audio_manager.cleanup_stale_device(&device_name).await;
-                    disconnected_devices.insert(device_name);
+                    let _ = audio_manager.cleanup_stale_device(&stale).await;
+                    disconnected_devices.insert(device_name.clone());
                 }
 
                 // Check central handler health (audio-receiver + transcription-receiver)

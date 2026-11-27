@@ -339,18 +339,15 @@ fn is_encrypted_bytes(data: &[u8]) -> bool {
     data.len() >= 8 && &data[..8] == STORE_MAGIC
 }
 
-/// Did this store JSON parse and contain a non-empty `settings.aiPresets`?
-/// Used as the "is this a real user state" signal — empty presets means the
-/// migration in use-settings.tsx will seed defaults, which is the wipe trigger.
+/// Non-empty presets prove personal settings are healthy. A native managed
+/// policy may deliberately permit none; restoring a prior snapshot in that case
+/// would undo the organization's restriction and overwrite newer settings.
 fn store_json_has_presets(data: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(data)
-        .ok()
-        .and_then(|v| {
-            v.pointer("/settings/aiPresets")
-                .and_then(|p| p.as_array())
-                .map(|a| !a.is_empty())
+    serde_json::from_slice::<Value>(data).ok().is_some_and(|value| {
+        value.pointer("/settings/aiPresets").and_then(Value::as_array).is_some_and(|presets| {
+            !presets.is_empty() || value.pointer("/settings/enterpriseAiPresetPolicy/version") == Some(&json!(2))
         })
-        .unwrap_or(false)
+    })
 }
 
 /// Atomically and *durably* write `bytes` to `path`.
@@ -978,6 +975,39 @@ pub fn persist_store_before_restart(app: &AppHandle) -> Result<(), String> {
 /// Tauri resource table drops the underlying store (e.g. after an in-place
 /// update restart on Windows where resource IDs become stale).
 static STORE_CACHE: Mutex<Option<Arc<tauri_plugin_store::Store<tauri::Wry>>>> = Mutex::new(None);
+
+/// Operational evidence for an explicit support request. Never builds a store,
+/// reads credentials, exports arbitrary settings, or substitutes defaults when
+/// the native settings are unavailable.
+pub(crate) fn support_recording_settings() -> Value {
+    let cached = STORE_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let Some(settings) = cached.and_then(|store| store.get("settings")) else {
+        return serde_json::json!({"source": "unavailable", "cleanup_outcome": "unknown"});
+    };
+    let enabled = settings
+        .get("localRetentionEnabled")
+        .and_then(Value::as_bool);
+    let days = settings.get("localRetentionDays").and_then(Value::as_u64);
+    let mode = settings
+        .get("localRetentionMode")
+        .and_then(Value::as_str)
+        .filter(|mode| matches!(*mode, "media" | "lean" | "all"));
+    let quality = settings
+        .get("videoQuality")
+        .and_then(Value::as_str)
+        .filter(|quality| matches!(*quality, "low" | "balanced" | "high" | "max"));
+    serde_json::json!({
+        "source": "cached_native_settings",
+        "local_retention_enabled": enabled,
+        "local_retention_days": days,
+        "local_retention_mode": mode,
+        "video_quality": quality,
+        "cleanup_outcome": "not established by saved settings"
+    })
+}
 
 /// Build (or rebuild) the store, retrying on TOCTOU races and stale resource IDs.
 fn build_store(app: &AppHandle) -> anyhow::Result<Arc<tauri_plugin_store::Store<tauri::Wry>>> {
@@ -1985,6 +2015,18 @@ impl Default for EmbeddedLLM {
     }
 }
 
+fn apply_legacy_recording_defaults(fields: &mut serde_json::Map<String, Value>) {
+    for (key, default) in [
+        ("disableClipboardCapture", Value::Bool(false)),
+        ("disableKeyboardCapture", Value::Bool(false)),
+        ("asyncPiiRedaction", Value::Bool(true)),
+        ("asyncImagePiiRedaction", Value::Bool(true)),
+        ("piiBackend", Value::String("tinfoil".into())),
+    ] {
+        fields.entry(key).or_insert(default);
+    }
+}
+
 impl Default for SettingsStore {
     fn default() -> Self {
         // Default ignored windows for all OS
@@ -2112,18 +2154,26 @@ Rules:
             ),
         ]);
 
+        // App-specific defaults override RecordingSettings::default() where needed.
+        let mut recording = screenpipe_config::RecordingSettings {
+            enable_semantic_context: true,
+            audio_transcription_engine: "whisper-large-v3-turbo-quantized".to_string(),
+            monitor_ids: vec!["default".to_string()],
+            audio_devices: vec!["default".to_string()],
+            use_pii_removal: true,
+            analytics_id: uuid::Uuid::new_v4().to_string(),
+            ignored_windows,
+            ..screenpipe_config::RecordingSettings::default()
+        };
+        if crate::app_mode::is_enterprise_package() {
+            recording.disable_clipboard_capture = false;
+            recording.disable_keyboard_capture = false;
+            recording.async_pii_redaction = true;
+            recording.async_image_pii_redaction = true;
+            recording.pii_backend = "tinfoil".into();
+        }
         Self {
-            // App-specific defaults override RecordingSettings::default() where needed
-            recording: screenpipe_config::RecordingSettings {
-                enable_semantic_context: true,
-                audio_transcription_engine: "whisper-large-v3-turbo-quantized".to_string(),
-                monitor_ids: vec!["default".to_string()],
-                audio_devices: vec!["default".to_string()],
-                use_pii_removal: true,
-                analytics_id: uuid::Uuid::new_v4().to_string(),
-                ignored_windows,
-                ..screenpipe_config::RecordingSettings::default()
-            },
+            recording,
             ai_presets: vec![default_free_preset],
             is_loading: false,
             ui_locale: "system".to_string(),
@@ -2350,12 +2400,17 @@ impl SettingsStore {
             true => Ok(None),
             false => {
                 let raw = store.get("settings").unwrap_or(Value::Null);
-                let sanitized = Self::sanitize_legacy_fields(raw.clone());
+                let mut sanitized = Self::sanitize_legacy_fields(raw.clone());
                 // Persist sanitized fields back to store so the migration only warns once
                 if sanitized != raw {
                     store.set("settings", sanitized.clone());
                     let _ = save_store_to_disk(store.as_ref());
                     reencrypt_store_file(app);
+                }
+                if crate::app_mode::is_enterprise_package() {
+                    if let Some(fields) = sanitized.as_object_mut() {
+                        apply_legacy_recording_defaults(fields);
+                    }
                 }
                 let settings = serde_json::from_value(sanitized);
                 match settings {
@@ -2394,8 +2449,10 @@ impl SettingsStore {
         settings.enable_semantic_context = true;
         // Automatic meeting capture also applies before the frontend mounts,
         // including old stores with the former opt-in saved as false.
-        settings.experimental_meeting_piggyback =
-            screenpipe_config::default_experimental_meeting_piggyback();
+        settings.experimental_meeting_piggyback = self.extra.get("enterpriseManagedSettings")
+            .and_then(|managed| managed.get("experimentalMeetingPiggyback"))
+            .and_then(Value::as_bool)
+            .unwrap_or_else(screenpipe_config::default_experimental_meeting_piggyback);
         // Override user_id with the Clerk JWT token from the auth user object.
         // This token is used as the Bearer credential for screenpipe cloud
         // (transcription proxy, Pi agent, etc.), not as a database ID.
@@ -2468,6 +2525,10 @@ impl SettingsStore {
             data_dir,
             Some(&resolved_engine),
         );
+        config.streaming_mode = self.extra.get("enterpriseManagedSettings")
+            .and_then(|managed| managed.get("streamingMode"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         // Resolve the API auth key from the seeded cache. The cache is populated
         // asynchronously by `recording::spawn_screenpipe` via the shared helper
         // (`screenpipe_engine::auth_key::resolve_api_auth_key`) — which is the
@@ -2636,43 +2697,14 @@ impl SettingsStore {
         self.has_verified_paid_plan()
     }
 
-    /// Consumer binaries must not record behind an org's mandatory-enterprise-
-    /// app screen. A separate consumer subscription remains a valid opt-out,
-    /// matching the frontend account-routing policy.
+    /// Workspace membership selects managed mode independently of personal billing.
     pub(crate) fn requires_enterprise_app_for_consumer(&self) -> bool {
-        let requires_enterprise_app = self
-            .user
+        self.user
             .enterprise_account
             .as_ref()
             .and_then(|account| account.get("requires_enterprise_app"))
             .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        if !requires_enterprise_app {
-            return false;
-        }
-        if self.user.enterprise_account.as_ref()
-            .and_then(|account| account.get("restrict_consumer_build_access"))
-            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
-        {
-            return true;
-        }
-
-        let has_consumer_entitlement = self
-            .user
-            .entitlement
-            .as_ref()
-            .and_then(|entitlement| entitlement.get("source"))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|source| {
-                matches!(
-                    source.to_ascii_lowercase().as_str(),
-                    "subscription" | "manual" | "lifetime"
-                )
-            })
-            && self.has_current_app_entitlement();
-
-        !has_consumer_entitlement
     }
 
     pub fn audio_engine_resolution(&self) -> AudioEngineResolution {
@@ -2722,6 +2754,17 @@ impl SettingsStore {
         };
 
         store.set("settings", json!(self));
+        save_store_with_permission_repair(app, store.as_ref())?;
+        reencrypt_store_file(app);
+        Ok(())
+    }
+
+    pub(crate) fn clear_workspace_session(app: &AppHandle) -> Result<(), String> {
+        let store = get_store(app, None).map_err(|e| e.to_string())?;
+        let mut settings = store.get("settings").ok_or("settings unavailable")?;
+        settings["user"] = serde_json::json!({});
+        settings["dataSyncEnabled"] = serde_json::json!(false);
+        store.set("settings", settings);
         save_store_with_permission_repair(app, store.as_ref())?;
         reencrypt_store_file(app);
         Ok(())
@@ -2804,9 +2847,9 @@ fn migrate_timeline_visibility_to_sidebar(
         .as_object_mut()
         .unwrap()
         .entry("hidden".to_string())
-        .or_insert_with(|| serde_json::json!(["brain"]));
+        .or_insert_with(|| serde_json::json!([]));
     if !hidden.is_array() {
-        *hidden = serde_json::json!(["brain"]);
+        *hidden = serde_json::json!([]);
     }
     let hidden = hidden.as_array_mut().unwrap();
     if !hidden.iter().any(|id| id.as_str() == Some("timeline")) {
@@ -2856,7 +2899,7 @@ fn migrate_remote_logs_default_enabled(settings: &mut SettingsStore) -> bool {
 }
 
 fn backfill_default_ai_preset(settings: &mut SettingsStore) -> bool {
-    if !settings.ai_presets.is_empty() {
+    if !settings.ai_presets.is_empty() || settings.extra.get("enterpriseAiPresetPolicy").is_some_and(|policy| policy["version"] == 2) {
         return false;
     }
     settings.ai_presets = SettingsStore::default().ai_presets;
@@ -2879,7 +2922,8 @@ pub fn init_store(app: &AppHandle) -> Result<SettingsStore, String> {
         .map(|obj| !obj.contains_key("restartNotificationsDefaultedOff"))
         .unwrap_or(false);
     let should_persist_ai_preset_backfill = raw_obj.as_ref().is_some_and(|obj| {
-        obj.get("aiPresets")
+        !obj.get("enterpriseAiPresetPolicy").is_some_and(|policy| policy["version"] == 2)
+            && obj.get("aiPresets")
             .and_then(Value::as_array)
             .is_none_or(Vec::is_empty)
     });
@@ -3585,6 +3629,22 @@ mod tests {
     }
 
     #[test]
+    fn legacy_package_defaults_preserve_explicit_recording_settings() {
+        let mut raw = json!({
+            "disableKeyboardCapture": true,
+            "asyncPiiRedaction": false,
+            "piiBackend": "local",
+        });
+        super::apply_legacy_recording_defaults(raw.as_object_mut().unwrap());
+        let settings: SettingsStore = serde_json::from_value(raw).unwrap();
+        assert!(settings.recording.disable_keyboard_capture);
+        assert!(!settings.recording.disable_clipboard_capture);
+        assert!(!settings.recording.async_pii_redaction);
+        assert!(settings.recording.async_image_pii_redaction);
+        assert_eq!(settings.recording.pii_backend, "local");
+    }
+
+    #[test]
     fn missing_auto_update_deserializes_enabled() {
         let settings: SettingsStore = serde_json::from_value(json!({
             "aiPresets": []
@@ -3716,7 +3776,7 @@ mod tests {
         assert!(migrate_timeline_visibility_to_sidebar(&mut settings, false));
         assert_eq!(
             settings.extra["sidebarNavLayout"]["hidden"],
-            serde_json::json!(["brain", "timeline"])
+            serde_json::json!(["timeline"])
         );
     }
 
@@ -4202,7 +4262,7 @@ mod tests {
             "checked_at": chrono::Utc::now().to_rfc3339(),
             "features": { "app": true }
         }));
-        assert!(!store.requires_enterprise_app_for_consumer());
+        assert!(store.requires_enterprise_app_for_consumer());
         store.user.enterprise_account = Some(json!({
             "requires_enterprise_app": true,
             "restrict_consumer_build_access": true,
@@ -4211,7 +4271,7 @@ mod tests {
     }
 
     #[test]
-    fn business_capacity_plans_override_enterprise_app_requirement() {
+    fn personal_capacity_plans_do_not_override_workspace_mode() {
         for plan in ["pro_max", "pro_ultra"] {
             let mut store = SettingsStore::default();
             store.user.id = Some("consumer_capacity_paid".to_string());
@@ -4229,7 +4289,7 @@ mod tests {
 
             assert_eq!(store.local_plan_policy(), LocalPlanPolicy::VerifiedPaid);
             assert!(!store.restricts_paid_local_features());
-            assert!(!store.requires_enterprise_app_for_consumer());
+            assert!(store.requires_enterprise_app_for_consumer());
             let config = store.to_recording_config(std::path::PathBuf::from("/tmp/screenpipe"));
             assert_eq!(config.max_non_template_pipes, None);
         }
@@ -4398,6 +4458,15 @@ mod tests {
         assert_eq!(settings.ai_presets.len(), 1);
         assert_eq!(settings.auto_update, preserved_auto_update);
         assert!(!backfill_default_ai_preset(&mut settings));
+    }
+
+    #[test]
+    fn organization_empty_presets_survive_recovery_and_boot_migrations() {
+        let raw = json!({"settings":{"aiPresets":[],"enterpriseAiPresetPolicy":{"version":2,"allow_screenpipe_cloud":false,"allow_employee_custom_presets":false}}});
+        assert!(store_json_has_presets(&serde_json::to_vec(&raw).unwrap()));
+        let mut settings: SettingsStore = serde_json::from_value(raw["settings"].clone()).unwrap();
+        assert!(!backfill_default_ai_preset(&mut settings));
+        assert!(settings.ai_presets.is_empty());
     }
 
     /// Any `<name>.durable.<pid>.<seq>.tmp` still sitting in `dir`.
@@ -5711,6 +5780,17 @@ mod tests {
             json!({"smartRecording": false}),
         );
         assert!(store.to_recording_settings().experimental_meeting_piggyback);
+    }
+
+    #[test]
+    fn managed_smart_audio_choice_overrides_the_default_but_emergency_off_still_wins() {
+        let mut settings = SettingsStore::default();
+        for enabled in [false, true] {
+            settings.extra.insert("enterpriseManagedSettings".into(), json!({"experimentalMeetingPiggyback":enabled}));
+            assert_eq!(settings.to_recording_settings().experimental_meeting_piggyback, enabled);
+        }
+        settings.extra.insert("remoteControlPolicy".into(), json!({"schemaVersion":1,"boolean":{"smartRecording":{"defaultEnabled":true,"forceDisabled":true}}}));
+        assert!(!settings.to_recording_settings().experimental_meeting_piggyback);
     }
 
     #[test]

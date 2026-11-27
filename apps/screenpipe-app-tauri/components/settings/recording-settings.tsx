@@ -52,6 +52,7 @@ export const screenSearchIndex: SettingsField[] = [
   { label: msg("Recording quality", {}), keywords: ["fps", "quality"], conditional: true },
   // conditional: hidden when screen recording is off (same gate as Recording quality).
   { label: msg("Capture frequency", {}), keywords: ["screenshot", "interval", "idle", "cadence", "every", "minimum"], conditional: true },
+  { label: msg("Screenshot frame rate", {}), keywords: ["fps", "sampling", "capture", "performance"], conditional: true },
   { label: msg("HD recording for meetings", {}), keywords: ["hd", "meeting"] },
   { label: msg("Semantic search", {}), keywords: ["meaning", "embeddings", "search", "ai"] },
   { label: msg("Chinese mirror", {}), keywords: ["china", "mirror"] },
@@ -63,6 +64,7 @@ export const searchIndex: SettingsField[] = [
   ...screenSearchIndex,
 ];
 import { RecordingDetailCard } from "./recording-detail-card";
+import { ScreenshotFrameRateCard } from "./screenshot-frame-rate-card";
 import { LockedSetting, ManagedSwitch } from "@/components/enterprise-locked-setting";
 import {
   Select,
@@ -127,7 +129,7 @@ import {
   CommandGroup,
   CommandItem,
 } from "@/components/ui/command";
-import { commands, SettingsStore, MonitorDevice, AudioDeviceInfo, HardwareCapability } from "@/lib/utils/tauri";
+import { commands, SettingsStore, MonitorDevice, AudioDeviceInfo, HardwareCapability, DEFAULT_SCREENSHOT_FRAME_RATE } from "@/lib/utils/tauri";
 
 import {
   useSettings,
@@ -313,6 +315,7 @@ const SERVER_RESTART_SETTINGS = new Set<keyof SettingsStore>([
   "audioCaptureMode",
   "encryptStore",
   "asyncPiiRedaction",
+  "requirePiiCompletion",
   "asyncImagePiiRedaction",
   "piiBackend",
   "useChineseMirror",
@@ -2090,6 +2093,29 @@ export function RecordingSettings({ section }: { section: RecordingSettingsSecti
       setHasUnsavedChanges(true);
     }
   }, [settings, updateSettings, debouncedValidateSettings]);
+
+  const handleScreenshotFrameRateChange = useCallback((fps: number) => {
+    let saved = false;
+    void enqueueSettingsWrite(settingsWriteQueueRef.current, async () => {
+      await updateSettings({ screenshotFrameRate: fps });
+      saved = true;
+      const result = await commands.setScreenshotFrameRate(fps);
+      if (result.status === "error") throw new Error(result.error);
+    }).catch((error) => {
+      if (saved) {
+        setPendingChanges(previous => ({ ...previous, screenshotFrameRate: fps }));
+        setHasUnsavedChanges(true);
+      }
+      toast({
+        title: ui("Could not apply screenshot frame rate"),
+        description: saved
+          ? ui("Your preference was saved. Restart recording to apply it.")
+          : ui("Your preference could not be saved. Please try again."),
+        variant: "destructive",
+      });
+      console.error("Screenshot frame-rate update failed", error);
+    });
+  }, [updateSettings, toast, ui]);
 
   const currentPlatform = isMacOS ? "macos" : isWindows ? "windows" : "linux";
   const aecMode = normalizeAecModeForPlatform(
@@ -3929,6 +3955,22 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
             </CardContent>
           </Card>
         )}
+
+        {screenshotImagesEnabled && (isMacOS || isWindows) && (() => {
+          const idleMs = settings.idleCaptureIntervalMs;
+          // Match the engine's whole-fps floor: sampling must cover idle saves.
+          const minimum = idleMs != null && idleMs > 0
+            ? Math.max(1, Math.ceil(1000 / idleMs)) : 1;
+          return (
+            <LockedSetting settingKey="screenshotFrameRate">
+              <ScreenshotFrameRateCard
+                value={Math.max(settings.screenshotFrameRate ?? DEFAULT_SCREENSHOT_FRAME_RATE, minimum)}
+                minimum={minimum}
+                onChange={handleScreenshotFrameRateChange}
+              />
+            </LockedSetting>
+          );
+        })()}
 
         {/* Capture frequency — guaranteed screenshot cadence. Capture is
             event-driven (clicks, typing, app/window switches, visual change),

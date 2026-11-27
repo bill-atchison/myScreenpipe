@@ -2103,3 +2103,58 @@ metadata and input-mutation controls, and a missing-source infrastructure error.
 The grader executes the production edit projection with synthetic documents.
 UI navigation, backend persistence, authorization, native execution, enforced
 agent isolation and model improvement are outside this case's evidence.
+
+### Retention capture contract dispatch
+
+The retention capture grader always installs its hidden assertions under a
+reserved test name. A candidate's same-named product test cannot replace the
+cleanup-start deadline, capture deadline, deletion, watermark or reopen checks.
+Run `bun test evals/coding-agent/retention-grader-adapter.test.js` for ten adapter
+controls. These use a Cargo dispatch shim and do not establish native behavior;
+the existing historical `--verify` contrast and current-source Cargo execution
+remain separate evidence. Fixtures still appear only at grading.
+
+The app-zero-weight-over-quota case executes trackUsage against synthetic SQLite-backed D1 transport. It preserves paid quota and anonymous IP refusal while verifying zero-weight requests above the daily cap. Run `bun test evals/coding-agent/calibrate-zero-weight-quota.test.js` for correct, broken, bypass and equivalent-fix controls. It does not establish HTTP admission, live credit settlement, D1 concurrency or model improvement.
+
+### Custom-header transcription diagnostics
+
+`app-transcription-diagnostic-custom-headers` runs the actual exported diagnostics
+hook against deterministic React state/callback and synthetic transport ports.
+It checks custom headers without a bearer key, Authorization overrides, existing
+bearer/public requests, auth refusal without transcription, and transcription
+refusal. Historical multipart requests retain configured model and WAV payload.
+The parent fails three header assertions; the reference and current hook pass
+seven controls. Run `bun test evals/coding-agent/calibrate-transcription-custom-headers.test.js`
+for eight broken/correct/bypass/preserved/equivalent calibration controls. Hidden
+fixtures appear only at grading; no dependency links or installation are needed.
+This does not execute React lifecycle, browser CORS, native HTTP/audio, live
+providers, or model trials. Current source uses native transport; that command is
+a synthetic port in the grader.
+
+### Fable tool-result continuations
+
+`gateway-fable-tool-continuation` runs the real provider factory and adapters
+against synthetic transport responses. Fifty-six outcomes cover streamed and JSON
+completion after tool results, single dispatch, output budgets, policy headers,
+reported usage, unchanged inputs, ordinary turns and explicit native rollback.
+The parent fails two completion outcomes while preserving the other 54; the
+historical fix passes all 56.
+
+Run `bun test evals/coding-agent/calibrate-fable-tool-continuation.test.js` for
+eleven correct/broken/bypass/preserved/equivalent controls. Third-party dependencies
+and the hidden fixture appear only at grading. These checks exclude live model
+quality, provider availability, billing settlement, deployment, enforced agent
+isolation and model performance.
+
+### One-shot pipe stdin lifecycle
+
+`app-orphan-guard-one-shot-stdin` executes the actual orphan-guard extension
+with synthetic process, event and timer ports. Eight outcomes preserve one-shot
+work after stdin closes, RPC stdin termination, healthy-parent work and
+changed/missing-parent termination. Parent: six pass and two intended failures;
+reference and current source: eight pass. Run
+`bun test evals/coding-agent/calibrate-orphan-guard-stdin.test.js` for ten
+controls including unused fixes, no-op behavior, missing safeguards and equivalent
+implementations. The fixture appears only at grading, with no dependency links.
+This does not prove real Pi startup, OS process death, enforced agent isolation
+or model performance. Timer reference counting is outside these checks.

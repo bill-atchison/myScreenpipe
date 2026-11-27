@@ -74,6 +74,20 @@ mod tests {
     };
 
     #[test]
+    fn simplified_ui_cache_round_trips_without_becoming_fully_hidden() {
+        let mut json = serde_json::json!({"hide_app": true, "org": "example"}).as_object().unwrap().clone();
+        super::update_enterprise_ui_cache(&mut json, true, true);
+        assert_eq!(json["ui_mode"], "simplified");
+        assert_eq!(json["hide_app"], false);
+        assert_eq!(json["org"], "example");
+        super::update_enterprise_ui_cache(&mut json, true, false);
+        assert!(!json.contains_key("ui_mode"));
+        assert_eq!(json["hide_app"], true);
+        super::update_enterprise_ui_cache(&mut json, false, false);
+        assert_eq!(json["hide_app"], false);
+    }
+
+    #[test]
     fn shortcut_reminder_star_hint_tracks_registered_settings() {
         let mut settings = crate::store::SettingsStore::default();
         let default_shortcut = settings.star_session_shortcut.clone();
@@ -166,6 +180,88 @@ mod tests {
         assert!(!notification_belongs_to_overlay(Some("capture_stall")));
         assert!(!notification_belongs_to_overlay(Some("pipe")));
         assert!(!notification_belongs_to_overlay(None));
+    }
+
+    #[test]
+    fn personal_account_switch_only_removes_requested_sign_in_enrollment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("enterprise.json");
+        let db = dir.path().join("db.sqlite");
+        std::fs::write(&db, b"local history").unwrap();
+        let mut fields = serde_json::json!({"license_key": "test-key"});
+        fields["leave_workspace_on_restart"] = true.into();
+        let check = |fields: &serde_json::Value, allowed: bool, remains: bool| {
+            std::fs::write(&path, serde_json::to_vec(fields).unwrap()).unwrap();
+            super::finish_workspace_switch_at(&path, || allowed).unwrap();
+            assert_eq!(path.exists(), remains);
+        };
+        check(&fields, true, true); // Unattributed legacy or provisioned configuration.
+        fields["sign_in_enrollment"] = enterprise_license_key_sha256("old-key").into();
+        check(&fields, true, true);
+        fields["sign_in_enrollment"] = enterprise_license_key_sha256("test-key").into();
+        check(&fields, false, true); // A deployment source was added after sign-out.
+        fields["leave_workspace_on_restart"] = false.into();
+        check(&fields, true, true);
+        fields["leave_workspace_on_restart"] = true.into();
+        check(&fields, true, false);
+        super::finish_workspace_switch_at(&path, || true).unwrap();
+        assert_eq!(std::fs::read(db).unwrap(), b"local history");
+    }
+
+    #[cfg(not(feature = "enterprise-build"))]
+    #[test]
+    fn personal_account_switch_survives_a_process_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        for step in ["enroll", "protected", "restart", "again", "url-only"] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "commands::tests::personal_account_switch_process_probe", "--ignored"])
+                .env("SCREENPIPE_DATA_DIR", dir.path())
+                .env("SCREENPIPE_SWITCH_TEST_STEP", step)
+                .env_remove("SCREENPIPE_ENTERPRISE_INGEST_URL")
+                .env_remove("SCREENPIPE_ENTERPRISE_LICENSE_KEY");
+            if step == "protected" {
+                command.env("SCREENPIPE_ENTERPRISE_LICENSE_KEY", "fixture-deployment-key");
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{step}: {}", String::from_utf8_lossy(&output.stdout));
+        }
+    }
+
+    #[test]
+    #[ignore = "driven by personal_account_switch_survives_a_process_restart"]
+    fn personal_account_switch_process_probe() {
+        let Ok(step) = std::env::var("SCREENPIPE_SWITCH_TEST_STEP") else { return; };
+        let path = screenpipe_core::paths::default_screenpipe_data_dir().join("enterprise.json");
+        match step.as_str() {
+            "enroll" => {
+                super::persist_sign_in_enrollment("fixture-workspace-key", None).unwrap();
+                assert!(super::can_switch_to_personal_account());
+                super::finish_workspace_switch().unwrap();
+                assert!(path.is_file());
+                crate::enterprise_config_file::update(&path, |fields| {
+                    fields.insert("leave_workspace_on_restart".into(), true.into());
+                    Ok(())
+                }).unwrap();
+            }
+            "protected" => {
+                assert!(!super::can_switch_to_personal_account());
+                super::finish_workspace_switch().unwrap();
+                assert!(path.is_file());
+            }
+            "restart" | "again" => {
+                super::finish_workspace_switch().unwrap();
+                assert!(!path.exists());
+                assert!(!crate::app_mode::for_settings(&Default::default()));
+            }
+            "url-only" => {
+                std::fs::write(&path, r#"{"ingest_url":"https://example.test/ingest"}"#).unwrap();
+                super::persist_sign_in_enrollment("test-mdm-key", None).unwrap();
+                assert_eq!(super::get_enterprise_license_key().as_deref(), Some("test-mdm-key"));
+                assert!(!super::can_switch_to_personal_account());
+            }
+            _ => unreachable!(),
+        }
     }
 
     /// The whole point of SCR-300: `gateway_url` is the ONE name the server,
@@ -965,10 +1061,39 @@ fn persist_enterprise_device_config_inner(
     license_key: Option<&str>,
     ingest_url: Option<&str>,
     replaces_license_key: Option<&str>,
+    from_sign_in: bool,
 ) -> Result<(), String> {
     let dir = screenpipe_core::paths::default_screenpipe_data_dir();
     let path = dir.join("enterprise.json");
     crate::enterprise_config_file::update(&path, |json| {
+        if from_sign_in
+            && json
+                .get("license_key")
+                .and_then(|v| v.as_str())
+                .is_some_and(|old| Some(old) != license_key)
+        {
+            return Err("Workspace enrollment changed during sign-in".into());
+        }
+        // A URL-only provisioned device can still obtain its key by signing in.
+        // Keep that enrollment administrator-owned. Only a fresh account
+        // enrollment (or rotation of its original key) can be removed in-app.
+        let new_sign_in = from_sign_in
+            && !json.contains_key("license_key")
+            && !json.contains_key("ingest_url")
+            && user_controls_enrollment();
+        let account_rotation = replaces_license_key.is_some()
+            && sign_in_enrollment(json)
+            && json.get("license_key").and_then(|v| v.as_str()) == replaces_license_key;
+        if new_sign_in || account_rotation {
+            let key = license_key.ok_or("Missing workspace credential")?;
+            json.insert(
+                "sign_in_enrollment".into(),
+                enterprise_license_key_sha256(key).into(),
+            );
+        } else if !from_sign_in && license_key.is_some() {
+            json.remove("sign_in_enrollment");
+            json.remove("leave_workspace_on_restart");
+        }
         if let Some(key) = license_key {
             json.insert(
                 "license_key".to_string(),
@@ -1004,7 +1129,128 @@ pub fn persist_enterprise_device_config(
     license_key: Option<&str>,
     ingest_url: Option<&str>,
 ) -> Result<(), String> {
-    persist_enterprise_device_config_inner(license_key, ingest_url, None)
+    persist_enterprise_device_config_inner(license_key, ingest_url, None, false)
+}
+
+pub(crate) fn persist_sign_in_enrollment(
+    key: &str,
+    ingest_url: Option<&str>,
+) -> Result<(), String> {
+    persist_enterprise_device_config_inner(Some(key), ingest_url, None, true)
+}
+
+fn sign_in_enrollment(fields: &serde_json::Map<String, serde_json::Value>) -> bool {
+    fields
+        .get("license_key")
+        .and_then(|v| v.as_str())
+        .filter(|key| !key.is_empty())
+        .is_some_and(|key| {
+            fields.get("sign_in_enrollment").and_then(|v| v.as_str())
+                == Some(enterprise_license_key_sha256(key).as_str())
+        })
+}
+
+fn user_controls_enrollment() -> bool {
+    if crate::app_mode::is_enterprise_package()
+        || read_enterprise_config_from_windows_registry().is_some()
+        || [
+            "SCREENPIPE_ENTERPRISE_LICENSE_KEY",
+            "SCREENPIPE_ENTERPRISE_INGEST_URL",
+        ]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some())
+    {
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(dir) = exe.parent() else {
+        return false;
+    };
+    #[cfg(target_os = "macos")]
+    if !matches!(
+        dir.join("../Resources/enterprise.json").try_exists(),
+        Ok(false)
+    ) {
+        return false;
+    }
+    matches!(dir.join("enterprise.json").try_exists(), Ok(false))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn can_switch_to_personal_account() -> bool {
+    let path = screenpipe_core::paths::default_screenpipe_data_dir().join("enterprise.json");
+    std::fs::read(path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+        .is_some_and(|fields| sign_in_enrollment(&fields))
+        && user_controls_enrollment()
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn switch_to_personal_account(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    if !can_switch_to_personal_account() {
+        return Err("This workspace enrollment is managed by your administrator.".into());
+    }
+    crate::search_only::prepare_restart()?;
+    set_cloud_token(None, app.clone(), app.state()).await?;
+    crate::store::SettingsStore::clear_workspace_session(&app)?;
+    let path = screenpipe_core::paths::default_screenpipe_data_dir().join("enterprise.json");
+    let changed = crate::enterprise_config_file::update(&path, |fields| {
+        if !sign_in_enrollment(fields) {
+            return Err("Workspace enrollment changed. Please try again.".into());
+        }
+        fields.insert(
+            "leave_workspace_on_restart".into(),
+            serde_json::Value::Bool(true),
+        );
+        Ok(())
+    })?;
+    if !changed {
+        return Ok(()); // Another window already requested this restart.
+    }
+    crate::process_exit::request_prepared_app_relaunch(
+        app,
+        "switch to personal account",
+        std::time::Duration::ZERO,
+    );
+    Ok(())
+}
+
+// Consume the request on the next launch, before policy or upload workers start.
+// All workers in the departing process continue to see the original workspace.
+pub(crate) fn finish_workspace_switch() -> Result<(), String> {
+    let path = screenpipe_core::paths::default_screenpipe_data_dir().join("enterprise.json");
+    finish_workspace_switch_at(&path, user_controls_enrollment)
+}
+
+fn finish_workspace_switch_at(
+    path: &std::path::Path,
+    allowed: impl FnOnce() -> bool,
+) -> Result<(), String> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let Ok(fields) = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&raw)
+    else {
+        return Ok(());
+    };
+    if fields
+        .get("leave_workspace_on_restart")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+        && sign_in_enrollment(&fields)
+        && allowed()
+    {
+        std::fs::remove_file(path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 pub fn persist_recovered_enterprise_device_config(
@@ -1019,7 +1265,12 @@ pub fn persist_recovered_enterprise_device_config(
         read_enterprise_config_from_deployment().and_then(|cfg| cfg.license_key);
     let recovery_anchor =
         recovery_anchor_license_key(bundled_license_key.as_deref(), replaced_license_key);
-    persist_enterprise_device_config_inner(Some(license_key), ingest_url, Some(recovery_anchor))
+    persist_enterprise_device_config_inner(
+        Some(license_key),
+        ingest_url,
+        Some(recovery_anchor),
+        false,
+    )
 }
 
 /// Save the enterprise license key to `~/.screenpipe/enterprise.json`.
@@ -1051,12 +1302,22 @@ pub fn save_enterprise_license_key(license_key: String) -> Result<(), String> {
 /// We only ever touch the user-writable file; a bundled MDM `enterprise.json`
 /// (checked first at boot) keeps precedence. To avoid littering consumer
 /// machines we skip writing a `false` when there's nothing to clear.
+fn update_enterprise_ui_cache(json: &mut serde_json::Map<String, serde_json::Value>, hidden: bool, simplified: bool) {
+    if simplified {
+        json.insert("ui_mode".into(), serde_json::json!("simplified"));
+    } else if json.get("ui_mode").and_then(|value| value.as_str()) == Some("simplified") {
+        json.remove("ui_mode");
+    }
+    if (hidden && !simplified) || json.contains_key("hide_app") {
+        json.insert("hide_app".into(), serde_json::json!(hidden && !simplified));
+    }
+}
+
 fn persist_enterprise_hide_app(hidden: bool) {
+    let simplified = crate::enterprise_policy::is_simplified_ui();
     let path = screenpipe_core::paths::default_screenpipe_data_dir().join("enterprise.json");
     match crate::enterprise_config_file::update(&path, |json| {
-        if hidden || json.contains_key("hide_app") {
-            json.insert("hide_app".to_string(), serde_json::Value::Bool(hidden));
-        }
+        update_enterprise_ui_cache(json, hidden, simplified);
         Ok(())
     }) {
         Ok(true) => info!(
@@ -3347,6 +3608,7 @@ fn shortcut_reminder_payload(
     settings: &crate::store::SettingsStore,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut map = serde_json::Map::new();
+    map.insert("simplifiedUI".into(), serde_json::json!(crate::enterprise_policy::is_simplified_ui().to_string()));
     map.insert(
         "overlay".to_string(),
         serde_json::Value::String(shortcut_reminder_label(
@@ -3462,7 +3724,7 @@ pub(crate) async fn maybe_show_shortcut_reminder_on_startup(
     let mut store = crate::store::SettingsStore::get(&app_handle)?.unwrap_or_default();
     let now_unix = chrono::Utc::now().timestamp();
     if shortcut_overlay_hidden_by_choice(
-        store.show_shortcut_overlay,
+        store.show_shortcut_overlay || crate::enterprise_policy::is_simplified_ui(),
         store.shortcut_overlay_snoozed_until,
         now_unix,
     ) {
@@ -3510,7 +3772,7 @@ pub async fn show_shortcut_reminder(
     let mut store = crate::store::SettingsStore::get(&app_handle)?.unwrap_or_default();
     let now_unix = chrono::Utc::now().timestamp();
     if shortcut_overlay_hidden_by_choice(
-        store.show_shortcut_overlay,
+        store.show_shortcut_overlay || crate::enterprise_policy::is_simplified_ui(),
         store.shortcut_overlay_snoozed_until,
         now_unix,
     ) {
@@ -3565,7 +3827,7 @@ pub(crate) async fn show_shortcut_reminder_impl(
     let store = crate::store::SettingsStore::get(&app_handle)
         .unwrap_or_default()
         .unwrap_or_default();
-    if respect_timeline_disabled && store.recording.disable_timeline {
+    if respect_timeline_disabled && store.recording.disable_timeline && !crate::enterprise_policy::is_simplified_ui() {
         info!("timeline disabled: skipping shortcut reminder overlay");
         return Ok(());
     }
@@ -3733,7 +3995,7 @@ pub(crate) async fn show_shortcut_reminder_impl(
     let mut builder = WebviewWindowBuilder::new(
         &app_handle,
         label,
-        tauri::WebviewUrl::App("shortcut-reminder".into()),
+        tauri::WebviewUrl::App(format!("shortcut-reminder?simplified={}", crate::enterprise_policy::is_simplified_ui()).into()),
     )
     .title("")
     .inner_size(window_width, window_height)
@@ -4074,7 +4336,46 @@ pub(crate) fn notification_belongs_to_overlay(notification_type: Option<&str>) -
     matches!(notification_type, Some("meeting"))
 }
 
-/// Join cards share a compact landscape surface on every platform.
+/// Join and open-note cards share the same logical bounds on every surface.
+const MEETING_CARD_WIDTH: f64 = 460.0;
+const MEETING_CARD_HEIGHT: f64 = 124.0;
+
+fn shortcut_overlay_scale(size: &str) -> f64 {
+    match size {
+        "large" => 2.0,
+        "medium" => 1.5,
+        _ => 1.0,
+    }
+}
+
+fn meeting_notification_card_size(scale: f64) -> (f64, f64) {
+    (
+        MEETING_CARD_WIDTH * scale,
+        MEETING_CARD_HEIGHT * scale,
+    )
+}
+
+#[cfg(test)]
+fn meeting_join_notification_size(scale: f64) -> (f64, f64) {
+    meeting_notification_card_size(scale)
+}
+
+fn meeting_notification_card_payload(payload: &str, scale: f64) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return payload.to_owned();
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("overlayScale".to_owned(), serde_json::json!(scale));
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| payload.to_owned())
+}
+
+#[cfg(test)]
+fn meeting_join_notification_payload(payload: &str, scale: f64) -> String {
+    meeting_notification_card_payload(payload, scale)
+}
+
+#[cfg(any(test, target_os = "windows"))]
 fn notification_is_meeting_join(payload: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(payload)
         .ok()
@@ -4090,9 +4391,57 @@ fn notification_is_meeting_join(payload: &str) -> bool {
         })
 }
 
+fn notification_is_meeting_card(payload: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    let Some(actions) = value.get("actions").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    let has_join = actions.iter().any(|action| {
+        action.get("type").and_then(|v| v.as_str()) == Some("meeting_join")
+            && action
+                .get("url")
+                .and_then(|v| v.as_str())
+                .is_some_and(|url| !url.is_empty())
+    });
+    let has_open_note = actions.iter().any(|action| {
+        let id = action
+            .get("id")
+            .or_else(|| action.get("action"))
+            .and_then(|v| v.as_str());
+        action.get("type").and_then(|v| v.as_str()) == Some("deeplink")
+            && id == Some("open-live-notes")
+            && action
+                .get("url")
+                .and_then(|v| v.as_str())
+                .is_some_and(|url| url.starts_with("screenpipe://meeting"))
+    });
+    has_join || has_open_note
+}
+
 #[cfg(test)]
 mod meeting_join_notification_tests {
-    use super::notification_is_meeting_join;
+    use super::{notification_is_meeting_card, notification_is_meeting_join};
+
+    #[test]
+    fn meeting_join_panel_uses_shared_logical_bounds() {
+        let expected = [
+            ("small", 460.0, 124.0),
+            ("medium", 690.0, 186.0),
+            ("large", 920.0, 248.0),
+        ];
+        for (size, width, height) in expected {
+            let scale = super::shortcut_overlay_scale(size);
+            assert_eq!(super::meeting_join_notification_size(scale), (width, height));
+            let payload = super::meeting_join_notification_payload(
+                r#"{"id":"meeting","actions":[]}"#,
+                scale,
+            );
+            let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(value["overlayScale"].as_f64(), Some(scale));
+        }
+    }
 
     #[test]
     fn meeting_join_uses_typed_action_instead_of_localized_copy() {
@@ -4105,6 +4454,12 @@ mod meeting_join_notification_tests {
         assert!(!notification_is_meeting_join("invalid"));
         assert!(!notification_is_meeting_join(
             r#"{"actions":[{"type":"meeting_join","url":""}]}"#
+        ));
+        assert!(notification_is_meeting_card(
+            r#"{"actions":[{"id":"open-live-notes","action":"open-live-notes","type":"deeplink","url":"screenpipe://meeting/42"}]}"#
+        ));
+        assert!(!notification_is_meeting_card(
+            r#"{"actions":[{"id":"open-live-notes","type":"deeplink","url":"screenpipe://activity"}]}"#
         ));
     }
 }
@@ -4210,6 +4565,8 @@ pub(crate) async fn deliver_notification_panel(
     // The pill speaks up for its own alerts wherever it is native. Windows has
     // no native standalone panel, so only the overlay branch applies and
     // anything the pill refuses falls through to the webview panel below.
+    let meeting_card = notification_is_meeting_card(&payload);
+    #[cfg(target_os = "windows")]
     let meeting_join = notification_is_meeting_join(&payload);
     #[cfg(target_os = "windows")]
     {
@@ -4244,7 +4601,7 @@ pub(crate) async fn deliver_notification_panel(
             return Ok(NotificationDelivery::ShownOnOverlay);
         }
 
-        if !meeting_join && native_notification::is_available() {
+        if !meeting_card && native_notification::is_available() {
             info!("Using native SwiftUI notification panel");
             if native_notification::show(&payload) {
                 // Emit event so the main window can save notification history + PostHog analytics
@@ -4256,10 +4613,24 @@ pub(crate) async fn deliver_notification_panel(
         }
     }
 
-    let (window_width, window_height) = if meeting_join {
-        (460.0, 124.0)
+    let overlay_scale = if meeting_card {
+        let size = crate::store::SettingsStore::get(&app_handle)
+            .unwrap_or_default()
+            .unwrap_or_default()
+            .shortcut_overlay_size;
+        shortcut_overlay_scale(&size)
+    } else {
+        1.0
+    };
+    let (window_width, window_height) = if meeting_card {
+        meeting_notification_card_size(overlay_scale)
     } else {
         (340.0, 380.0)
+    };
+    let panel_payload = if meeting_card {
+        meeting_notification_card_payload(&payload, overlay_scale)
+    } else {
+        payload.clone()
     };
 
     // Position at top-right of the screen where the cursor is
@@ -4317,7 +4688,7 @@ pub(crate) async fn deliver_notification_panel(
             .set_size(tauri::LogicalSize::new(window_width, window_height))
             .map_err(|e| e.to_string())?;
         let _ = window.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(x, y)));
-        let _ = app_handle.emit_to(label, "notification-panel-update", &payload);
+        let _ = app_handle.emit_to(label, "notification-panel-update", &panel_payload);
 
         // On macOS, skip window.show() — it calls makeKeyAndOrderFront which
         // steals focus from the user's current app. Use orderFront: on the
@@ -4460,7 +4831,7 @@ pub(crate) async fn deliver_notification_panel(
 
     // Wait for webview to mount React and register event listeners before emitting
     let app_clone = app_handle.clone();
-    let payload_clone = payload.clone();
+    let payload_clone = panel_payload;
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         info!("Emitting notification-panel-update event");
@@ -5189,7 +5560,7 @@ fn dir_size(path: &std::path::Path) -> u64 {
 pub fn set_autostart(app_handle: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 
-    #[cfg(all(feature = "enterprise-build", target_os = "windows"))]
+    #[cfg(target_os = "windows")]
     if crate::enterprise_persistence::installed() {
         // The protected service owns startup for this package. Keep the
         // user-writable Run entry absent even if an old setting is toggled.
@@ -5219,4 +5590,22 @@ pub fn set_autostart(app_handle: tauri::AppHandle, enabled: bool) -> Result<(), 
         manager.is_enabled().unwrap_or(false)
     );
     Ok(())
+}
+
+/// Apply only the screenshot acquisition rate. HD remains independently owned.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_screenshot_frame_rate(fps: u32) -> Result<(), String> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        screenpipe_screen::screenshot_rate::set(fps).map_err(|error| {
+            warn!(fps, error = %error, "screenshot frame-rate update failed");
+            error.to_string()
+        })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = fps;
+        Err("screenshot acquisition frame rate is supported on macOS and Windows".into())
+    }
 }

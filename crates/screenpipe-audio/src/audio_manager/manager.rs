@@ -24,9 +24,8 @@ use whisper_rs::WhisperContext;
 use screenpipe_db::DatabaseManager;
 
 /// True if `e` is the VPIO-relevant kind of stream death: a receive-timeout
-/// (the stream was created but delivered no data). A zero-fill hijack
-/// (`StreamDeath::ZeroFill`) is deliberately excluded — that is another process
-/// seizing the device, not a VPIO fault, and the HAL path would be hijacked too.
+/// (the stream was created but delivered no data). Silent samples remain
+/// valid delivery and never become a stream-death error.
 /// Walks the `anyhow` cause chain so it stays correct even if a caller later
 /// wraps the error with `.context(...)`.
 #[cfg(target_os = "macos")]
@@ -56,8 +55,8 @@ use crate::{
     segmentation::segmentation_manager::SegmentationManager,
     transcription::{
         engine::{TranscriptionEngine, TranscriptionSession},
-        handle_new_transcript,
-        stt::{process_audio_input, SAMPLE_RATE},
+        handle_new_transcript_with_optional_db,
+        stt::{process_audio_input_with_optional_db, SAMPLE_RATE},
         whisper::model::get_cached_whisper_model_path,
     },
     utils::{audio::resample, ffmpeg::write_audio_to_new_file},
@@ -200,7 +199,7 @@ pub struct AudioManager {
     device_manager: Arc<DeviceManager>,
     segmentation_manager: Arc<SegmentationManager>,
     status: Arc<RwLock<AudioManagerStatus>>,
-    db: Arc<DatabaseManager>,
+    db: Option<Arc<DatabaseManager>>,
     vad_engine: Arc<Mutex<Box<dyn VadEngine + Send>>>,
     recording_handles: Arc<RecordingHandlesMap>,
     recording_sender: Arc<flume::Sender<AudioInput>>,
@@ -371,6 +370,13 @@ fn runtime_transcription_config_matches(
 
 impl AudioManager {
     pub async fn new(options: AudioManagerOptions, db: Arc<DatabaseManager>) -> Result<Self> {
+        Self::new_with_optional_db(options, Some(db)).await
+    }
+
+    pub(super) async fn new_with_optional_db(
+        options: AudioManagerOptions,
+        db: Option<Arc<DatabaseManager>>,
+    ) -> Result<Self> {
         let effective_windows_input_aec_enabled =
             options.windows_input_aec_enabled && !options.screenpipe_aec_enabled;
         let effective_macos_input_vpio_enabled =
@@ -390,7 +396,8 @@ impl AudioManager {
                 "screenpipe-audio: macOS VoiceProcessingIO (AEC) enabled in settings (default input only)"
             );
         }
-        let segmentation_manager = Arc::new(SegmentationManager::new(options.is_disabled).await?);
+        let segmentation_manager =
+            Arc::new(SegmentationManager::new(options.is_disabled || db.is_none()).await?);
         let status = RwLock::new(AudioManagerStatus::Stopped);
         let vad_engine: Arc<Mutex<Box<dyn VadEngine + Send>>> = if options.is_disabled {
             Arc::new(Mutex::new(Box::new(WebRtcVad::new())))
@@ -558,7 +565,7 @@ impl AudioManager {
         *recording_receiver_handle = Some(self.start_audio_receiver_handler().await?);
         let self_arc = Arc::new(self.clone());
 
-        {
+        if let Some(db) = &self.db {
             let mut meeting_streaming_handle = self.meeting_streaming_handle.write().await;
             if meeting_streaming_handle.is_none() {
                 let config = self.options.read().await.meeting_streaming.clone();
@@ -567,26 +574,26 @@ impl AudioManager {
                     config,
                     self.meeting_audio_tap.clone(),
                     audio_rx,
-                    self.db.clone(),
+                    db.clone(),
                     self.engine.clone(),
                     self.on_transcription_insert.clone(),
                 ));
             }
-        }
 
-        // Durable pending chunks exist in both realtime and batch mode: silence,
-        // provider failures, or interrupted writes must recover after restart.
-        *self.reconciliation_handle.write().await = Some(self.start_reconciliation_handler().await);
+            // Durable pending chunks exist in both DB modes: silence, provider
+            // failures, or interrupted writes must recover after restart.
+            *self.reconciliation_handle.write().await =
+                Some(self.start_reconciliation_handler(db.clone()).await);
+        }
 
         start_device_monitor(self_arc.clone(), self.device_manager.clone()).await?;
 
-        // Seed known speakers from DB on startup
-        seed_speakers_from_db(&self.db, &self.segmentation_manager).await;
+        if let Some(db) = &self.db {
+            seed_speakers_from_db(db, &self.segmentation_manager).await;
 
-        // Subscribe to meeting events for calendar-assisted speaker diarization
-        {
+            // Subscribe to meeting events for calendar-assisted speaker diarization.
             let seg_mgr = self.segmentation_manager.clone();
-            let db = self.db.clone();
+            let db = db.clone();
             tokio::spawn(async move {
                 run_meeting_speaker_constraint_loop(seg_mgr, db).await;
             });
@@ -597,8 +604,7 @@ impl AudioManager {
         Ok(())
     }
 
-    async fn start_reconciliation_handler(&self) -> JoinHandle<()> {
-        let db = self.db.clone();
+    async fn start_reconciliation_handler(&self, db: Arc<DatabaseManager>) -> JoinHandle<()> {
         let engine_ref = self.engine.clone();
         let on_insert_bg = self.on_transcription_insert.clone();
         let options_ref = self.options.clone();
@@ -1084,14 +1090,7 @@ impl AudioManager {
             return Ok(());
         }
 
-        if !self.recording_handles.contains_key(device) {
-            if let Some(is_running) = self.device_manager.is_running_mut(device) {
-                is_running.store(true, Ordering::Relaxed);
-            }
-            let handle = self.record_device(device).await?;
-            self.recording_handles
-                .insert(device.clone(), Arc::new(Mutex::new(handle)));
-        }
+        self.ensure_recording_handle(device).await?;
 
         if !self.enabled_devices().await.contains(&device.to_string()) {
             self.options
@@ -1245,24 +1244,45 @@ impl AudioManager {
             return Err(anyhow!("screen locked while opening {}", device));
         }
 
-        if !self.recording_handles.contains_key(device) {
-            if let Some(is_running) = self.device_manager.is_running_mut(device) {
-                is_running.store(true, Ordering::Relaxed);
-            }
-            match self.record_device(device).await {
-                Ok(handle) => {
-                    self.recording_handles
-                        .insert(device.clone(), Arc::new(Mutex::new(handle)));
-                }
-                Err(e) => {
-                    self.session_devices
-                        .write()
-                        .unwrap()
-                        .remove(&device.to_string());
-                    return Err(e);
-                }
-            }
+        if let Err(e) = self.ensure_recording_handle(device).await {
+            self.session_devices
+                .write()
+                .unwrap()
+                .remove(&device.to_string());
+            return Err(e);
         }
+        Ok(())
+    }
+
+    /// Attach a recorder to the stream published by `DeviceManager`.
+    ///
+    /// Device recovery can replace a disconnected native stream before the
+    /// monitor has removed its finished recorder. The complete device operation
+    /// is serialized, so hand the map entry over here instead of leaving the
+    /// replacement stream without a consumer until the next monitor tick.
+    async fn ensure_recording_handle(&self, device: &AudioDevice) -> Result<()> {
+        let existing = self
+            .recording_handles
+            .get(device)
+            .map(|entry| entry.value().clone());
+        if let Some(existing) = existing {
+            if !existing.lock().await.is_finished() {
+                return Ok(());
+            }
+            self.recording_handles
+                .remove_if(device, |_, current| Arc::ptr_eq(current, &existing));
+            info!(
+                "[DEVICE_RECOVERY] attaching replacement recorder for {} after previous recording task finished",
+                device
+            );
+        }
+
+        if let Some(is_running) = self.device_manager.is_running_mut(device) {
+            is_running.store(true, Ordering::Relaxed);
+        }
+        let handle = self.record_device(device).await?;
+        self.recording_handles
+            .insert(device.clone(), Arc::new(Mutex::new(handle)));
         Ok(())
     }
 
@@ -1491,9 +1511,7 @@ impl AudioManager {
         let mut session = match engine.create_session() {
             Ok(session) => session,
             Err(error) => {
-                warn!(
-                    "transcription session unavailable ({error}); audio receiver will continue and recorded audio remains queued for reconciliation"
-                );
+                warn!(%error, recovery_enabled = db.is_some(), "transcription session unavailable; audio receiver will continue");
                 TranscriptionSession::Disabled
             }
         };
@@ -1567,9 +1585,9 @@ impl AudioManager {
                     }
                 }
 
-                // ALWAYS persist audio to disk immediately, before any deferral.
-                // This ensures audio survives app restarts and can be retranscribed later.
-                let persisted_file_path = if let Some(ref out) = output_path {
+                // The DB pipeline persists audio before deferral so it can be
+                // retranscribed later. The raw pipeline only appends transcripts to the ledger.
+                let persisted_file_path = if let (Some(db), Some(out)) = (&db, &output_path) {
                     let queued_sample_count = audio.data.len();
                     let queued_duration_seconds =
                         queued_sample_count as f64 / audio.sample_rate as f64;
@@ -1705,7 +1723,7 @@ impl AudioManager {
                 // audio through the background STT path. The durable audio
                 // chunk was already written above; background transcription
                 // resumes when the live session ends.
-                if meeting_audio_tap.background_suppressed() {
+                if db.is_some() && meeting_audio_tap.background_suppressed() {
                     had_deferred_segments = true;
                     metrics.record_segment_deferred();
                     debug!(
@@ -1718,7 +1736,7 @@ impl AudioManager {
                 // Audio is already persisted to disk + DB above.
                 // When the session ends, reconciliation will transcribe all untranscribed chunks.
                 if is_batch_mode {
-                    if let Some(ref meeting) = meeting_detector {
+                    if let (Some(db), Some(meeting)) = (db.as_deref(), meeting_detector.as_ref()) {
                         let was_in_session = meeting.is_in_audio_session();
                         meeting.check_grace_period().await;
                         let now_in_session = meeting.is_in_audio_session();
@@ -1738,7 +1756,6 @@ impl AudioManager {
                                 .is_some_and(|t| t.elapsed().as_secs() >= max_deferral_secs);
 
                         if session_just_ended {
-                            // Reconcile: session ended or deferral cap reached
                             had_deferred_segments = false;
                             deferral_started = None;
                             info!(
@@ -1746,7 +1763,7 @@ impl AudioManager {
                             );
                             let data_dir = output_path.as_deref();
                             let sweep = super::reconciliation::reconcile_untranscribed(
-                                &db,
+                                db,
                                 &engine,
                                 on_insert_session.as_ref(),
                                 audio_transcription_engine.clone(),
@@ -1776,71 +1793,32 @@ impl AudioManager {
                             had_deferred_segments = true;
                             metrics.record_segment_deferred();
                             debug!("batch mode: in audio session, deferring transcription");
-                        } else {
-                            // Not in an audio session — transcribe immediately like realtime
-                            if let Err(e) = process_audio_input(
-                                audio.clone(),
-                                vad_engine.clone(),
-                                segmentation_model_path.clone(),
-                                embedding_manager.clone(),
-                                embedding_extractor.clone(),
-                                &output_path.clone().unwrap(),
-                                &transcription_sender.clone(),
-                                &mut session,
-                                metrics.clone(),
-                                persisted_file_path.clone(),
-                                filter_music,
-                                &db,
-                            )
-                            .await
-                            {
-                                metrics.record_process_error();
-                                log_audio_process_error(&e);
-                            }
                         }
-                    } else {
-                        // No meeting detector available — transcribe immediately
-                        if let Err(e) = process_audio_input(
-                            audio.clone(),
-                            vad_engine.clone(),
-                            segmentation_model_path.clone(),
-                            embedding_manager.clone(),
-                            embedding_extractor.clone(),
-                            &output_path.clone().unwrap(),
-                            &transcription_sender.clone(),
-                            &mut session,
-                            metrics.clone(),
-                            persisted_file_path.clone(),
-                            filter_music,
-                            &db,
-                        )
-                        .await
-                        {
-                            metrics.record_process_error();
-                            log_audio_process_error(&e);
+                        if session_just_ended || now_in_session {
+                            continue;
                         }
                     }
-                } else {
-                    // Realtime mode: transcribe immediately
-                    if let Err(e) = process_audio_input(
-                        audio.clone(),
-                        vad_engine.clone(),
-                        segmentation_model_path.clone(),
-                        embedding_manager.clone(),
-                        embedding_extractor.clone(),
-                        &output_path.clone().unwrap(),
-                        &transcription_sender.clone(),
-                        &mut session,
-                        metrics.clone(),
-                        persisted_file_path.clone(),
-                        filter_music,
-                        &db,
-                    )
-                    .await
-                    {
-                        metrics.record_process_error();
-                        log_audio_process_error(&e);
-                    }
+                }
+
+                // No DB means no deferred recovery; use the same live STT session.
+                if let Err(e) = process_audio_input_with_optional_db(
+                    audio,
+                    vad_engine.clone(),
+                    segmentation_model_path.clone(),
+                    embedding_manager.clone(),
+                    embedding_extractor.clone(),
+                    output_path.as_ref().expect("validated audio output path"),
+                    &transcription_sender,
+                    &mut session,
+                    metrics.clone(),
+                    persisted_file_path,
+                    filter_music,
+                    db.as_deref(),
+                )
+                .await
+                {
+                    metrics.record_process_error();
+                    log_audio_process_error(&e);
                 }
             }
         }))
@@ -1870,7 +1848,7 @@ impl AudioManager {
         drop(options); // Release lock before spawning
         let metrics = self.metrics.clone();
         let on_insert = self.on_transcription_insert.clone();
-        Ok(tokio::spawn(handle_new_transcript(
+        Ok(tokio::spawn(handle_new_transcript_with_optional_db(
             db,
             transcription_receiver,
             transcription_engine,
@@ -2301,8 +2279,10 @@ impl AudioManager {
             }
         }
 
-        let segmentation_changed = self.segmentation_manager.refresh_models().await;
-        changed = changed || segmentation_changed;
+        if self.db.is_some() {
+            let segmentation_changed = self.segmentation_manager.refresh_models().await;
+            changed = changed || segmentation_changed;
+        }
 
         changed
     }
@@ -2359,8 +2339,9 @@ impl AudioManager {
     /// Backfill missing speaker IDs for recently transcribed chunks if
     /// segmentation models have become available.
     pub async fn reconcile_missing_speakers(&self, lookback_hours: i64, limit: i64) -> usize {
+        let Some(db) = &self.db else { return 0 };
         super::reconciliation::backfill_missing_speakers(
-            &self.db,
+            db,
             self.segmentation_manager.clone(),
             lookback_hours,
             limit,
@@ -2370,7 +2351,7 @@ impl AudioManager {
 
     /// Check for recording handles that have finished (crashed or timed out)
     /// Returns device names that need to be cleaned up and restarted
-    pub async fn check_stale_recording_handles(&self) -> Vec<String> {
+    pub(crate) async fn check_stale_recording_handles(&self) -> Vec<StaleRecordingHandle> {
         let mut stale_devices = Vec::new();
         let session_devices = self.session_devices.read().unwrap().clone();
 
@@ -2389,7 +2370,10 @@ impl AudioManager {
 
             // Check if the JoinHandle has finished (task completed/crashed)
             if handle.lock().await.is_finished() {
-                stale_devices.push(device.to_string());
+                stale_devices.push(StaleRecordingHandle {
+                    device_name: device.to_string(),
+                    handle: handle.clone(),
+                });
             }
         }
 
@@ -2480,7 +2464,11 @@ impl AudioManager {
 
     /// Clean up a stale device that had its recording handle crash/timeout
     /// This prepares the device for restart by the device monitor
-    pub async fn cleanup_stale_device(&self, device_name: &str) -> anyhow::Result<()> {
+    pub(crate) async fn cleanup_stale_device(
+        &self,
+        stale: &StaleRecordingHandle,
+    ) -> anyhow::Result<()> {
+        let device_name = &stale.device_name;
         // Defensive: never clean up a session device here. `check_stale_recording_handles`
         // already omits them from the stale list (the only caller), but guard the
         // public entry point too — only `stop_session_device` may tear these down.
@@ -2496,12 +2484,39 @@ impl AudioManager {
             Err(_) => return Err(anyhow!("Device {} not found", device_name)),
         };
 
-        self.stop_device_recording(&device).await?;
+        let manager = self.clone();
+        let stale_handle = stale.handle.clone();
+        let target = device.clone();
+        self.device_manager
+            .run_device_operation(&device, async move {
+                let current = manager
+                    .recording_handles
+                    .get(&target)
+                    .map(|entry| entry.value().clone());
+                let Some(current) = current else {
+                    return Ok(());
+                };
+                if !Arc::ptr_eq(&current, &stale_handle) || !current.lock().await.is_finished() {
+                    debug!(
+                        "stale cleanup for {} no longer matches the current recording handle",
+                        target
+                    );
+                    return Ok(());
+                }
+                manager.stop_device_recording_inner(&target).await
+            })
+            .await?;
 
         debug!("cleaned up stale device {} for restart", device_name);
 
         Ok(())
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct StaleRecordingHandle {
+    pub(crate) device_name: String,
+    handle: Arc<Mutex<JoinHandle<Result<()>>>>,
 }
 
 /// Seed the embedding manager with named speakers from the DB.
@@ -2641,12 +2656,95 @@ impl Drop for AudioManager {
 mod tests {
     use super::*;
     use crate::core::device::{AudioDevice, DeviceType};
+    use crate::core::stream::AudioStream;
     use std::path::Path;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
     use tokio::sync::{Barrier, Notify, Semaphore};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_hands_replacement_stream_to_live_recorder_and_rejects_stale_cleanup() {
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
+        let manager = AudioManager::new(
+            AudioManagerOptions {
+                is_disabled: true,
+                audio_chunk_duration: Duration::from_secs(1),
+                ..Default::default()
+            },
+            db,
+        )
+        .await
+        .unwrap();
+        let device = AudioDevice::new("recovery microphone".into(), DeviceType::Input);
+
+        let finished = Arc::new(Mutex::new(tokio::spawn(async { Ok(()) })));
+        manager
+            .recording_handles
+            .insert(device.clone(), finished.clone());
+        while !finished.lock().await.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let stale = manager.check_stale_recording_handles().await;
+        assert_eq!(stale.len(), 1);
+
+        // Model DeviceManager's completed retry: the disconnected native stream
+        // has already been replaced, but its old finished recorder remains.
+        let (replacement, samples) =
+            AudioStream::from_sender_for_test(Arc::new(device.clone()), 16_000, 1);
+        manager
+            .device_manager
+            .install_stream_for_test(device.clone(), replacement, false);
+        manager.ensure_recording_handle(&device).await.unwrap();
+
+        let live = manager
+            .recording_handles
+            .get(&device)
+            .unwrap()
+            .value()
+            .clone();
+        assert!(!Arc::ptr_eq(&finished, &live));
+        assert!(!live.lock().await.is_finished());
+        while samples.receiver_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+        manager.meeting_audio_tap.set_active(true);
+        let mut live_samples = manager.meeting_audio_tap.subscribe();
+        for _ in 0..170 {
+            samples.send(vec![0.25; 320]).unwrap();
+        }
+        let live_frame = tokio::time::timeout(Duration::from_secs(2), live_samples.recv())
+            .await
+            .expect("replacement recorder must deliver live samples")
+            .unwrap();
+        assert!(!live_frame.samples.is_empty());
+        let delivered = tokio::time::timeout(
+            Duration::from_secs(2),
+            manager.recording_receiver.recv_async(),
+        )
+        .await
+        .expect("replacement recorder must consume samples")
+        .unwrap();
+        assert!(!delivered.data.is_empty());
+
+        manager.cleanup_stale_device(&stale[0]).await.unwrap();
+        let current = manager
+            .recording_handles
+            .get(&device)
+            .unwrap()
+            .value()
+            .clone();
+        assert!(Arc::ptr_eq(&live, &current));
+        assert!(!current.lock().await.is_finished());
+        assert!(manager.device_manager.stream(&device).is_some());
+
+        manager.stop_device_recording(&device).await.unwrap();
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn idle_audio_handlers_cancel_and_restart_without_stealing_queued_capture() {
@@ -3038,6 +3136,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ledger_only_meeting_audio_runs_live_stt_without_derived_writes() {
+        let _ledger = crate::transcription::RAW_TRANSCRIPT_LEDGER_TEST_LOCK
+            .lock()
+            .await;
+        use crate::transcription::deepgram::DeepgramTranscriptionConfig;
+        use screenpipe_core::raw_capture_ledger;
+        use vad_rs::VadStatus;
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+        struct SpeechVad;
+        impl VadEngine for SpeechVad {
+            fn is_voice_segment(&mut self, _: &[f32]) -> Result<bool> {
+                Ok(true)
+            }
+            fn audio_type(&mut self, _: &[f32]) -> Result<VadStatus> {
+                Ok(VadStatus::Speech)
+            }
+            fn set_speech_threshold(&mut self, _: Option<f32>) {}
+        }
+
+        struct DisableLedgerOnDrop;
+        impl Drop for DisableLedgerOnDrop {
+            fn drop(&mut self) {
+                raw_capture_ledger::disable();
+            }
+        }
+
+        let ledger = tempfile::tempdir().unwrap();
+        let media = tempfile::tempdir().unwrap();
+        raw_capture_ledger::configure(
+            ledger.path().into(),
+            "test-workspace".into(),
+            "test-device".into(),
+        )
+        .unwrap();
+        let _disable_ledger = DisableLedgerOnDrop;
+        let text = "live ledger-only transcription for me@example.com";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": {"channels": [{"alternatives": [{"transcript": text}]}]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let detector = Arc::new(MeetingDetector::new());
+        let mut manager = AudioManager::new_with_optional_db(
+            AudioManagerOptions {
+                is_disabled: true, // Exercise central handlers without opening physical devices.
+                audio_capture_mode: AudioCaptureMode::MeetingsOnly,
+                transcription_mode: TranscriptionMode::Batch,
+                transcription_engine: Arc::new(AudioTranscriptionEngine::Deepgram),
+                deepgram_config: Some(DeepgramTranscriptionConfig {
+                    endpoint: format!("{}/v1/listen", server.uri()),
+                    auth_token: "test".into(),
+                    auth_header_prefix: "Bearer",
+                }),
+                output_path: Some(media.path().into()),
+                meeting_detector: Some(detector.clone()),
+                use_pii_removal: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        manager.vad_engine = Arc::new(Mutex::new(Box::new(SpeechVad)));
+        manager.set_on_transcription_insert(Arc::new(|_| panic!("unexpected derived insert")));
+        let recordings = manager.start_audio_receiver_handler().await.unwrap();
+        let transcripts = manager
+            .start_transcription_receiver_handler()
+            .await
+            .unwrap();
+        let capture = AudioInput {
+            data: Arc::new((0..16000).map(|n| (n as f32 * 0.1).sin() * 0.1).collect()),
+            sample_rate: SAMPLE_RATE,
+            channels: 1,
+            device: Arc::new(AudioDevice::new(
+                "ledger test mic".into(),
+                DeviceType::Input,
+            )),
+            capture_timestamp: 1_700_000_000,
+        };
+
+        manager
+            .recording_sender
+            .send_async(capture.clone())
+            .await
+            .unwrap();
+        // The first chunk must be processed outside a meeting and dropped.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while manager.metrics.snapshot().chunks_received == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        detector.set_v2_in_meeting(true);
+        manager.recording_sender.send_async(capture).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let spooled = raw_capture_ledger::pending().unwrap().iter().any(|item| {
+                    let bytes = raw_capture_ledger::read(item).unwrap();
+                    let mut lines = bytes.split(|byte| *byte == b'\n');
+                    let header: serde_json::Value =
+                        serde_json::from_slice(lines.next().unwrap()).unwrap();
+                    let entry: serde_json::Value =
+                        serde_json::from_slice(lines.next().unwrap()).unwrap();
+                    header["context"]["device_name"] == "ledger test mic"
+                        && entry["kind"] == "screenpipe.transcript"
+                        && entry["payload"] == text
+                });
+                if spooled {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("live STT must append the transcript even in batch mode and without an uploader");
+        assert!(std::fs::read_dir(media.path()).unwrap().next().is_none());
+        assert_eq!(manager.metrics.snapshot().db_inserted, 0);
+        assert_eq!(manager.metrics.snapshot().segments_deferred, 0);
+        recordings.abort();
+        transcripts.abort();
+    }
+
+    #[tokio::test]
     async fn pending_cloud_audio_recovers_in_both_modes_after_failure_and_restart() {
         let _reconciliation = super::super::reconciliation::RECONCILIATION_TEST_LOCK
             .lock()
@@ -3098,7 +3327,7 @@ mod tests {
 
             // Foreground meetings keep priority even in realtime mode.
             detector.set_v2_in_meeting(true);
-            let worker = manager.start_reconciliation_handler().await;
+            let worker = manager.start_reconciliation_handler(db.clone()).await;
             let cancellation = worker.abort_handle();
             *manager.reconciliation_handle.write().await = Some(worker);
             manager.reconciliation_wakeup.notify_one();
@@ -3146,7 +3375,7 @@ mod tests {
                 })).set_delay(Duration::from_secs(1)))
                 .mount(&server).await;
             // Restart the worker against the same durable pending records.
-            let worker = manager.start_reconciliation_handler().await;
+            let worker = manager.start_reconciliation_handler(db.clone()).await;
             let cancellation = worker.abort_handle();
             *manager.reconciliation_handle.write().await = Some(worker);
             manager.reconciliation_wakeup.notify_one();
@@ -3828,7 +4057,7 @@ mod tests {
     }
 
     /// The VPIO-fallback classifier must fire only on a receive-timeout death —
-    /// not a zero-fill hijack (not VPIO's fault) and not unrelated errors.
+    /// not unrelated errors.
     #[cfg(target_os = "macos")]
     #[test]
     fn vpio_relevant_death_matches_only_receive_timeout() {
@@ -3840,12 +4069,6 @@ mod tests {
         assert!(is_vpio_relevant_stream_death(
             &anyhow!(StreamDeath::ReceiveTimeout { secs: 8 }).context("rebuilding device")
         ));
-        assert!(!is_vpio_relevant_stream_death(&anyhow!(
-            StreamDeath::ZeroFill {
-                device: "Mic (input)".to_string(),
-                secs: 30
-            }
-        )));
         assert!(!is_vpio_relevant_stream_death(&anyhow!(
             "device disconnected"
         )));

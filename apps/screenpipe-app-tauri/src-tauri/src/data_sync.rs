@@ -14,7 +14,7 @@
 mod imp {
     use chrono::{DateTime, Utc};
     use screenpipe_telemetry_wire::{
-        build_jsonl_with_parsed, AudioRow, FrameRow, MemoryRow, ParsedRow, UiEventRow,
+        build_jsonl_with_parsed, AudioRow, FrameRow, MemoryRow, ParsedRow, SnapshotRow, UiEventRow,
     };
     use serde::{Deserialize, Serialize};
     use std::path::PathBuf;
@@ -49,6 +49,8 @@ mod imp {
 
     #[derive(Debug, Clone, Default, Deserialize, Serialize)]
     struct Cursor {
+        #[serde(default)]
+        source_id: Option<String>,
         enabled_at: Option<String>,
         last_frame_ts: Option<String>,
         last_audio_ts: Option<String>,
@@ -69,6 +71,15 @@ mod imp {
     }
 
     impl Cursor {
+        fn select_source(&mut self, source_id: &str, legacy_device_id: &str) {
+            let same_source = self.source_id.as_deref() == Some(source_id)
+                || (self.source_id.is_none() && source_id == legacy_device_id);
+            if !same_source {
+                *self = Self::default();
+            }
+            self.source_id = Some(source_id.to_owned());
+        }
+
         fn load(path: &std::path::Path) -> Self {
             std::fs::read_to_string(path)
                 .ok()
@@ -147,6 +158,9 @@ mod imp {
     }
 
     fn current_config(app: &tauri::AppHandle) -> Option<SyncConfig> {
+        if crate::app_mode::is_managed(app) {
+            return None;
+        }
         let settings = crate::store::SettingsStore::get(app).ok().flatten()?;
         if settings
             .extra
@@ -280,14 +294,7 @@ mod imp {
                 .send()
                 .await
                 .map_err(|error| error.to_string())?;
-            if !response.status().is_success() {
-                return Err(format!("local search returned {}", response.status()));
-            }
-            response
-                .json::<LocalSearchResponse>()
-                .await
-                .map(|body| body.data)
-                .map_err(|error| format!("local search decode failed: {error}"))
+            decode_local_search_response(response, content_type).await
         }
 
         async fn frames(&self, since: &str, offset: u32) -> Result<Vec<FrameRow>, String> {
@@ -414,6 +421,135 @@ mod imp {
                         .collect()
                 })
         }
+
+        /// Fetch one downsized screenshot thumbnail for this sync tick,
+        /// bounded to frames recorded at or after `enabled_at`. Best-effort:
+        /// the caller logs and continues on `Err`.
+        async fn fetch_latest_snapshot(
+            &self,
+            enabled_at: DateTime<Utc>,
+        ) -> Result<Option<SnapshotRow>, String> {
+            // `disableScreenshots` is a hard privacy boundary, not only a
+            // capture hint. Fail closed when settings are unavailable and do
+            // not export old pixels that may still exist in local retention.
+            let settings = crate::store::SettingsStore::get(&self.app).ok().flatten();
+            if !image_uploads_allowed(settings.as_ref()) {
+                return Ok(None);
+            }
+
+            // Step 1: ask /search for the most recent OCR frames at or after
+            // `enabled_at`. We request a small page rather than just limit=1
+            // because the single newest frame is usually still in the
+            // in-progress (unfinalized) video segment, so `/frames/{id}` 404s
+            // for it. Note the omitted `order` param — unlike the page fetches
+            // above (which pin `order=ascending` so bounded backfill cannot
+            // skip backlog), the engine's newest-first default is exactly what
+            // a snapshot wants, while `start_time` keeps pre-consent frames
+            // out of scope.
+            let context = crate::recording::local_api_context_from_app(&self.app);
+            let search_url = snapshot_search_url(&context.url(""), enabled_at);
+            let response = context
+                .apply_auth(self.http.get(&search_url))
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut candidates = decode_local_search_response(response, "ocr")
+                .await?
+                .into_iter()
+                .filter_map(|item| match item {
+                    LocalSearchItem::OCR(row) if row.timestamp >= enabled_at => {
+                        Some((row.frame_id, row.timestamp))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            // Newest first, so we snapshot the freshest frame that decodes.
+            candidates.sort_by(|left, right| right.1.cmp(&left.1));
+
+            for (frame_id, timestamp) in candidates {
+                // Step 2: fetch the frame's image bytes. A non-success status
+                // is expected here — a 404 means the frame is still in the
+                // unfinalized video segment (too fresh) or has expired from
+                // local retention. Skip to the next (older) candidate instead
+                // of failing the tick.
+                // Exact-only is load-bearing: `/frames/{id}` normally falls
+                // back to nearby historical pixels when this frame has no
+                // image. Accessibility-only frames must never inherit those
+                // pixels for upload.
+                let frame_url = snapshot_frame_url(&context.url(""), frame_id);
+                let response = context
+                    .apply_auth(self.http.get(&frame_url))
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if !response.status().is_success() {
+                    continue;
+                }
+                let bytes = match response.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(_) => continue,
+                };
+
+                // Resize + encode off the async runtime so a large frame does
+                // not stall the sync worker.
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    thumbnail_snapshot(frame_id, timestamp.to_rfc3339(), &bytes)
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some(snapshot) = snapshot {
+                    return Ok(Some(snapshot));
+                }
+            }
+
+            // No recent frame was decodable (all still too fresh or expired).
+            // Skip this tick quietly — a later tick will catch a flushed frame.
+            Ok(None)
+        }
+    }
+
+    const SNAPSHOT_CANDIDATES: u32 = 12;
+
+    fn image_uploads_allowed(settings: Option<&crate::store::SettingsStore>) -> bool {
+        settings.is_some_and(|settings| !settings.recording.disable_screenshots)
+    }
+
+    fn snapshot_search_url(api_url_base: &str, enabled_at: DateTime<Utc>) -> String {
+        format!(
+            "{api_url_base}/search?content_type=ocr&limit={SNAPSHOT_CANDIDATES}&start_time={}",
+            urlencoding::encode(&enabled_at.to_rfc3339())
+        )
+    }
+
+    fn snapshot_frame_url(api_url_base: &str, frame_id: i64) -> String {
+        format!("{api_url_base}/frames/{frame_id}?fallback=false")
+    }
+
+    /// Downsize an exact local JPEG into the wire thumbnail: 320×180 JPEG
+    /// Q60 (~30KB after base64). Unlike the enterprise archive
+    /// (`ee_sync::snapshot_from_jpeg`, which preserves full resolution for
+    /// write-only customer storage), the consumer stream embeds images
+    /// inline in the JSONL request body, so the API payload limit dictates
+    /// the image budget.
+    fn thumbnail_snapshot(frame_id: i64, timestamp: String, jpeg: &[u8]) -> Option<SnapshotRow> {
+        use base64::Engine as _;
+        use image::codecs::jpeg::JpegEncoder;
+
+        let image = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg).ok()?;
+        let thumbnail = image.resize(320, 180, image::imageops::FilterType::Triangle);
+        let mut encoded = Vec::new();
+        JpegEncoder::new_with_quality(&mut encoded, 60)
+            .encode_image(&thumbnail)
+            .ok()?;
+        Some(SnapshotRow {
+            frame_id,
+            timestamp,
+            mime: "image/jpeg".into(),
+            image_b64: base64::engine::general_purpose::STANDARD.encode(&encoded),
+            width: thumbnail.width(),
+            height: thumbnail.height(),
+        })
     }
 
     fn nonempty(value: String) -> Option<String> {
@@ -477,6 +613,42 @@ mod imp {
     #[derive(Debug, Deserialize)]
     struct LocalSearchResponse {
         data: Vec<LocalSearchItem>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LocalSearchError {
+        error: Option<String>,
+        code: Option<String>,
+    }
+
+    async fn decode_local_search_response(
+        response: reqwest::Response,
+        stream: &str,
+    ) -> Result<Vec<LocalSearchItem>, String> {
+        let status = response.status();
+        if !status.is_success() {
+            let detail = response.json::<LocalSearchError>().await.ok();
+            let mut fields = Vec::new();
+            if let Some(code) = detail.as_ref().and_then(|body| body.code.as_deref()) {
+                fields.push(format!("code={code}"));
+            }
+            if let Some(error) = detail.as_ref().and_then(|body| body.error.as_deref()) {
+                fields.push(format!("error={error}"));
+            }
+            return Err(if fields.is_empty() {
+                format!("local search {stream} returned {status}")
+            } else {
+                format!(
+                    "local search {stream} returned {status}: {}",
+                    fields.join("; ")
+                )
+            });
+        }
+        response
+            .json::<LocalSearchResponse>()
+            .await
+            .map(|body| body.data)
+            .map_err(|error| format!("local search decode failed: {error}"))
     }
 
     #[derive(Debug, Deserialize)]
@@ -551,6 +723,7 @@ mod imp {
         cursor: &mut Cursor,
         local: &LocalClient,
         http: &reqwest::Client,
+        include_snapshot: bool,
     ) -> Result<bool, String> {
         let Some(server_enabled_at) = server_enabled_at(config, http).await? else {
             cursor.nullify(&config.cursor_path)?;
@@ -558,8 +731,6 @@ mod imp {
             return Ok(false);
         };
         let enabled_at = effective_enabled_at(server_enabled_at, config.device_enabled_at);
-        cursor.clamp_to(Some(enabled_at));
-        cursor.save(&config.cursor_path)?;
 
         let db = app
             .state::<crate::recording::RecordingState>()
@@ -569,16 +740,23 @@ mod imp {
             .as_ref()
             .map(|server| std::sync::Arc::clone(&server.db))
             .ok_or("recording database is not ready")?;
-        db.admit_consumer_sync()
-            .map_err(|error| error.to_string())?;
-        let read = db
-            .storage_read_token()
+        let source_id = db
+            .consumer_sync_source_id(&config.device_id)
             .await
             .map_err(|error| error.to_string())?;
-        let binding = format!(
+        // Recording may append while these pages are fetched. Only deletion or privacy changes may revoke bytes already prepared for upload.
+        let read = db
+            .storage_export_token()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut binding = format!(
             "consumer:{}:{}:{}",
             config.ingest_url, config.account_id, config.device_id
         );
+        if source_id != config.device_id {
+            binding.push(':');
+            binding.push_str(&source_id);
+        }
         if let Some(saved) = db
             .upload_checkpoint(&binding)
             .await
@@ -586,8 +764,10 @@ mod imp {
         {
             *cursor = serde_json::from_str(&saved)
                 .map_err(|error| format!("invalid source checkpoint: {error}"))?;
-            cursor.clamp_to(Some(enabled_at));
         }
+        cursor.select_source(&source_id, &config.device_id);
+        cursor.clamp_to(Some(enabled_at));
+        cursor.save(&config.cursor_path)?;
         let frames = local
             .frames(
                 cursor.last_frame_ts.as_deref().unwrap(),
@@ -624,6 +804,22 @@ mod imp {
                 )
                 .await,
         );
+        // Snapshots ride the first page of each sync tick and are best-effort:
+        // a failed or gated fetch must never fail the page. They are also
+        // deliberately excluded from `may_have_more`, `advance` and the cursor
+        // — a thumbnail has no position in the ordered backlog.
+        let snapshots = if include_snapshot {
+            match local.fetch_latest_snapshot(enabled_at).await {
+                Ok(Some(snapshot)) => vec![snapshot],
+                Ok(None) => Vec::new(),
+                Err(error) => {
+                    warn!("data sync snapshot fetch failed (skipping): {error}");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
 
         let may_have_more = [
             frames.len(),
@@ -635,13 +831,13 @@ mod imp {
         .into_iter()
         .any(|count| count >= PAGE_LIMIT as usize);
         let body = build_jsonl_with_parsed(
-            &config.device_id,
+            &source_id,
             &config.device_label,
             &frames,
             &parsed,
             &audio,
             &ui,
-            &[],
+            &snapshots,
             &memories,
         );
         if body.is_empty() {
@@ -649,6 +845,9 @@ mod imp {
         }
 
         for chunk in split_jsonl(body) {
+            if crate::app_mode::is_managed(app) {
+                return Ok(false);
+            }
             let admission = read
                 .admit(&db.pool)
                 .await
@@ -710,12 +909,13 @@ mod imp {
         .map_err(|error| error.to_string())?;
         cursor.save(&config.cursor_path)?;
         debug!(
-            "data sync uploaded frames={} audio={} ui={} memories={} parsed={}",
+            "data sync uploaded frames={} audio={} ui={} memories={} parsed={} snapshots={}",
             frames.len(),
             audio.len(),
             ui.len(),
             memories.len(),
-            parsed.len()
+            parsed.len(),
+            snapshots.len()
         );
 
         // Re-read consent between pages so disabling the toggle stops a large
@@ -782,6 +982,9 @@ mod imp {
     }
 
     async fn sync_once(app: &tauri::AppHandle, local: &LocalClient, http: &reqwest::Client) {
+        if crate::app_mode::is_managed(app) {
+            return;
+        }
         let Some(config) = current_config(app) else {
             if let Ok(path) = app.path().app_data_dir() {
                 let mut cursor = Cursor::load(&path.join(CURSOR_FILENAME));
@@ -792,12 +995,18 @@ mod imp {
             return;
         };
         let mut cursor = Cursor::load(&config.cursor_path);
+        // One snapshot per sync tick, attached to the first page — a long
+        // catch-up burst must not spam a screenshot per page.
+        let mut include_snapshot = true;
         loop {
             if crate::search_only::is_active() {
                 return;
             }
-            match run_page(app, &config, &mut cursor, local, http).await {
-                Ok(true) => continue,
+            match run_page(app, &config, &mut cursor, local, http, include_snapshot).await {
+                Ok(true) => {
+                    include_snapshot = false;
+                    continue;
+                }
                 Ok(false) => {
                     info!("data sync completed");
                     return;
@@ -831,6 +1040,55 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn database_switch_resets_progress_but_keeps_the_consent_floor() {
+            let floor = DateTime::parse_from_rfc3339("2026-11-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc);
+            let mut cursor = Cursor {
+                source_id: Some("database-a".into()),
+                last_frame_ts: Some("2026-11-06T00:00:00Z".into()),
+                boundary: CursorBoundary {
+                    frames: 42,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            cursor.select_source("database-b", "computer");
+            cursor.clamp_to(Some(floor));
+            assert_eq!(cursor.source_id.as_deref(), Some("database-b"));
+            assert_eq!(
+                cursor.last_frame_ts.as_deref(),
+                Some("2026-11-01T00:00:00+00:00")
+            );
+            assert_eq!(cursor.boundary.frames, 0);
+
+            cursor.last_frame_ts = Some("2026-11-02T00:00:00Z".into());
+            cursor.boundary.frames = 7;
+            let saved = serde_json::to_vec(&cursor).unwrap();
+            let mut reopened: Cursor = serde_json::from_slice(&saved).unwrap();
+            reopened.select_source("database-b", "computer");
+            reopened.clamp_to(Some(floor));
+            assert_eq!(reopened.last_frame_ts, cursor.last_frame_ts);
+            assert_eq!(reopened.boundary.frames, 7);
+        }
+
+        #[test]
+        fn old_cursors_keep_legacy_progress_but_cannot_skip_a_fresh_history() {
+            let saved = r#"{"last_frame_ts":"2026-11-06T00:00:00Z","boundary":{"frames":9,"audio":0,"ui":0,"memories":0,"parsed":0}}"#;
+            let mut legacy: Cursor = serde_json::from_str(saved).unwrap();
+            legacy.select_source("computer", "computer");
+            assert_eq!(
+                legacy.last_frame_ts.as_deref(),
+                Some("2026-11-06T00:00:00Z")
+            );
+            assert_eq!(legacy.boundary.frames, 9);
+            let mut fresh: Cursor = serde_json::from_str(saved).unwrap();
+            fresh.select_source("new-database", "computer");
+            assert!(fresh.last_frame_ts.is_none());
+            assert_eq!(fresh.boundary.frames, 0);
+        }
 
         #[test]
         fn disabled_server_status_has_no_upload_boundary() {
@@ -878,6 +1136,141 @@ mod imp {
             assert_eq!(
                 effective_enabled_at(server_enabled_at, Some(device_enabled_at)),
                 device_enabled_at
+            );
+        }
+
+        #[test]
+        fn snapshots_require_screenshots_and_exact_frames() {
+            // Fail closed: no settings readable means no pixels leave the device.
+            assert!(!image_uploads_allowed(None));
+
+            let mut settings = crate::store::SettingsStore::default();
+            assert!(image_uploads_allowed(Some(&settings)));
+            settings.recording.disable_screenshots = true;
+            assert!(!image_uploads_allowed(Some(&settings)));
+
+            // Consent floor + newest-first default: pre-consent frames must
+            // stay out of scope, and `order` stays omitted so the freshest
+            // candidates come back first.
+            let floor = DateTime::parse_from_rfc3339("2026-11-24T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc);
+            let search = snapshot_search_url("http://localhost:3030", floor);
+            assert_eq!(
+                search,
+                "http://localhost:3030/search?content_type=ocr&limit=12&start_time=2026-11-24T00%3A00%3A00%2B00%3A00"
+            );
+            assert!(!search.contains("order="));
+
+            // Exact-only fetch: accessibility-only frames must never inherit
+            // nearby historical pixels.
+            assert_eq!(
+                snapshot_frame_url("http://localhost:3030", 42),
+                "http://localhost:3030/frames/42?fallback=false"
+            );
+        }
+
+        #[test]
+        fn thumbnail_snapshot_downsizes_to_the_wire_budget() {
+            use base64::Engine as _;
+
+            let source = image::DynamicImage::new_rgb8(1920, 1080);
+            let mut jpeg = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+                .encode_image(&source)
+                .unwrap();
+
+            let snapshot =
+                thumbnail_snapshot(7, "2026-11-24T00:00:00+00:00".to_string(), &jpeg).unwrap();
+            assert_eq!(snapshot.frame_id, 7);
+            assert_eq!(snapshot.timestamp, "2026-11-24T00:00:00+00:00");
+            assert_eq!(snapshot.mime, "image/jpeg");
+            // 16:9 downsizes to exactly the documented 320×180 wire budget.
+            assert_eq!((snapshot.width, snapshot.height), (320, 180));
+            // STANDARD base64, no data: prefix.
+            assert!(!snapshot.image_b64.starts_with("data:"));
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&snapshot.image_b64)
+                .unwrap();
+            let reparsed =
+                image::load_from_memory_with_format(&decoded, image::ImageFormat::Jpeg).unwrap();
+            assert_eq!((reparsed.width(), reparsed.height()), (320, 180));
+
+            // A payload that is not a JPEG must yield None, never a garbage row.
+            assert!(
+                thumbnail_snapshot(7, "2026-11-24T00:00:00+00:00".into(), b"not jpeg").is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn local_search_error_keeps_safe_server_cause_in_support_diagnostics() {
+            use wiremock::{matchers::path, Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(path("/search"))
+                .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                    "error": "frame storage: read revision changed; retry the complete query",
+                    "code": "storage_read_revoked",
+                    "private_content": "private-person@example.com",
+                    "token": "password=hunter2"
+                })))
+                .mount(&server)
+                .await;
+            let response = reqwest::Client::new()
+                .get(format!("{}/search", server.uri()))
+                .send()
+                .await
+                .unwrap();
+            let error = decode_local_search_response(response, "ocr")
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error,
+                "local search ocr returned 503 Service Unavailable: code=storage_read_revoked; error=frame storage: read revision changed; retry the complete query"
+            );
+            assert!(!error.contains("private-person@example.com"));
+            assert!(!error.contains("hunter2"));
+
+            let logs = tempfile::tempdir().unwrap();
+            tokio::fs::write(
+                logs.path().join("screenpipe-app.2026-11-05.1.log"),
+                format!(
+                    "WARN data sync frames fetch skipped: {error}\ncontact=private-person@example.com password=hunter2\n"
+                ),
+            )
+            .await
+            .unwrap();
+            tokio::fs::write(
+                logs.path().join("screenpipe-app.2026-11-06.log"),
+                "INFO recorder restarted\n",
+            )
+            .await
+            .unwrap();
+            let report =
+                crate::diagnostic_logs::collect_redacted_from_dirs(&[logs.path().to_path_buf()])
+                    .await
+                    .unwrap();
+            assert!(report.contains("local search ocr returned 503 Service Unavailable"));
+            assert!(report.contains("code=storage_read_revoked"));
+            assert!(report.contains("frame storage: read revision changed"));
+            assert!(report.contains("recorder restarted"));
+            assert!(!report.contains("private-person@example.com"));
+            assert!(!report.contains("hunter2"));
+
+            Mock::given(path("/malformed"))
+                .respond_with(ResponseTemplate::new(503).set_body_string("not json"))
+                .mount(&server)
+                .await;
+            let malformed = reqwest::Client::new()
+                .get(format!("{}/malformed", server.uri()))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                decode_local_search_response(malformed, "audio")
+                    .await
+                    .unwrap_err(),
+                "local search audio returned 503 Service Unavailable"
             );
         }
 

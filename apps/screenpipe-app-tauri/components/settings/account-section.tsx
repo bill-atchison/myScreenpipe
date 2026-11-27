@@ -5,30 +5,33 @@
 import React, { useEffect, useRef, useState } from "react";
 import type { SettingsField } from "./settings-search";
 
+export const accountSessionSearchIndex: SettingsField[] = [
+  { label: msg("Sign in to Screenpipe", {}), keywords: ["login", "log in", "sign in"] },
+  { label: msg("Logout", {}), keywords: ["signout", "sign out", "log out"] },
+];
+
 /** Settings search index for this section. Co-located with the component so adding a field here means updating one file. See `SettingsField` in `./settings-search` for the schema. */
 export const searchIndex: SettingsField[] = [
   // Mirrors the labels actually rendered by AccountSection below. Keep in sync
   // when you add/remove a control — phantom entries route users to a page that
   // doesn't contain the field.
-  { label: msg("Sign in to Screenpipe", {}), keywords: ["login", "log in", "sign in"] },
-  { label: msg("Logout", {}), keywords: ["signout", "sign out", "log out"] },
+  ...accountSessionSearchIndex,
   { label: msg("Screenpipe Business", {}), keywords: ["subscription", "billing", "plan", "pro", "business", "max", "ultra", "upgrade", "manage"] },
   { label: msg("Data sync", {}), keywords: ["allow data sync", "sync this device", "cloud", "account", "upload"] },
   { label: msg("AI connections", {}), keywords: ["codex", "claude", "connect"] },
   { label: msg("Device name", {}), keywords: ["data sync", "hostname", "computer"] },
-  { label: msg("Sync scheduled tasks across devices", {}), keywords: ["scheduled sync", "pipe sync", "sync"] },
-  { label: msg("Memories sync across devices", {}), keywords: ["memories sync", "sync", "facts"] },
-  { label: msg("Connection sync across devices", {}), keywords: ["connection sync", "sync", "slack", "notion"] },
+  { label: msg("Tasks and memories", {}), keywords: ["scheduled sync", "pipe sync", "memories sync", "facts"] },
+  { label: msg("Connected accounts", {}), keywords: ["connection sync", "sync", "slack", "notion"] },
   { label: msg("Restart remote sync", {}), keywords: ["reset sync", "older key", "new device", "decryption"] },
 ];
-import { AccountDataSyncCard } from "./account-data-sync-card";
+import { SwitchToPersonalAccount } from "@/components/switch-to-personal-account";
+import { AccountDataSyncCard, SyncPreferenceRow } from "./account-data-sync-card";
 import { Button } from "@/components/ui/button";
 import { useSettings } from "@/lib/hooks/use-settings";
 import {
   UserCog,
   ExternalLinkIcon,
   Sparkles,
-  RefreshCw,
   Lock,
   ShieldCheck,
 } from "lucide-react";
@@ -45,7 +48,7 @@ import {
 import { useManagedPolicy } from "@/lib/hooks/use-managed-policy";
 import { Card } from "../ui/card";
 import { Input } from "@/components/ui/input";
-import { Switch } from "@/components/ui/switch";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { syncFetchOrThrow } from "@/lib/sync-fetch";
@@ -141,14 +144,112 @@ function syncErrorDescription(e: unknown): string {
   return msg;
 }
 
+function AccountSessionHeader({ sessionOnly = false }: { sessionOnly?: boolean }) {
+  const ui = useGT();
+  const { settings, updateSettings } = useSettings();
+  const { isManagedDeployment, isManagedAuthenticated } = useManagedPolicy();
+
+  return (
+    <div className="flex items-center justify-between">
+      <p className="text-sm text-muted-foreground" data-testid="account-login-status">
+        {settings.user?.token
+          ? ui("Logged in as {value1}", { value1: settings.user.email })
+          : isManagedDeployment
+            ? isManagedAuthenticated
+              ? ui("Enterprise device access active")
+              : ui("Enterprise access verification required")
+            : ui("Not logged in")}
+      </p>
+      <div className="flex gap-2">
+        {settings.user?.token ? (
+          <>
+            {!sessionOnly && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => openExternalUrl(ACCOUNT_URL)}
+              >
+                <UserCog className="w-4 h-4 mr-1.5" />
+                Web account
+              </Button>
+            )}
+            <Button
+              variant="outline"
+              size="sm"
+              data-testid="account-logout-button"
+              onClick={async () => {
+                await updateSettings({ user: null as any });
+                try {
+                  await commands.setCloudToken(null);
+                } catch (error) {
+                  console.warn("failed to clear cloud token on logout:", error);
+                }
+                // Restart Pi without the signed-out account's token.
+                try {
+                  await commands.piUpdateConfig(null, null);
+                } catch {}
+                toast({ title: ui("Logged out") });
+              }}
+            >
+              {ui("Logout")}
+            </Button>
+          </>
+        ) : (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => commands.openLoginWindow(null, null)}
+          >
+            Login <ExternalLinkIcon className="w-3.5 h-3.5 ml-1.5" />
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ManagedWorkspaceAccountCard() {
+  const ui = useGT();
+  const { isManagedAuthenticated, policy } = useManagedPolicy();
+
+  return (
+    <Card className="p-5" data-testid="account-enterprise-managed-card">
+      <div className="flex items-center gap-2">
+        <ShieldCheck className="h-5 w-5 text-primary" />
+        <h3 className="text-lg font-semibold">Screenpipe Enterprise</h3>
+        <span className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full font-medium">
+          {isManagedAuthenticated ? ui("Active") : ui("Verification required")}
+        </span>
+      </div>
+      <p className="text-sm text-muted-foreground mt-2">
+        {policy.orgName
+          ? ui("{value1} manages this deployment and its recording policy.", { value1: policy.orgName })
+          : ui("Your organization manages this deployment and its recording policy.")}
+      </p>
+      <p className="text-xs text-muted-foreground mt-3">
+        {isManagedAuthenticated
+          ? ui("Enterprise access has been verified for this session.")
+          : ui("Verify the enterprise key or sign in with an authorized organization account to enable recording.")}
+      </p>
+      <div className="mt-3 empty:hidden"><SwitchToPersonalAccount /></div>
+    </Card>
+  );
+}
+
+export function ManagedAccountSessionSection() {
+  return (
+    <div className="space-y-6">
+      <AccountSessionHeader sessionOnly />
+      <ManagedWorkspaceAccountCard />
+    </div>
+  );
+}
+
 export function AccountSection() {
   const uiLocale = useUiLocale();
   const ui = useGT();
   const { settings, updateSettings, loadUser } = useSettings();
   const { isServerDown } = useHealthCheck();
-  const [pipeSyncing, setPipeSyncing] = useState(false);
-  const [memoriesSyncing, setMemoriesSyncing] = useState(false);
-  const [connectionsSyncing, setConnectionsSyncing] = useState(false);
   const [showSyncKeyRecovery, setShowSyncKeyRecovery] = useState(false);
   const [checkoutBusy, setCheckoutBusy] = useState(false);
   const [dataSyncSaving, setDataSyncSaving] = useState(false);
@@ -607,7 +708,7 @@ export function AccountSection() {
   // Consumer build collapses org/license-derived team/enterprise → "Business";
   // only the enterprise build shows the real org label. Mirrors plan_display_name
   // in src-tauri/src/tray.rs.
-  const { isManagedDeployment, isManagedAuthenticated, policy } = useManagedPolicy();
+  const { isManagedDeployment } = useManagedPolicy();
 
   const reportSyncFailure = (error: unknown) => {
     if (isLegacySyncKeyMismatch(error)) {
@@ -620,87 +721,40 @@ export function AccountSection() {
     });
   };
 
+  const showPreferenceSync = !isManagedDeployment && isSignedInBusinessSubscriber;
+  const showHistorySync = canUseDataSync(appUser);
+  const tasksEnabled = !!settings.pipeSyncEnabled;
+  const memoriesEnabled = !!settings.memoriesSyncEnabled;
+
+  const updateSyncPreferences = async (updates: Partial<Pick<typeof settings,
+    "pipeSyncEnabled" | "memoriesSyncEnabled" | "connectionsSyncEnabled"
+  >>) => {
+    try {
+      await updateSettings(updates);
+    } catch (error) {
+      reportSyncFailure(error);
+    }
+  };
+
+  const syncPreferenceNow = async (category: "pipes" | "memories" | "connections", title: string) => {
+    try {
+      await syncFetchOrThrow(`/sync/${category}/pull`, { method: "POST" });
+      await syncFetchOrThrow(`/sync/${category}/push`, { method: "POST" });
+      toast({ title });
+    } catch (error) {
+      reportSyncFailure(error);
+    }
+  };
+
   return (
     <div className="space-y-6">
-      {/* Header + login status */}
-      <div className="flex items-center justify-between">
-        <p className="text-sm text-muted-foreground" data-testid="account-login-status">
-          {settings.user?.token
-            ? ui("Logged in as {value1}", { value1: settings.user.email })
-            : isManagedDeployment
-              ? isManagedAuthenticated
-                ? ui("Enterprise device access active")
-                : ui("Enterprise access verification required")
-              : ui("Not logged in")}
-        </p>
-        <div className="flex gap-2">
-          {settings.user?.token ? (
-            <>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => openExternalUrl(ACCOUNT_URL)}
-              >
-                <UserCog className="w-4 h-4 mr-1.5" />
-                Web account
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                data-testid="account-logout-button"
-                onClick={async () => {
-                  await updateSettings({ user: null as any });
-                  try {
-                    await commands.setCloudToken(null);
-                  } catch (e) {
-                    console.warn("failed to clear cloud token on logout:", e);
-                  }
-                  // Restart Pi with null token so it stops using the old
-                  // account's quota. Next message will auto-start as anonymous.
-                  try {
-                    await commands.piUpdateConfig(null, null);
-                  } catch {}
-                  toast({ title: ui("Logged out") });
-                }}
-              >
-                Logout
-              </Button>
-            </>
-          ) : (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => commands.openLoginWindow(null, null)}
-            >
-              Login <ExternalLinkIcon className="w-3.5 h-3.5 ml-1.5" />
-            </Button>
-          )}
-        </div>
-      </div>
+      <AccountSessionHeader />
 
       {/* Subscribed view — requires a session token, not just cloud_subscribed,
           so a token-hydration failure can't render this "active" card under a
           "not logged in" header (see isSignedInCloudSubscriber). */}
       {isManagedDeployment ? (
-        <Card className="p-5" data-testid="account-enterprise-managed-card">
-          <div className="flex items-center gap-2">
-            <ShieldCheck className="h-5 w-5 text-primary" />
-            <h3 className="text-lg font-semibold">Screenpipe Enterprise</h3>
-            <span className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full font-medium">
-              {isManagedAuthenticated ? ui("Active") : ui("Verification required")}
-            </span>
-          </div>
-          <p className="text-sm text-muted-foreground mt-2">
-            {policy.orgName
-              ? ui("{value1} manages this deployment and its recording policy.", { value1: policy.orgName })
-              : ui("Your organization manages this deployment and its recording policy.")}
-          </p>
-          <p className="text-xs text-muted-foreground mt-3">
-            {isManagedAuthenticated
-              ? ui("Enterprise access has been verified for this session.")
-              : ui("Verify the enterprise key or sign in with an authorized organization account to enable recording.")}
-          </p>
-        </Card>
+        <ManagedWorkspaceAccountCard />
       ) : isSignedInBusinessSubscriber ? (
         <>
           <Card className="p-5" data-testid="account-cloud-active-card">
@@ -745,195 +799,7 @@ export function AccountSection() {
             />
           </div>
 
-          {/* Pipe sync */}
-          <div className="mt-4 pt-4 border-t border-border/50">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm font-medium">Sync scheduled tasks across devices</p>
-                <p className="text-xs text-muted-foreground">
-                  Sync your scheduled tasks & configs to all devices linked to your account
-                </p>
-              </div>
-              <div className="flex items-center gap-3">
-                <div className="flex items-center gap-1.5">
-                  <Switch
-                    id="pipe-sync-toggle"
-                    checked={!!settings.pipeSyncEnabled}
-                    onCheckedChange={async (checked) => {
-                      await updateSettings({ pipeSyncEnabled: checked });
-                      toast({
-                        title: checked ? ui("Scheduled task sync enabled") : ui("Scheduled task sync disabled"),
-                        description: checked
-                          ? ui("Scheduled tasks will sync across your devices")
-                          : ui("Scheduled tasks will no longer sync"),
-                      });
-                    }}
-                  />
-                  <Label htmlFor="pipe-sync-toggle" className="text-xs text-muted-foreground cursor-pointer sr-only">
-                    Sync
-                  </Label>
-                </div>
-                {settings.pipeSyncEnabled && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="text-xs normal-case tracking-wide"
-                    title={
-                      isServerDown
-                        ? ui("Screenpipe server is starting up — try again in a moment")
-                        : undefined
-                    }
-                    disabled={pipeSyncing || isServerDown}
-                    onClick={async () => {
-                      setPipeSyncing(true);
-                      try {
-                        await syncFetchOrThrow("/sync/pipes/pull", { method: "POST" });
-                        await syncFetchOrThrow("/sync/pipes/push", { method: "POST" });
-                        toast({ title: ui("Scheduled tasks synced") });
-                      } catch (e) {
-                        reportSyncFailure(e);
-                      } finally {
-                        setPipeSyncing(false);
-                      }
-                    }}
-                  >
-                    <RefreshCw className={`h-3 w-3 mr-1 ${pipeSyncing ? "animate-spin" : ""}`} />
-                    Sync now
-                  </Button>
-                )}
-              </div>
-            </div>
-          </div>
-
-          {/* Memories sync — independent toggle. A user might keep pipes
-              device-local but want their memories everywhere, or vice versa. */}
-          <div className="mt-4 pt-4 border-t border-border/50">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm font-medium">Memories sync across devices</p>
-                <p className="text-xs text-muted-foreground">
-                  Sync your memories (facts, preferences, decisions) across devices
-                </p>
-              </div>
-              <div className="flex items-center gap-3">
-                <div className="flex items-center gap-1.5">
-                  <Switch
-                    id="memories-sync-toggle"
-                    checked={!!settings.memoriesSyncEnabled}
-                    onCheckedChange={async (checked) => {
-                      await updateSettings({ memoriesSyncEnabled: checked });
-                      toast({
-                        title: checked ? ui("Memories sync enabled") : ui("Memories sync disabled"),
-                        description: checked
-                          ? ui("Memories will sync across your devices")
-                          : ui("Memories will no longer sync"),
-                      });
-                    }}
-                  />
-                  <Label htmlFor="memories-sync-toggle" className="text-xs text-muted-foreground cursor-pointer sr-only">
-                    Sync
-                  </Label>
-                </div>
-                {settings.memoriesSyncEnabled && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="text-xs normal-case tracking-wide"
-                    title={
-                      isServerDown
-                        ? ui("Screenpipe server is starting up — try again in a moment")
-                        : undefined
-                    }
-                    disabled={memoriesSyncing || isServerDown}
-                    onClick={async () => {
-                      setMemoriesSyncing(true);
-                      try {
-                        await syncFetchOrThrow("/sync/memories/pull", { method: "POST" });
-                        await syncFetchOrThrow("/sync/memories/push", { method: "POST" });
-                        toast({ title: ui("Memories synced") });
-                      } catch (e) {
-                        reportSyncFailure(e);
-                      } finally {
-                        setMemoriesSyncing(false);
-                      }
-                    }}
-                  >
-                    <RefreshCw className={`h-3 w-3 mr-1 ${memoriesSyncing ? "animate-spin" : ""}`} />
-                    Sync now
-                  </Button>
-                )}
-              </div>
-            </div>
-          </div>
-
-          {/* Connection sync — independent toggle. Off by default and kept
-              separate from pipes/memories on purpose: this syncs connected-
-              account credentials (OAuth tokens, API keys), so enabling it is a
-              distinct, informed choice. Credentials are end-to-end encrypted in
-              the sync blob; the server never sees them in plaintext. */}
-          <div className="mt-4 pt-4 border-t border-border/50">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm font-medium">Connection sync across devices</p>
-                <p className="text-xs text-muted-foreground">
-                  Sync connected accounts (slack, notion…) to your devices — credentials are end-to-end encrypted
-                </p>
-              </div>
-              <div className="flex items-center gap-3">
-                <div className="flex items-center gap-1.5">
-                  <Switch
-                    id="connections-sync-toggle"
-                    checked={!!settings.connectionsSyncEnabled}
-                    onCheckedChange={async (checked) => {
-                      await updateSettings({ connectionsSyncEnabled: checked });
-                      toast({
-                        title: checked ? ui("Connection sync enabled") : ui("Connection sync disabled"),
-                        description: checked
-                          ? ui("Connected accounts will sync across your devices")
-                          : ui("Connected accounts will no longer sync"),
-                      });
-                    }}
-                  />
-                  <Label htmlFor="connections-sync-toggle" className="text-xs text-muted-foreground cursor-pointer sr-only">
-                    Sync
-                  </Label>
-                </div>
-                {settings.connectionsSyncEnabled && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="text-xs normal-case tracking-wide"
-                    title={
-                      isServerDown
-                        ? ui("Screenpipe server is starting up — try again in a moment")
-                        : undefined
-                    }
-                    disabled={connectionsSyncing || isServerDown}
-                    onClick={async () => {
-                      setConnectionsSyncing(true);
-                      try {
-                        await syncFetchOrThrow("/sync/connections/pull", { method: "POST" });
-                        await syncFetchOrThrow("/sync/connections/push", { method: "POST" });
-                        toast({ title: ui("Connections synced") });
-                      } catch (e) {
-                        reportSyncFailure(e);
-                      } finally {
-                        setConnectionsSyncing(false);
-                      }
-                    }}
-                  >
-                    <RefreshCw className={`h-3 w-3 mr-1 ${connectionsSyncing ? "animate-spin" : ""}`} />
-                    Sync now
-                  </Button>
-                )}
-              </div>
-            </div>
-          </div>
           </Card>
-          <SyncKeyRecovery
-            visible={showSyncKeyRecovery}
-            onRecovered={() => setShowSyncKeyRecovery(false)}
-          />
           {hasExpiringProfilePlan && (
             <div ref={upgradeCardRef}>
               <BusinessUpgradeCard
@@ -977,27 +843,6 @@ export function AccountSection() {
             />
           </div>
 
-          {/* Locked pipe sync toggle — not logged in */}
-          <Card className="p-4 opacity-75">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm font-medium">Sync scheduled tasks across devices</p>
-                <p className="text-xs text-muted-foreground">
-                  Sync your scheduled tasks & configs to all devices linked to your account
-                </p>
-              </div>
-              <div className="flex items-center gap-2">
-                <Switch disabled checked={false} />
-                <button
-                  onClick={() => focusUpgradeCard("locked-pipe-sync")}
-                  className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full font-medium flex items-center gap-1 hover:bg-primary/20 transition-colors cursor-pointer"
-                >
-                  <Lock className="h-3 w-3" />
-                  Business
-                </button>
-              </div>
-            </div>
-          </Card>
         </>
       ) : (
         /* Logged in, no cloud (Basic plan or free): show active plan + Business upsell */
@@ -1017,7 +862,7 @@ export function AccountSection() {
               <p className="text-sm text-muted-foreground mt-2">
                 {isLifetimePlan
                   ? ui("One-time purchase. Local capture, search & timeline are included.")
-                  : ui("Local capture, search & timeline. Add cloud sync, cloud AI & 50+ integrations with Business below.")}
+                  : ui("Local capture, search & timeline. Add cross-device sync, frontier AI models & higher limits with Business below.")}
               </p>
 
               <div className="mt-4">
@@ -1070,28 +915,6 @@ export function AccountSection() {
             />
           </div>
 
-          {/* Locked pipe sync toggle — gated to Business (cloud) */}
-          <Card className="p-4 opacity-75">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm font-medium">Sync scheduled tasks across devices</p>
-                <p className="text-xs text-muted-foreground">
-                  Sync your scheduled tasks & configs to all devices linked to your account
-                </p>
-              </div>
-              <div className="flex items-center gap-2">
-                <Switch disabled checked={false} />
-                <button
-                  onClick={() => focusUpgradeCard("locked-pipe-sync")}
-                  className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full font-medium flex items-center gap-1 hover:bg-primary/20 transition-colors cursor-pointer"
-                >
-                  <Lock className="h-3 w-3" />
-                  Business
-                </button>
-              </div>
-            </div>
-          </Card>
-
           {/* Free-tier note — only for true free (no plan); named plans show the active card above */}
           {!hasNamedPlan && (
             <div className="px-3 py-2 rounded-lg border border-border/50">
@@ -1105,26 +928,124 @@ export function AccountSection() {
         </>
       )}
 
-      {canUseDataSync(appUser) && (
+      {(showPreferenceSync || showHistorySync) && (
         <AccountDataSyncCard
-          enabled={settings.dataSyncEnabled ?? false}
-          saving={dataSyncSaving}
-          error={dataSyncError}
-          onRetry={() => void setDataSyncEnabled(!settings.dataSyncEnabled)}
-          onEnabledChange={setDataSyncEnabled}
-          deviceName={settings.dataSyncDeviceName ?? ""}
-          onDeviceNameChange={(name) => void updateSettings({ dataSyncDeviceName: name })}
-          devices={syncedDevices}
-          devicesLoading={devicesLoading}
-          devicesError={devicesError}
-          onRetryDevices={() => setDevicesRevision((value) => value + 1)}
-          locale={uiLocale}
-          onOpenExternal={openExternalUrl}
-          onConfigureClient={async (client) => {
-            const { installCloudMcp } = await import("@/lib/ai-tools-mcp");
-            await installCloudMcp(client);
-          }}
-        />
+          history={showHistorySync ? {
+            enabled: settings.dataSyncEnabled ?? false,
+            saving: dataSyncSaving,
+            error: dataSyncError,
+            onRetry: () => void setDataSyncEnabled(!settings.dataSyncEnabled),
+            onEnabledChange: setDataSyncEnabled,
+            deviceName: settings.dataSyncDeviceName ?? "",
+            onDeviceNameChange: (name) => void updateSettings({ dataSyncDeviceName: name }),
+            devices: syncedDevices,
+            devicesLoading,
+            devicesError,
+            onRetryDevices: () => setDevicesRevision((value) => value + 1),
+            locale: uiLocale,
+            onOpenExternal: openExternalUrl,
+            onConfigureClient: async (client) => {
+              const { installCloudMcp } = await import("@/lib/ai-tools-mcp");
+              await installCloudMcp(client);
+            },
+          } : undefined}
+        >
+          {showPreferenceSync && (
+            <>
+              <div className="space-y-2 border-t pt-4">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <Label htmlFor="tasks-memories-sync" className="font-sans">
+                      {ui("Tasks and memories")}
+                    </Label>
+                    <p id="tasks-memories-sync-description" className="text-xs text-muted-foreground">
+                      {ui("Sync scheduled tasks, saved facts, preferences, and decisions across devices.")}
+                    </p>
+                  </div>
+                  <Checkbox
+                    id="tasks-memories-sync"
+                    className="mr-3 mt-1"
+                    aria-describedby="tasks-memories-sync-description"
+                    checked={tasksEnabled === memoriesEnabled ? tasksEnabled : "indeterminate"}
+                    onCheckedChange={(checked) => {
+                      const enabled = checked === true;
+                      void updateSyncPreferences({
+                        pipeSyncEnabled: enabled,
+                        memoriesSyncEnabled: enabled,
+                      });
+                    }}
+                  />
+                </div>
+                <details className="text-xs">
+                  <summary className="w-fit cursor-pointer text-muted-foreground">
+                    {ui("Manage tasks and memories separately")}
+                  </summary>
+                  <div className="mt-3 space-y-3 border-l pl-3">
+                    <SyncPreferenceRow
+                      id="pipe-sync-toggle"
+                      label={ui("Scheduled tasks")}
+                      enabled={tasksEnabled}
+                      onEnabledChange={(checked) => updateSyncPreferences({ pipeSyncEnabled: checked })}
+                      onSync={() => syncPreferenceNow("pipes", ui("Scheduled tasks synced"))}
+                      isServerDown={isServerDown}
+                    />
+                    <SyncPreferenceRow
+                      id="memories-sync-toggle"
+                      label={ui("Memories")}
+                      enabled={memoriesEnabled}
+                      onEnabledChange={(checked) => updateSyncPreferences({ memoriesSyncEnabled: checked })}
+                      onSync={() => syncPreferenceNow("memories", ui("Memories synced"))}
+                      isServerDown={isServerDown}
+                    />
+                  </div>
+                </details>
+              </div>
+              <div className="border-t pt-4">
+                <SyncPreferenceRow
+                  id="connections-sync-toggle"
+                  label={ui("Connected accounts")}
+                  description={ui("Sync accounts like Slack and Notion across devices. Credentials are end-to-end encrypted.")}
+                  enabled={!!settings.connectionsSyncEnabled}
+                  onEnabledChange={(checked) => updateSyncPreferences({ connectionsSyncEnabled: checked })}
+                  onSync={() => syncPreferenceNow("connections", ui("Connections synced"))}
+                  isServerDown={isServerDown}
+                />
+              </div>
+              <SyncKeyRecovery
+                visible={showSyncKeyRecovery}
+                onRecovered={() => setShowSyncKeyRecovery(false)}
+              />
+            </>
+          )}
+        </AccountDataSyncCard>
+      )}
+      {!isManagedDeployment && !showPreferenceSync && !showHistorySync && (
+        <Card className="p-4" data-testid="account-data-sync-locked">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <p className="text-sm font-medium">{ui("Data sync")}</p>
+              <p className="text-xs text-muted-foreground">
+                {ui("Sync device history, scheduled tasks, memories, and connected accounts across devices.")}
+              </p>
+            </div>
+            <button
+              type="button"
+              aria-label={ui("Explore Business for data sync")}
+              data-testid="locked-data-sync-upgrade-button"
+              onClick={() => {
+                posthog.capture("desktop_upgrade_entry_clicked", {
+                  source: "locked-data-sync",
+                  target_plan: "business",
+                });
+                focusUpgradeCard("locked-data-sync");
+              }}
+              className="flex shrink-0 items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary transition-colors hover:bg-primary/20"
+            >
+              <Lock className="h-3 w-3" aria-hidden="true" />
+              {ui("Business")}
+            </button>
+          </div>
+        </Card>
       )}
     </div>
   );

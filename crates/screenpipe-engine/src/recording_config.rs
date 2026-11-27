@@ -39,6 +39,7 @@ pub struct RecordingConfig {
     /// capture alive. This skips visual-diff images, full screenshot capture,
     /// JPEG writes, and OCR fallback.
     pub disable_screenshots: bool,
+    pub focused_window_screenshots: bool,
     /// Opt in to the bounded semantic projection worker. False preserves the
     /// historical capture and database behavior.
     pub enable_semantic_context: bool,
@@ -56,6 +57,8 @@ pub struct RecordingConfig {
     /// overwrites the source columns with the redacted text. Off by
     /// default.
     pub async_pii_redaction: bool,
+    /// Gate reads and sync on AI completion. False keeps background redaction.
+    pub require_pii_completion: bool,
     /// Secrets-only scrub of coding-agent (pi) session logs at rest: a
     /// background worker strips credentials from `pi/sessions/*.jsonl`
     /// (idle files only). On-device regex, no model. Off by default;
@@ -172,6 +175,10 @@ pub struct RecordingConfig {
     /// Max width (px) of the macOS screen capture that OCR reads. 0 = native,
     /// otherwise at least `MIN_CAPTURE_MAX_WIDTH`.
     pub capture_max_width: u32,
+    /// Native screenshot acquisition rate; does not change HD video pacing.
+    pub screenshot_frame_rate: u32,
+    /// Managed opt-in to best-effort window masking on regular screenshots.
+    pub streaming_mode: bool,
 
     // Misc
     pub use_chinese_mirror: bool,
@@ -306,12 +313,14 @@ impl RecordingConfig {
                 || settings.audio_capture_mode.eq_ignore_ascii_case("disabled"),
             disable_vision: settings.disable_vision,
             disable_screenshots: settings.disable_screenshots,
+            focused_window_screenshots: settings.focused_window_screenshots,
             enable_semantic_context: settings.enable_semantic_context,
             semantic_context_mode: settings.semantic_context_mode,
             enable_semantic_search: settings.enable_semantic_search,
             disable_timeline: settings.timeline_cache_disabled(),
             use_pii_removal: settings.use_pii_removal,
             async_pii_redaction: settings.async_pii_redaction,
+            require_pii_completion: settings.require_pii_completion,
             redact_agent_session_secrets: settings.redact_agent_session_secrets,
             async_image_pii_redaction: settings.async_image_pii_redaction,
             pii_backend: settings.pii_backend.clone(),
@@ -397,6 +406,8 @@ impl RecordingConfig {
             openai_compatible_raw_audio: settings.openai_compatible_raw_audio,
             user_name: settings.user_name.clone(),
             video_quality: settings.video_quality.clone(),
+            screenshot_frame_rate: settings.screenshot_frame_rate,
+            streaming_mode: false,
             capture_max_width: match settings.capture_max_width {
                 0 => 0,
                 width => width.max(MIN_CAPTURE_MAX_WIDTH),
@@ -569,7 +580,10 @@ impl RecordingConfig {
             languages: self.languages.clone(),
             video_quality: self.video_quality.clone(),
             capture_max_width: self.capture_max_width,
+            screenshot_frame_rate: self.screenshot_frame_rate,
+            streaming_mode: self.streaming_mode,
             disable_screenshots: self.disable_screenshots,
+            focused_window_screenshots: self.focused_window_screenshots,
             enable_semantic_context: self.enable_semantic_context,
             semantic_context_mode: self.semantic_context_mode,
             idle_capture_interval_ms: self.idle_capture_interval_ms,
@@ -875,6 +889,7 @@ mod tests {
             use_all_monitors: false,
             video_quality: "high".to_string(),
             capture_max_width: 2560,
+            screenshot_frame_rate: 30,
             idle_capture_interval_ms: Some(2_000),
             visual_check_interval_ms: Some(350),
             visual_change_threshold: Some(0.18),
@@ -904,13 +919,34 @@ mod tests {
         assert!(vision.pause_on_drm_content);
         assert_eq!(vision.video_quality, "high");
         assert_eq!(vision.capture_max_width, 2560);
+        assert_eq!(vision.screenshot_frame_rate, 30);
+        assert_eq!(
+            config.hd_recording_interval_ms,
+            settings.hd_recording_interval_ms
+        );
         assert!(!vision.disable_screenshots);
+        assert!(!vision.focused_window_screenshots);
         assert_eq!(vision.idle_capture_interval_ms, Some(2_000));
         assert_eq!(vision.visual_check_interval_ms, Some(350));
         assert_eq!(vision.visual_change_threshold, Some(0.18));
         assert_eq!(vision.min_capture_interval_ms, Some(120));
         assert_eq!(vision.capture_on_keystroke, Some(true));
         assert_eq!(vision.capture_on_clipboard, Some(true));
+    }
+
+    #[test]
+    fn focused_window_screenshots_reach_vision_config() {
+        let settings = screenpipe_config::RecordingSettings {
+            focused_window_screenshots: true,
+            ..Default::default()
+        };
+        let config = build(&settings);
+        assert!(config.focused_window_screenshots);
+        let vision = config.to_vision_manager_config(
+            "capture-output".into(),
+            std::sync::Arc::new(PipelineMetrics::new()),
+        );
+        assert!(vision.focused_window_screenshots);
     }
 
     /// OCR reads the captured frame, so no storage preset may shrink the

@@ -103,6 +103,20 @@ it("shows saved definitions and execution context on the read-only document", ()
   expect(screen.getByRole("button", { name: "Customer" })).toBeVisible();
   expect(screen.queryByRole("button", { name: "Add input" })).toBeNull();
 });
+it("opens a read-only desktop variable in Details and returns to its source step", () => {
+  const workflow = source();
+  workflow.stages[0].description = "Review [Customer](#workflow-io-customer).";
+  workflow.stages[1].id = "source-step";
+  workflow.variables = [{ ...variable, examples: [{ stepId: "source-step", field: "description", value: "Acme" }] }];
+  render(<WorkflowDocument workflow={workflow} readingModes sharing={{ people: [], agents: [] }} />);
+  expect(screen.queryByRole("button", { name: "Map", exact: true })).toBeNull();
+  fireEvent.click(screen.getByRole("link", { name: "Customer" }));
+  expect(screen.getByRole("dialog", { name: "Workflow details" })).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Add input" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Source step · Instructions" }));
+  expect(screen.queryByRole("dialog")).toBeNull();
+  expect(screen.getByText("Step 2 of 3")).toBeVisible();
+});
 it("restores through the revision-checked save path and retains typing made while restore is pending", async () => {
   const workflow = source();
   const old = structuredClone(workflow); old.title = "Earlier title";
@@ -143,13 +157,17 @@ it("filters local archive and review state without losing the underlying workflo
   const workflows=[{...source(),title:"Archived research",archived:true},{...source(),title:"Active research",reviewStatus:"needs-edits" as const}];
   render(<WorkflowsView documentFilters workflows={workflows} knownWorkflowCount={2} query="" setQuery={vi.fn()} openWorkflow={open} analyze={vi.fn()} analyzing={false} error="" activityState={{cycleId:"",items:[],unavailable:false}}/>);
   expect(screen.queryByRole("heading",{name:"Archived research"})).toBeNull();
-  fireEvent.click(screen.getByRole("button",{name:"Open map"}));expect(open).toHaveBeenCalledWith(1);
-  fireEvent.change(screen.getByRole("combobox",{name:"Workflow status"}),{target:{value:"archived"}});
+  fireEvent.click(screen.getByRole("button",{name:/Active research/}));expect(open).toHaveBeenCalledWith(1);
+  fireEvent.click(screen.getByRole("button",{name:"Filter workflows"}));
+  fireEvent.click(screen.getByRole("checkbox",{name:"Show archived"}));
   expect(screen.getByRole("heading",{name:"Archived research"})).toBeVisible();
   expect(screen.queryByRole("heading",{name:"Active research"})).toBeNull();
-  fireEvent.change(screen.getByRole("combobox",{name:"Workflow status"}),{target:{value:"reviewed"}});
-  fireEvent.click(screen.getByRole("button",{name:"Clear filters"}));
+  fireEvent.click(screen.getByRole("button",{name:"Filter workflows"}));
+  fireEvent.click(screen.getByRole("option",{name:/Unreviewed/}));
+  expect(screen.queryByRole("heading",{name:"Active research"})).toBeNull();
+  fireEvent.click(screen.getByRole("button",{name:"Reset",exact:true}));
   expect(screen.getByRole("heading",{name:"Active research"})).toBeVisible();
+  expect(screen.queryByRole("heading",{name:"Archived research"})).toBeNull();
 });
 
 it("opens secondary tools by keyboard and restores focus without changing the draft", () => {

@@ -11,6 +11,7 @@ import { setupOpenBlas } from './setup_openblas.js'
 import { stageMlxBundleResources } from './macos_bundle_sidecars.js'
 import { downloadFile, find7z } from './find_tools.js'
 import { ensureCachedDirectory, ensureCachedFile } from './native_dependency_cache.js'
+import { copyFileIfChanged } from './content_copy.js'
 
 if (process.env.SCREENPIPE_NATIVE_PREBUILD_COMPLETE === '1') {
 	console.log('native prebuild already completed by the system build queue')
@@ -77,10 +78,7 @@ const config = {
 		ffmpegUrl: 'https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz',
 	},
 	macos: {
-		ffmpegUrlArm: 'https://www.osxexperts.net/ffmpeg7arm.zip',
-		ffprobeUrlArm: 'https://www.osxexperts.net/ffprobe71arm.zip',
-		ffmpegUrlx86_64: 'https://www.osxexperts.net/ffmpeg80intel.zip',
-		ffprobeUrlx86_64: 'https://www.osxexperts.net/ffprobe71intel.zip',
+		ffmpegMirror: 'https://downloads.screenpipe.com/ffmpeg/8.1.3-screenpipe.1',
 		mlxMetallibUrl: 'https://github.com/screenpipe/screenpipe/releases/download/mlx-metallib-v0.2.0/mlx.metallib',
 	},
 }
@@ -253,15 +251,10 @@ async function copyBunBinary() {
 		return;
 	}
 
-	if (await fs.exists(bunDest1)) {
-		console.log('bun binary already exists for tauri.');
-		return;
-	}
-
 	try {
 		await fs.access(bunSrc);
-		await copyFile(bunSrc, bunDest1);
-		console.log(`bun binary copied successfully from ${bunSrc} to ${bunDest1}`);
+		const changed = await copyFile(bunSrc, bunDest1);
+		console.log(`bun binary ${changed ? 'copied' : 'already current'} at ${bunDest1}`);
 	} catch (error) {
 		console.error('failed to copy bun binary:', error);
 		console.error('source path:', bunSrc);
@@ -272,8 +265,7 @@ async function copyBunBinary() {
 
 // Helper function to copy file and set permissions
 async function copyFile(src, dest) {
-	await fs.copyFile(src, dest);
-	await fs.chmod(dest, 0o755); // ensure the binary is executable
+	return copyFileIfChanged(src, dest, { mode: 0o755 });
 }
 
 async function validateFileSize(filePath, minSize) {
@@ -837,10 +829,11 @@ async function copyVcredistDlls(arch = 'x64') {
 	const crtDir = await findVc143CrtDir(arch);
 
 	const dlls = ['msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll', 'vcruntime140.dll', 'vcruntime140_1.dll'];
+	let copied = 0;
 	for (const dll of dlls) {
-		await fs.copyFile(path.join(crtDir, dll), path.join(vcredistDir, dll));
+		if (await copyFileIfChanged(path.join(crtDir, dll), path.join(vcredistDir, dll))) copied++;
 	}
-	console.log('VC CRT DLLs copied to vcredist');
+	console.log(copied === 0 ? 'VC CRT DLLs already current in vcredist' : `VC CRT DLLs updated in vcredist (${copied})`);
 }
 
 async function moveDirectoryContents(source, destination) {
@@ -922,46 +915,54 @@ async function setupWindowsFfmpeg(sevenZ) {
 }
 
 async function setupMacosFfmpegSidecars() {
-	const sidecars = [
+	const archives = [
 		{
-			name: 'ffmpeg-aarch64-apple-darwin',
-			binaryName: 'ffmpeg',
-			expectedArch: 'arm64',
-			url: config.macos.ffmpegUrlArm,
-			cacheKey: 'ffmpeg-macos-aarch64-osxexperts-7',
+			arch: 'arm64',
+			target: 'aarch64-apple-darwin',
+			sha256: '51323dcbade2634bb9448b13a81187ad554775ae8eef5b28d4702299812346ae',
 		},
 		{
-			name: 'ffprobe-aarch64-apple-darwin',
-			binaryName: 'ffprobe',
-			expectedArch: 'arm64',
-			url: config.macos.ffprobeUrlArm,
-			cacheKey: 'ffprobe-macos-aarch64-osxexperts-7.1',
-		},
-		{
-			name: 'ffmpeg-x86_64-apple-darwin',
-			binaryName: 'ffmpeg',
-			expectedArch: 'x86_64',
-			url: config.macos.ffmpegUrlx86_64,
-			cacheKey: 'ffmpeg-macos-x86_64-osxexperts-8.0',
-		},
-		{
-			name: 'ffprobe-x86_64-apple-darwin',
-			binaryName: 'ffprobe',
-			expectedArch: 'x86_64',
-			url: config.macos.ffprobeUrlx86_64,
-			cacheKey: 'ffprobe-macos-x86_64-osxexperts-7.1',
+			arch: 'x86_64',
+			target: 'x86_64-apple-darwin',
+			sha256: '541252465d94282956e9956b81e53435aa93de320f8d52d40b2599fc4a4ad750',
 		},
 	]
-
-	for (const sidecar of sidecars) {
-		const destination = path.join(cwd, sidecar.name)
-		await ensureCachedFile({
-			cacheKey: sidecar.cacheKey,
-			destination,
-			validate: (filePath) => validateMacosBinary(filePath, sidecar.expectedArch),
-			populate: (filePath) => populateZipBinary(sidecar.url, filePath, sidecar.binaryName),
+	const programs = ['ffmpeg', 'ffprobe']
+	for (const { arch, target, sha256 } of archives) {
+		const url = `${config.macos.ffmpegMirror}/ffmpeg-8.1.3-macos-${arch}.zip`
+		const cacheKey = `ffmpeg-mirror-${arch}-${sha256}.zip`
+		const archive = await ensureCachedFile({
+			cacheKey,
+			destination: path.join(cwd, cacheKey),
+			validate: async (candidate) => {
+				const hash = new Bun.CryptoHasher('sha256')
+				for await (const chunk of Bun.file(candidate).stream()) hash.update(chunk)
+				return hash.digest('hex') === sha256
+			},
+			populate: (candidate) => downloadFile(url, candidate, { retries: 10, timeoutMs: 900000 }),
 		})
-		await fs.chmod(destination, 0o755)
+
+		const extracted = await fs.mkdtemp(path.join(os.tmpdir(), 'screenpipe-ffmpeg-'))
+		try {
+			await $`unzip -q ${archive} -d ${extracted}`
+			for (const program of programs) {
+				if (!(await validateMacosBinary(path.join(extracted, program), arch))) {
+					throw new Error(`Invalid ${arch} ${program} in ${url}`)
+				}
+			}
+			for (const program of programs) {
+				await copyFile(path.join(extracted, program), path.join(cwd, `${program}-${target}`))
+			}
+			if (arch === 'arm64') {
+				// The corresponding source and license notices apply to both architectures.
+				const notices = path.join(cwd, '../.macos-sidecars/Resources/FFmpeg')
+				await fs.mkdir(notices, { recursive: true })
+				await fs.copyFile(path.join(extracted, 'README.txt'), path.join(notices, 'README.txt'))
+				await fs.cp(path.join(extracted, 'licenses'), path.join(notices, 'licenses'), { recursive: true })
+			}
+		} finally {
+			await fs.rm(extracted, { recursive: true, force: true })
+		}
 	}
 }
 
@@ -999,16 +1000,8 @@ if (platform == 'windows') {
 
 /* ########## macOS ########## */
 if (platform == 'macos') {
-	// Always use the self-contained osxexperts.net binaries. The
-	// `copySystemBinary` path that briefly lived here (b73cf7f93) ships
-	// brew's dynamically-linked ffmpeg as-is, with hardcoded
-	// `/opt/homebrew/Cellar/ffmpeg/<rev>/lib/lib*.dylib` references.
-	// CI's brew rev (`8.1_1`) is almost never the rev a user has at
-	// runtime (`8.1`, `8.1_2`, …), so dyld fails with
-	//   Library not loaded: …/Cellar/ffmpeg/8.1_1/lib/libavdevice.62.dylib
-	// and ffmpeg SIGABRTs on every invocation. osxexperts.net binaries
-	// are statically linked and have zero external deps — safe to copy
-	// into any .app.
+	// The mirror ships self-contained binaries instead of Homebrew builds
+	// that can link against a Cellar path unavailable on users' machines.
 	await setupMacosFfmpegSidecars()
 
 	await ensureMacosMlxMetallibSidecar();

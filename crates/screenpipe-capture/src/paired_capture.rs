@@ -9,7 +9,7 @@
 //! 1. Receives a screenshot from the caller when image capture is enabled
 //! 2. Walks the accessibility tree (in parallel)
 //! 3. Writes the JPEG snapshot to disk
-//! 4. Inserts a frame with accessibility text + snapshot path into the DB
+//! 4. Appends raw artifacts to the configured ledger, then optionally indexes the frame
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -19,7 +19,9 @@ use regex::Regex;
 use screenpipe_a11y::tree::{
     create_tree_walker, TreeSnapshot, TreeWalkerConfig, TreeWalkerPlatform,
 };
-use screenpipe_core::pii_removal::remove_pii;
+use screenpipe_core::{
+    pii_removal::remove_pii, raw_capture_ledger, raw_capture_metrics as metrics,
+};
 use screenpipe_db::DatabaseManager;
 use screenpipe_screen::snapshot_writer::SnapshotWriter;
 use screenpipe_screen::text_regions::{
@@ -145,8 +147,8 @@ pub fn detach_tree_from_pixels(snapshot: &mut TreeSnapshot) {
 }
 
 /// Context for a paired capture operation — replaces positional arguments.
-pub struct CaptureContext<'a> {
-    pub db: &'a DatabaseManager,
+pub struct CaptureContextWithDb<'a, Db> {
+    pub db: Db,
     pub snapshot_writer: &'a SnapshotWriter,
     pub image: Arc<DynamicImage>,
     pub captured_at: DateTime<Utc>,
@@ -178,9 +180,10 @@ pub struct CaptureContext<'a> {
     /// Whether the captured monitor is the one hosting the focused window.
     /// This is a capture-source boundary: only that monitor may pair its
     /// screenshot with the globally focused accessibility tree and focused
-    /// app/window identity. Other monitors use screenshot OCR with unknown
-    /// metadata. Callers without per-monitor focus knowledge should pass
-    /// `true` only when capturing a single monitor.
+    /// app/window identity or extract/reuse OCR text. Other and unknown-focus
+    /// monitors retain permitted screenshots without text. Callers must confirm
+    /// focused-window ownership at the capture boundary, never infer it from
+    /// scheduling state or the number of monitors.
     pub monitor_hosts_focus: bool,
     /// Whether the focused accessibility snapshot was collected under the
     /// same stable process identity as these pixels. When false, the AX data
@@ -204,11 +207,17 @@ pub struct CaptureContext<'a> {
     pub stored_labels: Option<(String, String)>,
 }
 
+pub type CaptureContext<'a> = CaptureContextWithDb<'a, &'a DatabaseManager>;
+pub type OptionalDbCaptureContext<'a> = CaptureContextWithDb<'a, Option<&'a DatabaseManager>>;
+
 /// Result of a paired capture operation.
 #[derive(Debug)]
 pub struct PairedCaptureResult {
     /// Database frame ID
     pub frame_id: i64,
+    /// Matches the stored focus flag. Only these frames may anchor focused UI
+    /// events; screenshot-only background frames must not inherit event text.
+    pub focused: bool,
     /// Path to the JPEG snapshot on disk
     pub snapshot_path: String,
     /// Accessibility text (if available)
@@ -267,23 +276,74 @@ pub async fn paired_capture(
     tree_snapshot: Option<&TreeSnapshot>,
     ocr_gate: Option<&mut OcrGate>,
 ) -> Result<PairedCaptureResult> {
-    paired_capture_inner(ctx, tree_snapshot, ocr_gate, false).await
+    paired_capture_with_snapshot(ctx, tree_snapshot, ocr_gate, false, None).await
 }
 
 /// Save an authorized screenshot while expensive text extraction is deferred.
 /// Never reuse accessibility or OCR text from an earlier image. The normal
 /// capture path can resume extraction on the next admitted walk.
 pub async fn paired_capture_deferred(ctx: &CaptureContext<'_>) -> Result<PairedCaptureResult> {
-    paired_capture_inner(ctx, None, None, true).await
+    paired_capture_with_snapshot(ctx, None, None, true, None).await
 }
 
-async fn paired_capture_inner(
+pub async fn paired_capture_with_snapshot(
     ctx: &CaptureContext<'_>,
     tree_snapshot: Option<&TreeSnapshot>,
     ocr_gate: Option<&mut OcrGate>,
     defer_text_extraction: bool,
+    snapshot_image: Option<&DynamicImage>,
 ) -> Result<PairedCaptureResult> {
+    match paired_capture_impl(
+        ctx,
+        tree_snapshot,
+        ocr_gate,
+        defer_text_extraction,
+        snapshot_image,
+    )
+    .await?
+    {
+        PairedCaptureOutcome::Indexed(result) => Ok(result),
+        _ => unreachable!("database-backed capture always indexes a frame"),
+    }
+}
+
+/// Persistence outcome without inventing a database frame ID in raw-only mode.
+#[derive(Debug)]
+pub enum PairedCaptureOutcome {
+    Indexed(PairedCaptureResult),
+    Raw { duration_ms: u64 },
+    Skipped,
+}
+
+pub async fn paired_capture_with_optional_db(
+    ctx: &OptionalDbCaptureContext<'_>,
+    tree_snapshot: Option<&TreeSnapshot>,
+    ocr_gate: Option<&mut OcrGate>,
+    defer_text_extraction: bool,
+    snapshot_image: Option<&DynamicImage>,
+) -> Result<PairedCaptureOutcome> {
+    paired_capture_impl(
+        ctx,
+        tree_snapshot,
+        ocr_gate,
+        defer_text_extraction,
+        snapshot_image,
+    )
+    .await
+}
+
+async fn paired_capture_impl<'a, Db>(
+    ctx: &CaptureContextWithDb<'a, Db>,
+    tree_snapshot: Option<&TreeSnapshot>,
+    ocr_gate: Option<&mut OcrGate>,
+    defer_text_extraction: bool,
+    snapshot_image: Option<&DynamicImage>,
+) -> Result<PairedCaptureOutcome>
+where
+    Db: Copy + Into<Option<&'a DatabaseManager>>,
+{
     let start = Instant::now();
+    let db = ctx.db.into();
 
     // AX and focused-window identity describe one global focused window, not
     // every monitor captured alongside it. Keep them inseparable from focus
@@ -317,26 +377,175 @@ async fn paired_capture_inner(
         (None, None, None, None)
     };
 
-    // Write JPEG snapshot to disk — skipped when screenshot_disabled (AudioPaused / FullPause).
-    // On the focused monitor the accessibility tree can still supply text;
-    // other monitors remain screenshot-only by the boundary above.
-    let snapshot_path_str = if ctx.screenshot_disabled {
-        debug!(
-            "paired_capture: screenshot skipped (screenshot_disabled, trigger={})",
-            ctx.capture_trigger
-        );
-        String::new()
+    let ledger_enabled = raw_capture_ledger::is_enabled();
+    let admitted_image = snapshot_image.unwrap_or(&ctx.image);
+    let jpeg = if ledger_enabled && !ctx.screenshot_disabled {
+        ctx.snapshot_writer
+            .encode_jpeg(admitted_image)
+            .map(|bytes| Some(Arc::new(bytes)))
     } else {
-        let snapshot_path =
-            ctx.snapshot_writer
-                .write(&ctx.image, ctx.captured_at, ctx.monitor_id)?;
-        debug!(
-            "paired_capture: snapshot written in {:?} (trigger={})",
-            start.elapsed(),
-            ctx.capture_trigger
-        );
-        snapshot_path.to_string_lossy().to_string()
+        Ok(None)
     };
+    let ledger_jpeg = jpeg.as_ref().ok().and_then(|bytes| bytes.clone());
+    // Start the ledger write from the admitted bytes, without depending on
+    // creation or read-back of the local snapshot file.
+    let ledger_append =
+        if ledger_enabled && (ledger_jpeg.is_some() || stored_tree_snapshot.is_some()) {
+            let captured_at = ctx.captured_at;
+            let paired = ctx.ax_screenshot_coherent;
+            let (mut context, ax) = raw_screen_metadata(ctx, stored_tree_snapshot);
+            let ax_capture = stored_tree_snapshot.map(|tree| {
+                let mut ax_context = context.clone();
+                ax_context["app_name"] = serde_json::json!(tree.app_name);
+                ax_context["window_name"] = serde_json::json!(tree.window_name);
+                ax_context["browser_url"] = serde_json::json!(tree.browser_url);
+                (tree.timestamp, ax_context)
+            });
+            Some(tokio::task::spawn_blocking(move || {
+                let screenshot = ledger_jpeg.map(|bytes| {
+                    serde_json::json!({
+                        "kind": "screenpipe.screenshot",
+                        "schema_version": 1,
+                        "media_type": "image/jpeg",
+                        "encoding": "base64",
+                        "payload": raw_capture_ledger::encode_base64(&bytes),
+                    })
+                });
+                let ax = ax.zip(ax_capture).map(|(ax, (timestamp, context))| {
+                    (
+                        timestamp,
+                        context,
+                        serde_json::json!({
+                            "kind": "screenpipe.ax",
+                            "schema_version": 1,
+                            "media_type": "application/json",
+                            "encoding": "utf8",
+                            "payload": ax.to_string(),
+                        }),
+                    )
+                });
+                let append = |timestamp, context, entries| match raw_capture_ledger::append(
+                    timestamp, context, entries,
+                ) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn!(%error, "raw screen capture could not be appended");
+                        false
+                    }
+                };
+                match (screenshot, ax) {
+                    (Some(screenshot), Some((_, _, ax))) if paired => {
+                        append(captured_at, context, vec![screenshot, ax])
+                    }
+                    (screenshot, ax) => {
+                        context["ax_captured_at"] = serde_json::Value::Null;
+                        let screenshot_saved = screenshot
+                            .is_some_and(|entry| append(captured_at, context, vec![entry]));
+                        let ax_saved = ax.is_some_and(|(timestamp, context, entry)| {
+                            append(timestamp, context, vec![entry])
+                        });
+                        screenshot_saved || ax_saved
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
+    let snapshot_path = if ctx.screenshot_disabled || (db.is_none() && ledger_enabled) {
+        Ok(None)
+    } else {
+        jpeg.and_then(|jpeg| {
+            match jpeg {
+                Some(bytes) => {
+                    ctx.snapshot_writer
+                        .write_encoded(&bytes, ctx.captured_at, ctx.monitor_id)
+                }
+                None => ctx
+                    .snapshot_writer
+                    .write(admitted_image, ctx.captured_at, ctx.monitor_id),
+            }
+            .map(Some)
+        })
+    };
+    let ledger_saved = if let Some(appended) = ledger_append {
+        match appended.await {
+            Ok(saved) => saved,
+            Err(error) => {
+                warn!(%error, "raw screen capture append task failed");
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    let measure = ledger_enabled && (!ctx.screenshot_disabled || stored_tree_snapshot.is_some());
+    if measure {
+        metrics::add(&metrics::VISUAL_CAPTURE_ATTEMPTS, 1);
+        metrics::add(
+            if ledger_saved {
+                &metrics::VISUAL_LEDGER_SAVED
+            } else {
+                &metrics::VISUAL_LEDGER_NOT_SAVED
+            },
+            1,
+        );
+    }
+    let record_history = |saved: Option<bool>| {
+        if measure {
+            let (counter, ledger_only_counter) = match saved {
+                Some(true) => (&metrics::VISUAL_DB_SAVED, None),
+                Some(false) => (
+                    &metrics::VISUAL_DB_FAILED,
+                    Some(&metrics::VISUAL_LEDGER_SAVED_DB_FAILED),
+                ),
+                None => (
+                    &metrics::VISUAL_DB_UNAVAILABLE,
+                    Some(&metrics::VISUAL_LEDGER_SAVED_DB_UNAVAILABLE),
+                ),
+            };
+            metrics::add(counter, 1);
+            if let Some(counter) = ledger_only_counter.filter(|_| ledger_saved) {
+                metrics::add(counter, 1);
+            }
+        } else if !ledger_enabled {
+            if let Some(saved) = saved {
+                metrics::add(
+                    if saved {
+                        &metrics::VISUAL_LOCAL_ONLY_DB_SAVED
+                    } else {
+                        &metrics::VISUAL_LOCAL_ONLY_DB_FAILED
+                    },
+                    1,
+                );
+            }
+        }
+    };
+    let Some(db) = db else {
+        record_history(None);
+        let persisted = if ledger_saved {
+            if let Err(error) = snapshot_path {
+                warn!(%error, "local snapshot failed after admitting raw capture");
+            }
+            true
+        } else {
+            snapshot_path?.is_some()
+        };
+        return Ok(if persisted {
+            PairedCaptureOutcome::Raw {
+                duration_ms: start.elapsed().as_millis() as u64,
+            }
+        } else {
+            PairedCaptureOutcome::Skipped
+        });
+    };
+    let snapshot_path_str = snapshot_path
+        .inspect_err(|_| {
+            record_history(Some(false));
+        })?
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
 
     // --- Check if accessibility tree already provides text ---
     // When the tree snapshot has text we skip OCR entirely. This avoids
@@ -386,6 +595,7 @@ async fn paired_capture_inner(
         || browser_url.map(is_meeting_url).unwrap_or(false);
     let meeting_trigger = ctx.in_meeting && meeting_matched && ctx.monitor_hosts_focus;
     let wants_ocr = !defer_text_extraction
+        && ctx.monitor_hosts_focus
         && !ctx.screenshot_disabled
         && (app_prefers_ocr || meeting_trigger || !has_accessibility_text || a11y_is_thin_generic);
 
@@ -755,8 +965,7 @@ async fn paired_capture_inner(
         Some((app, window)) => (Some(app.as_str()), Some(window.as_str())),
         None => (app_name, window_name),
     };
-    let frame_id = ctx
-        .db
+    let frame_id = db
         .insert_snapshot_frame_with_ocr(
             ctx.device_name,
             ctx.captured_at,
@@ -777,7 +986,11 @@ async fn paired_capture_inner(
                 .then_some(ctx.elements_ref_frame_id)
                 .flatten(),
         )
-        .await?;
+        .await
+        .inspect_err(|_| {
+            record_history(Some(false));
+        })?;
+    record_history(Some(true));
 
     // Commit the gate's pending signature (and cache the OCR result for
     // reuse on pixel-identical captures) only now that the frame is durably
@@ -806,8 +1019,9 @@ async fn paired_capture_inner(
         frame_id, ctx.capture_trigger, text_source
     );
 
-    Ok(PairedCaptureResult {
+    Ok(PairedCaptureOutcome::Indexed(PairedCaptureResult {
         frame_id,
+        focused: ctx.focused && ctx.monitor_hosts_focus,
         snapshot_path: snapshot_path_str,
         accessibility_text,
         text_source: text_source.map(String::from),
@@ -824,7 +1038,35 @@ async fn paired_capture_inner(
         browser_url: browser_url.map(String::from),
         content_hash,
         stored_labels: stored_labels.cloned(),
-    })
+    }))
+}
+
+fn raw_screen_metadata<Db>(
+    ctx: &CaptureContextWithDb<'_, Db>,
+    tree: Option<&TreeSnapshot>,
+) -> (serde_json::Value, Option<serde_json::Value>) {
+    let mut context = serde_json::json!({
+        "monitor_id": ctx.monitor_id,
+        "device_name": ctx.device_name,
+        "capture_trigger": ctx.capture_trigger,
+        "focused": ctx.focused && ctx.monitor_hosts_focus,
+        "ax_captured_at": tree.map(|snapshot| snapshot.timestamp),
+    });
+    if ctx.monitor_hosts_focus {
+        context["app_name"] = serde_json::json!(ctx.app_name);
+        context["window_name"] = serde_json::json!(ctx.window_name);
+        context["browser_url"] = serde_json::json!(ctx.browser_url);
+    }
+    let ax = tree.map(|snapshot| {
+        serde_json::json!({
+            "app_name": snapshot.app_name,
+            "window_name": snapshot.window_name,
+            "text": snapshot.text_content,
+            "nodes": snapshot.nodes,
+            "truncated": snapshot.truncated,
+        })
+    });
+    (context, ax)
 }
 
 /// Walk the accessibility tree for the currently focused window.
@@ -1245,6 +1487,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_capture_persists_screenshot_and_ax_without_database() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let jpeg_dir = tmp.path().join("snapshots");
+        let writer = SnapshotWriter::new(&jpeg_dir, 80, 1920);
+        raw_capture_ledger::configure(
+            tmp.path().join("spool"),
+            "workspace".into(),
+            "device".into(),
+        )?;
+        struct DisableLedger;
+        impl Drop for DisableLedger {
+            fn drop(&mut self) {
+                raw_capture_ledger::disable();
+            }
+        }
+        let _disable_ledger = DisableLedger;
+        let mut ctx = OptionalDbCaptureContext {
+            db: None,
+            snapshot_writer: &writer,
+            image: test_image(),
+            captured_at: Utc::now(),
+            monitor_id: 7,
+            device_name: "raw_only_test_monitor",
+            app_name: Some("Test"),
+            window_name: Some("Contact me@example.com"),
+            browser_url: None,
+            document_path: None,
+            focused: true,
+            capture_trigger: "manual",
+            use_pii_removal: true,
+            languages: vec![],
+            elements_ref_frame_id: None,
+            screenshot_disabled: false,
+            in_meeting: false,
+            monitor_hosts_focus: true,
+            ax_screenshot_coherent: true,
+            focused_window_bounds: None,
+        };
+        let mut tree = make_snap(vec![AccessibilityTreeNode {
+            text: "Contact me@example.com".into(),
+            value: Some("me@example.com".into()),
+            ..Default::default()
+        }]);
+        tree.window_name = "Contact me@example.com".into();
+        assert!(matches!(
+            paired_capture_with_optional_db(&ctx, Some(&tree), None, false, None).await?,
+            PairedCaptureOutcome::Raw { .. }
+        ));
+        let jpeg = raw_capture_ledger::encode_base64(&writer.encode_jpeg(&ctx.image)?);
+        assert!(
+            !jpeg_dir.exists(),
+            "raw-only capture must not write a local history JPEG"
+        );
+
+        ctx.screenshot_disabled = true;
+        assert!(matches!(
+            paired_capture_with_optional_db(&ctx, Some(&tree), None, false, None).await?,
+            PairedCaptureOutcome::Raw { .. }
+        ));
+        ctx.screenshot_disabled = false;
+        ctx.captured_at += chrono::Duration::seconds(1);
+        assert!(matches!(
+            paired_capture_with_optional_db(&ctx, None, None, false, None).await?,
+            PairedCaptureOutcome::Raw { .. }
+        ));
+        ctx.captured_at += chrono::Duration::seconds(1);
+        ctx.ax_screenshot_coherent = false;
+        detach_tree_from_pixels(&mut tree);
+        assert!(matches!(
+            paired_capture_with_optional_db(&ctx, Some(&tree), None, false, None).await?,
+            PairedCaptureOutcome::Raw { .. }
+        ));
+        let blocked_snapshot_dir = tmp.path().join("not-a-directory");
+        std::fs::write(&blocked_snapshot_dir, b"blocked")?;
+        let blocked_writer = SnapshotWriter::new(&blocked_snapshot_dir, 80, 1920);
+        ctx.snapshot_writer = &blocked_writer;
+        assert!(matches!(
+            paired_capture_with_optional_db(&ctx, Some(&tree), None, false, None).await?,
+            PairedCaptureOutcome::Raw { .. }
+        ));
+
+        let mut pairs = 0;
+        let mut screenshots_only = 0;
+        let mut ax_only = 0;
+        for item in raw_capture_ledger::pending()? {
+            let body = String::from_utf8(raw_capture_ledger::read(&item)?)?;
+            let records = body
+                .lines()
+                .map(serde_json::from_str)
+                .collect::<serde_json::Result<Vec<serde_json::Value>>>()?;
+            if records[0]["context"]["device_name"] != ctx.device_name {
+                continue;
+            }
+            let ax_record = if records[1]["kind"] == "screenpipe.screenshot" {
+                if records.len() == 2 {
+                    screenshots_only += 1;
+                    assert!(records[0]["context"]["ax_captured_at"].is_null());
+                    continue;
+                }
+                pairs += 1;
+                assert_eq!(records[1]["payload"], jpeg);
+                &records[2]
+            } else {
+                ax_only += 1;
+                assert_eq!(records.len(), 2);
+                &records[1]
+            };
+            assert_eq!(ax_record["kind"], "screenpipe.ax");
+            let ax: serde_json::Value =
+                serde_json::from_str(ax_record["payload"].as_str().unwrap())?;
+            assert_eq!(
+                records[0]["context"]["window_name"],
+                "Contact me@example.com"
+            );
+            assert_eq!(ax["text"], tree.text_content);
+            assert_eq!(ax["nodes"][0]["value"], "me@example.com");
+        }
+        assert_eq!((pairs, screenshots_only, ax_only), (1, 3, 3));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_paired_capture_without_accessibility() {
         let tmp = TempDir::new().unwrap();
         let snapshot_writer = SnapshotWriter::new(tmp.path(), 80, 1920);
@@ -1289,6 +1653,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn presized_snapshot_keeps_original_pixels_and_frame_record() {
+        let tmp = TempDir::new().unwrap();
+        let writer = SnapshotWriter::new(tmp.path(), 80, 50);
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
+        let ctx = CaptureContext {
+            db: &db,
+            snapshot_writer: &writer,
+            image: test_image(),
+            captured_at: Utc::now(),
+            monitor_id: 7,
+            device_name: "test_monitor",
+            app_name: None,
+            window_name: None,
+            browser_url: None,
+            document_path: None,
+            focused: false,
+            capture_trigger: "idle",
+            use_pii_removal: false,
+            languages: vec![],
+            elements_ref_frame_id: None,
+            screenshot_disabled: false,
+            in_meeting: false,
+            monitor_hosts_focus: false,
+            ax_screenshot_coherent: false,
+            focused_window_bounds: None,
+        };
+        let presized =
+            DynamicImage::ImageRgb8(RgbImage::from_pixel(50, 50, image::Rgb([200, 0, 0])));
+        let result = paired_capture_with_snapshot(&ctx, None, None, true, Some(&presized))
+            .await
+            .unwrap();
+
+        let stored = db.get_frame(result.frame_id).await.unwrap().unwrap();
+        assert_eq!(stored.0, result.snapshot_path);
+        assert!(stored.2);
+        assert_eq!(
+            db.get_frame_timestamp(result.frame_id).await.unwrap(),
+            Some(ctx.captured_at)
+        );
+        assert!(result
+            .snapshot_path
+            .ends_with(&format!("{}_m7.jpg", ctx.captured_at.timestamp_millis())));
+        let jpeg = image::open(&result.snapshot_path).unwrap().to_rgb8();
+        assert_eq!(jpeg.dimensions(), (50, 50));
+        assert!(jpeg.get_pixel(25, 25)[0] > 180);
+        assert_eq!(ctx.image.width(), 100);
+    }
+
+    #[tokio::test]
     async fn test_paired_capture_screenshot_disabled_skips_snapshot_and_ocr() {
         let tmp = TempDir::new().unwrap();
         let snapshot_writer = SnapshotWriter::new(tmp.path(), 80, 1920);
@@ -1327,6 +1742,29 @@ mod tests {
         assert!(result.accessibility_text.is_none());
         assert!(result.text_source.is_none());
         assert!(result.ocr_duration_ms.is_none());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+
+        // The engine uses this same flag when isolated window capture fails.
+        // A privacy failure must not discard independently authorized AX text.
+        let snapshot = make_snap(vec![AccessibilityTreeNode {
+            role: "AXStaticText".into(),
+            text: "Allowed text survives a withheld screenshot".into(),
+            ..Default::default()
+        }]);
+        let text_only = paired_capture(&ctx, Some(&snapshot), None).await.unwrap();
+        assert_eq!(text_only.snapshot_path, "");
+        assert!(text_only.ocr_duration_ms.is_none());
+        let (text, tree) = db
+            .get_frame_accessibility_data(text_only.frame_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            text.as_deref(),
+            Some("Allowed text survives a withheld screenshot")
+        );
+        assert!(tree
+            .unwrap()
+            .contains("Allowed text survives a withheld screenshot"));
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
 
@@ -2135,84 +2573,153 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_focused_monitor_gets_gated_ocr_on_its_own_pixels() {
-        // Multi-monitor: a second monitor receives the globally focused
-        // window's AX result, but its pixels show unrelated content. The
-        // capture boundary must discard both that tree and its identity,
-        // then OCR the second monitor's own screenshot.
+    async fn non_focused_monitor_keeps_pixels_without_any_text_or_element_reference() {
         let tmp = TempDir::new().unwrap();
         let snapshot_writer = SnapshotWriter::new(tmp.path(), 80, 1920);
-        let db = DatabaseManager::new("sqlite::memory:", Default::default())
-            .await
-            .unwrap();
-        // Thin a11y text (in-call meeting chrome is typically <100 chars).
-        let snap = make_snap(vec![AccessibilityTreeNode {
-            role: "AXStaticText".into(),
-            text: "Leave meeting".into(),
-            depth: 0,
-            bounds: None,
-            ..Default::default()
-        }]);
-        let make_ctx = |image| CaptureContext {
+        let db = DatabaseManager::new(
+            tmp.path().join("capture.sqlite").to_str().unwrap(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let mut snap = rich_meeting_snap();
+        snap.nodes[0].on_screen = Some(true);
+        snap.nodes[0].bounds = Some(screenpipe_a11y::tree::NodeBounds {
+            left: 0.1,
+            top: 0.1,
+            width: 0.8,
+            height: 0.1,
+        });
+        let mut ctx = CaptureContext {
             db: &db,
             snapshot_writer: &snapshot_writer,
-            image,
+            image: strokes_image(),
             captured_at: Utc::now(),
             monitor_id: 1,
             device_name: "monitor_2",
             app_name: Some("zoom.us"),
             window_name: Some("Zoom Meeting"),
-            browser_url: None,
-            document_path: None,
+            browser_url: Some("https://example.com/private"),
+            document_path: Some("/private/document"),
             focused: true,
             capture_trigger: "visual_change",
             use_pii_removal: false,
             languages: vec![],
             elements_ref_frame_id: None,
             screenshot_disabled: false,
-            in_meeting: true,
-            monitor_hosts_focus: false,
+            in_meeting: false,
+            monitor_hosts_focus: true,
             ax_screenshot_coherent: true,
             focused_window_bounds: None,
             stored_labels: None,
         };
-        let mut gate = OcrGate::new();
-        // Text on this monitor: first sighting OCRs it.
-        let ctx = make_ctx(strokes_image_at(50, 100));
-        let result = paired_capture(&ctx, Some(&snap), Some(&mut gate))
+        // Establish a real focused frame with elements that must not leak
+        // through a reference when this display subsequently loses focus.
+        let focused = paired_capture(&ctx, Some(&snap), None).await.unwrap();
+        assert!(focused.focused);
+        assert_eq!(focused.text_source.as_deref(), Some("accessibility"));
+        // Element projection is asynchronous. Seed the reference target
+        // durably so this check cannot race its background projection.
+        db.execute_raw_sql_write(&format!(
+            "INSERT INTO elements (frame_id, source, role, text) VALUES ({}, 'accessibility', 'AXStaticText', 'reference secret')",
+            focused.frame_id,
+        )).await.unwrap();
+        assert!(!db
+            .get_frame_elements(focused.frame_id, None)
             .await
-            .unwrap();
-        assert!(
-            result.ocr_duration_ms.is_some(),
-            "new text on a non-focused monitor must be OCR'd"
-        );
-        assert!(result.app_name.is_none());
-        assert!(result.window_name.is_none());
-        assert!(result.browser_url.is_none());
-        assert_ne!(result.accessibility_text.as_deref(), Some("Leave meeting"));
-        assert_ne!(result.content_hash, Some(snap.content_hash as i64));
-        // Content changes (a second text line appears): the union crop's
-        // pixels differ → OCR again. This is the coverage the old
-        // fingerprint gate starved. (Note: purely MOVED text is skipped by
-        // design — the union crop follows it and its pixels are identical.)
-        let mut canvas = image::RgbImage::from_pixel(400, 300, image::Rgb([235, 235, 235]));
-        for (y0, strokes) in [(100u32, 10u32), (200, 6)] {
-            for s in 0..strokes {
-                let sx = 50 + s * 7;
-                for dy in 0..12 {
-                    for dx in 0..3 {
-                        canvas.put_pixel(sx + dx, y0 + dy, image::Rgb([10, 10, 10]));
-                    }
+            .unwrap()
+            .is_empty());
+        ctx.elements_ref_frame_id = Some(focused.frame_id);
+        ctx.monitor_hosts_focus = false;
+        ctx.in_meeting = true;
+
+        let regions = detect_text_regions(&ctx.image);
+        let union = union_region(&regions, UNION_PAD_PX, 400, 300).unwrap();
+        let signature =
+            image_pixel_signature(
+                &ctx.image
+                    .crop_imm(union.x, union.y, union.width, union.height),
+            );
+        let mut cached_gate = OcrGate::new();
+        assert_eq!(cached_gate.observe("unknown", signature), OcrDecision::Ocr);
+        cached_gate.ocr_indexed("unknown", "cached background secret", "[]");
+        let mut empty_gate = OcrGate::new();
+        // Cover a stale cache, a new gate, no gate, absent AX, and text-only
+        // pause mode. The first case would have reused OCR before this fix.
+        for (gate, with_tree, screenshot_disabled) in [
+            (Some(&mut cached_gate), true, false),
+            (Some(&mut empty_gate), true, false),
+            (None, true, false),
+            (None, false, false),
+            (None, true, true),
+        ] {
+            ctx.captured_at += chrono::Duration::seconds(1);
+            ctx.screenshot_disabled = screenshot_disabled;
+            let result = paired_capture(&ctx, with_tree.then_some(&snap), gate)
+                .await
+                .unwrap();
+            assert!(
+                !result.focused,
+                "background frames must not anchor UI event text"
+            );
+            assert_eq!(result.ocr_duration_ms, None);
+            assert_eq!(result.ocr_gate_decision, None);
+            assert_eq!(result.ocr_gate_detect_duration, None);
+            assert!(!result.ocr_cache_hit);
+            assert_eq!(result.accessibility_text, None);
+            assert_eq!(result.text_source, None);
+            assert_eq!(result.content_hash, None);
+            assert_eq!(result.app_name, None);
+            assert_eq!(result.window_name, None);
+            assert_eq!(result.browser_url, None);
+            assert_eq!(
+                db.get_frame_accessibility_data(result.frame_id)
+                    .await
+                    .unwrap(),
+                (None, None)
+            );
+            assert!(db
+                .get_frame_elements(result.frame_id, None)
+                .await
+                .unwrap()
+                .is_empty());
+            let stored = db.query_raw_sql(&format!(
+                "SELECT full_text, text_json, accessibility_text, accessibility_tree_json, text_source, document_path, browser_url, app_name, window_name, content_hash, simhash, elements_ref_frame_id, focused FROM frames WHERE id = {}",
+                result.frame_id,
+            )).await.unwrap();
+            let row = stored[0].as_object().unwrap();
+            for (column, value) in row {
+                if column == "focused" {
+                    assert_eq!(*value, serde_json::json!(0));
+                } else {
+                    assert!(
+                        value.is_null(),
+                        "background column {column} retained {value}"
+                    );
                 }
             }
+            if screenshot_disabled {
+                assert!(result.snapshot_path.is_empty());
+            } else {
+                assert!(std::path::Path::new(&result.snapshot_path).is_file());
+                assert_eq!(
+                    db.get_frame(result.frame_id).await.unwrap().unwrap().0,
+                    result.snapshot_path
+                );
+            }
         }
-        let ctx2 = make_ctx(Arc::new(DynamicImage::ImageRgb8(canvas)));
-        let result2 = paired_capture(&ctx2, Some(&snap), Some(&mut gate))
-            .await
-            .unwrap();
-        assert!(
-            result2.ocr_duration_ms.is_some(),
-            "changed content on a non-focused monitor must re-OCR"
+        // Returning focus restores the normal text path; no global disable or
+        // destructive OCR-cache reset is needed.
+        ctx.monitor_hosts_focus = true;
+        ctx.screenshot_disabled = false;
+        ctx.in_meeting = false;
+        ctx.elements_ref_frame_id = None;
+        let restored = paired_capture(&ctx, Some(&snap), None).await.unwrap();
+        assert_eq!(restored.text_source.as_deref(), Some("accessibility"));
+        assert_eq!(restored.accessibility_text, focused.accessibility_text);
+        assert_eq!(
+            cached_gate.indexed_text("unknown"),
+            Some(("cached background secret", "[]"))
         );
     }
 

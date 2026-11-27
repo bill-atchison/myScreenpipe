@@ -26,11 +26,32 @@ export type WorkflowRunActivity = {
   status: "running" | "complete" | "error";
 };
 
+export type WorkflowAnalysisErrorCode =
+  | "cancelled"
+  | "allowance_paused"
+  | "business_required"
+  | "usage_unavailable"
+  | "sign_in_required"
+  | "rollout_disabled"
+  | "context_compaction"
+  | "missing_output"
+  | "timeout"
+  | "context_length_exceeded"
+  | "tasks_disabled"
+  | "no_work_ready"
+  | "missing_execution_id"
+  | "http_4xx"
+  | "http_5xx"
+  | "network_error"
+  | "unknown";
+
 export type WorkflowAnalysisJob = {
   id: string;
   /** Stable across agent executions belonging to one update. */
   cycleId?: string;
   status: "queued" | "processing" | "complete" | "incomplete" | "failed";
+  /** Enumerated failure category for local diagnostics and telemetry; never raw provider text. */
+  errorCode?: WorkflowAnalysisErrorCode;
   progress?: number;
   startedAt?: string;
   message?: string;
@@ -150,6 +171,8 @@ export type WorkflowRecording = {
 };
 
 export type WorkflowsAppProps = {
+  /** Optional content-free usage events; the host owns consent and identity. */
+  onUsageEvent?: (event: import("./use-workflow-usage").WorkflowUsageEvent) => void;
   modelControl?: import("react").ReactNode;
   /** Quiet in-app alternative to interrupting a focused workflow reader. */
   readyWorkflowIds?: string[];
@@ -165,6 +188,8 @@ export type WorkflowsAppProps = {
   active?: boolean;
   /** Native fullscreen state supplied by the host window. */
   fullscreen?: boolean;
+  /** Use the desktop app's sidebar preference, typography and navigation chrome. */
+  desktopAppearance?: boolean;
   navigationFooter?: (actions: {
     openKeyboardShortcuts: () => void;
   }) => import("react").ReactNode;
@@ -176,7 +201,7 @@ export type WorkflowsAppProps = {
   onShareDocument?: (document: import("./document-actions").LibraryShareDocument) => void;
   onShareWorkflow?: (workflow: WorkflowMap) => void;
   /** Optional host integration with the existing external-agent launchers. */
-  workflowAgentActions?: (workflow: WorkflowMap) => import("react").ReactNode;
+  workflowAgentActions?: (workflow: WorkflowMap, closeSharing?: () => void) => import("react").ReactNode;
   /** Host-owned live recorder status and controls. */
   recordingStatus?: import("react").ReactNode;
   analysisUnavailableReason?: string;

@@ -6,15 +6,18 @@
 //!
 //! This module deliberately knows nothing about remote requests, users, or
 //! upload endpoints. It builds a small bundle from the app's own logs, including
-//! rotated panic logs, and passes every byte through the shared deterministic
-//! on-device filtering pipeline. The manual "send logs" flow can additionally
+//! rotated panic logs and persisted migration metadata, and passes every byte
+//! through the shared deterministic on-device filtering pipeline. The manual "send logs" flow can additionally
 //! use the Tinfoil enclave, but unattended diagnostics never send raw text to a
 //! third-party redaction service. Because no automated filter can guarantee
 //! removal of every name or path, the consent UI explicitly discloses that
 //! residual personal data may remain.
 //!
 //! Unattended collection never includes screenshots, audio/video, chat history,
-//! settings, or the timeline database.
+//! full settings, or the timeline database. Explicit support requests include
+//! aggregate filesystem metadata and four whitelisted recording settings.
+
+mod storage;
 
 use std::path::Path;
 use std::time::Duration;
@@ -54,7 +57,11 @@ pub async fn collect_redacted(app: &AppHandle) -> Result<String, String> {
     let files = crate::log_files::get_log_files(app.clone())
         .await
         .unwrap_or_default();
-    redact_files(&owned_log_files(files)).await
+    redact_files_with_migration(
+        &owned_log_files(files),
+        Some(crate::db_relaunch::active_data_dir()),
+    )
+    .await
 }
 
 /// Collect from explicit app-owned log directories.
@@ -62,8 +69,15 @@ pub async fn collect_redacted(app: &AppHandle) -> Result<String, String> {
 /// Enterprise's mandatory collector uses this entry point so both managed and
 /// opted-in builds share one filesystem, size, timeout, and redaction policy.
 pub async fn collect_redacted_from_dirs(dirs: &[std::path::PathBuf]) -> Result<String, String> {
+    collect_redacted_from_dirs_at_root(dirs, crate::db_relaunch::active_data_dir()).await
+}
+
+pub(crate) async fn collect_redacted_from_dirs_at_root(
+    dirs: &[std::path::PathBuf],
+    root: std::path::PathBuf,
+) -> Result<String, String> {
     let files = crate::log_files::collect_log_files(dirs).await;
-    redact_files(&owned_log_files(files)).await
+    redact_files_with_migration(&owned_log_files(files), Some(root)).await
 }
 
 fn owned_log_files(files: Vec<LogFile>) -> Vec<LogFile> {
@@ -72,19 +86,32 @@ fn owned_log_files(files: Vec<LogFile>) -> Vec<LogFile> {
         .filter(|file| is_screenpipe_owned_log_name(&file.name))
         .collect();
     // Keep the retained failure visible when newer rolling files fill the bundle.
-    files.sort_by_key(|file| file.name != "enterprise-sync-error.log");
+    files.sort_by_key(|file| {
+        if is_enterprise_recovery_log(&file.name) {
+            0
+        } else if matches!(
+            file.name.as_str(),
+            "enterprise-sync-error.log" | "enterprise-screenshot-delivery.log"
+        ) {
+            1
+        } else {
+            2
+        }
+    });
     files
 }
 
 fn is_screenpipe_owned_log_name(name: &str) -> bool {
     crate::log_files::is_panic_log(name)
         || name == crate::recording::recovery_log::LOG_NAME
+        || is_enterprise_recovery_log(name)
         || is_enterprise_takeover_log(name)
         || crate::update_diagnostics::is_update_log(name)
         || matches!(
             name,
             "screenpipe.log"
                 | "enterprise-sync-error.log"
+                | "enterprise-screenshot-delivery.log"
                 | "screenpipe-app.log"
                 | "recover.import.log"
                 | "recover.stderr.log"
@@ -92,6 +119,16 @@ fn is_screenpipe_owned_log_name(name: &str) -> bool {
         )
         || is_dated_rolling_log(name, "screenpipe.")
         || is_dated_rolling_log(name, "screenpipe-app.")
+}
+
+#[cfg(feature = "enterprise-support")]
+fn is_enterprise_recovery_log(name: &str) -> bool {
+    name == crate::enterprise::recovery::FAILURE_LOG_NAME
+}
+
+#[cfg(not(feature = "enterprise-support"))]
+fn is_enterprise_recovery_log(_name: &str) -> bool {
+    false
 }
 
 #[cfg(target_os = "windows")]
@@ -132,8 +169,43 @@ fn is_dated_rolling_log(name: &str, prefix: &str) -> bool {
             })
 }
 
+#[cfg(test)]
 async fn redact_files(files: &[LogFile]) -> Result<String, String> {
-    let raw = build_bundle(files).await;
+    redact_files_with_migration(files, None).await
+}
+
+async fn redact_files_with_migration(
+    files: &[LogFile],
+    data_root: Option<std::path::PathBuf>,
+) -> Result<String, String> {
+    // Persistent evidence goes first so rolling logs cannot displace it at the
+    // existing redacted-bundle boundary. Reuse the manual support reader and
+    // send all bytes through the same local redaction as unattended logs.
+    let mut raw = match data_root {
+        Some(root) => {
+            let settings = crate::store::support_recording_settings();
+            let days = (settings["local_retention_enabled"] == true)
+                .then(|| settings["local_retention_days"].as_u64())
+                .flatten();
+            let inventory_root = root.clone();
+            // This request-only scan is independent of the engine, DB and
+            // local HTTP API, and never occupies an async recording worker.
+            let inventory =
+                tokio::task::spawn_blocking(move || storage::collect(&inventory_root, days))
+                    .await
+                    .map_err(|error| format!("storage support inventory failed: {error}"))?;
+            let inventory = serde_json::to_string_pretty(&serde_json::json!({
+                "filesystem": inventory, "saved_recording_settings": settings
+            }))
+            .map_err(|error| format!("storage support inventory encoding failed: {error}"))?;
+            format!(
+                "=== Storage support diagnostics ===\n{inventory}\n=== Storage migration diagnostics ===\n{}\n",
+                crate::feedback_upload::collect_migration_diagnostics_from_root(root).await
+            )
+        }
+        None => String::new(),
+    };
+    raw.push_str(&build_bundle(files).await);
     let redacted = tokio::time::timeout(
         REDACTION_TIMEOUT,
         crate::feedback_redact::redact_diagnostics_locally(raw),
@@ -233,15 +305,384 @@ async fn build_bundle(files: &[LogFile]) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "storage-fault-injection")]
+    #[tokio::test]
+    async fn probe_failure_child_writes_recovery_log() {
+        let Some(root) = std::env::var_os("SCREENPIPE_TEST_PROBE_FAILURE_ROOT") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let error = match screenpipe_db::DatabaseManager::new_hybrid(
+            &root,
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        {
+            Ok(db) => {
+                db.close().await;
+                panic!("injected probe failure must interrupt fresh bootstrap")
+            }
+            Err(error) => error,
+        };
+        crate::recording::recovery_log::append(
+            &root,
+            "database_startup_failed",
+            &format!("Failed to initialize database: {error}"),
+        );
+    }
+
+    #[cfg(feature = "storage-fault-injection")]
+    #[tokio::test]
+    async fn fresh_bootstrap_probe_failure_survives_normal_support_collection() {
+        let root = tempfile::tempdir().unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("diagnostic_logs::tests::probe_failure_child_writes_recovery_log")
+            .arg("--nocapture")
+            .env("SCREENPIPE_TEST_PROBE_FAILURE_ROOT", root.path())
+            .env("SCREENPIPE_STORAGE_AVAILABLE_SPACE", "error")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "probe failure child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+
+        let report = collect_redacted_from_dirs_at_root(
+            &[root.path().to_path_buf()],
+            root.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let injected = std::io::Error::from_raw_os_error(5);
+        for evidence in [
+            "database_startup_failed".to_owned(),
+            "offline construction disk-space probe failed".to_owned(),
+            format!("error_kind={:?}", injected.kind()),
+            "raw_os_error=Some(5)".to_owned(),
+            format!("cause={injected}"),
+            "required_bytes=2147483648".to_owned(),
+            "reserve_bytes=2147483648 (bytes)".to_owned(),
+            "source retained".to_owned(),
+            "outcome=recording_blocked".to_owned(),
+            "recovery=restore access to the storage drive or data folder".to_owned(),
+            "then retry startup".to_owned(),
+        ] {
+            assert!(
+                report.contains(&evidence),
+                "missing support evidence: {evidence}\n{report}"
+            );
+        }
+        assert!(!report.contains("available_bytes=0"));
+        assert!(!report.contains(root.path().to_str().unwrap()));
+        assert!(root.path().join("storage-init.json").exists());
+    }
+
+    #[tokio::test]
+    async fn fresh_bootstrap_reserve_failure_survives_normal_support_collection() {
+        let root = tempfile::tempdir().unwrap();
+        let mut options = screenpipe_db::storage::MigrationOptions::default();
+        options.budget.disk_reserve_bytes = u64::MAX;
+        let error = match screenpipe_db::DatabaseManager::new_hybrid(
+            root.path(),
+            Default::default(),
+            options,
+        )
+        .await
+        {
+            Ok(db) => {
+                db.close().await;
+                panic!("test reserve must interrupt fresh bootstrap")
+            }
+            Err(error) => error,
+        };
+        let detail = format!("Failed to initialize database: {error}");
+        crate::recording::recovery_log::append(root.path(), "database_startup_failed", &detail);
+
+        let report = collect_redacted_from_dirs_at_root(
+            &[root.path().to_path_buf()],
+            root.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        for evidence in [
+            "database_startup_failed".to_owned(),
+            "offline construction reached disk reserve".to_owned(),
+            "available_bytes=".to_owned(),
+            format!("required_bytes={}", u64::MAX),
+            format!("reserve_bytes={} (bytes)", u64::MAX),
+            "source retained".to_owned(),
+            "outcome=recording_blocked".to_owned(),
+            "recovery=free space".to_owned(),
+            "then retry".to_owned(),
+        ] {
+            assert!(
+                report.contains(&evidence),
+                "missing support evidence: {evidence}\n{report}"
+            );
+        }
+        assert!(!report.contains(root.path().to_str().unwrap()));
+        assert!(root.path().join("storage-init.json").exists());
+    }
+
+    #[tokio::test]
+    async fn storage_support_report_works_without_a_recording_engine() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("storage/payloads");
+        tokio::fs::create_dir_all(&archive).await.unwrap();
+        tokio::fs::write(root.path().join("db.sqlite"), "password=hunter2")
+            .await
+            .unwrap();
+        tokio::fs::write(root.path().join("db.sqlite-wal"), [0u8; 29])
+            .await
+            .unwrap();
+        tokio::fs::write(archive.join("private-window-title.parquet"), [0u8; 43])
+            .await
+            .unwrap();
+        let report = collect_redacted_from_dirs_at_root(&[], root.path().to_path_buf())
+            .await
+            .unwrap();
+        let json = report
+            .strip_prefix("=== Storage support diagnostics ===\n")
+            .unwrap()
+            .split("=== Storage migration diagnostics ===")
+            .next()
+            .unwrap();
+        let evidence: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(evidence["filesystem"]["complete"], true);
+        assert_eq!(
+            evidence["filesystem"]["categories"]["sqlite_wal"]["bytes"],
+            29
+        );
+        assert_eq!(evidence["filesystem"]["categories"]["parquet"]["bytes"], 43);
+        assert_eq!(evidence["filesystem"]["files"], 3);
+        assert!(!report.contains("hunter2"));
+        assert!(!report.contains("private-window-title"));
+        assert!(!report.contains(root.path().to_str().unwrap()));
+        assert_eq!(
+            tokio::fs::read_to_string(root.path().join("db.sqlite"))
+                .await
+                .unwrap(),
+            "password=hunter2"
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_support_failure_remains_visible_in_returned_report() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("private-missing-root");
+        let report = collect_redacted_from_dirs_at_root(&[], missing)
+            .await
+            .unwrap();
+        let json = report
+            .strip_prefix("=== Storage support diagnostics ===\n")
+            .unwrap()
+            .split("=== Storage migration diagnostics ===")
+            .next()
+            .unwrap();
+        let evidence: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(evidence["filesystem"]["complete"], false);
+        assert_eq!(evidence["filesystem"]["failures"][0]["kind"], "NotFound");
+        assert_eq!(
+            evidence["filesystem"]["failures"][0]["operation"],
+            "read_root"
+        );
+        assert!(!report.contains("private-missing-root"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn storage_support_preserves_large_byte_counts_through_redaction() {
+        let root = tempfile::tempdir().unwrap();
+        // Sparse fixture: account for a single 300 GiB file using metadata,
+        // without allocating, reading or copying its logical contents.
+        let path = root.path().join("db.sqlite-wal");
+        let file = std::fs::File::create(&path).unwrap();
+        let size = 300_u64 * 1024 * 1024 * 1024;
+        file.set_len(size).unwrap();
+        let report = collect_redacted_from_dirs_at_root(&[], root.path().to_path_buf())
+            .await
+            .unwrap();
+        let json = report
+            .strip_prefix("=== Storage support diagnostics ===\n")
+            .unwrap()
+            .split("=== Storage migration diagnostics ===")
+            .next()
+            .unwrap();
+        let evidence: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            evidence["filesystem"]["categories"]["sqlite_wal"]["bytes"],
+            size
+        );
+        assert_eq!(
+            evidence["filesystem"]["categories"]["sqlite_wal"]["largest_file_bytes"],
+            size
+        );
+        assert_eq!(std::fs::metadata(path).unwrap().len(), size);
+    }
+
+    #[cfg(feature = "enterprise-build")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn parsed_backlog_failure_and_recovery_survive_collected_support_upload() {
+        let logs = tempfile::tempdir().unwrap();
+        let report =
+            crate::enterprise::sync::tests::check_parsed_backlog_restart(logs.path()).await;
+        assert!(report.contains("ingest server error: status 503"));
+        assert!(report.contains("pending data retained"));
+        assert!(report.contains("pushed 0 frames, 101 parsed"));
+        assert!(report.contains("across 2 page(s)"));
+        assert!(!report.contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn browser_click_url_failure_survives_support_collection_and_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("screenpipe.2026-11-06.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(std::fs::File::create(&current).unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            screenpipe_a11y::capture_diagnostics::report_browser_click_failure(
+                "clicked_window_url",
+                "AXDocument read failed: Error(-25205); AXWebArea/AXURL and browser chrome yielded no URL",
+                Duration::from_millis(17),
+                "forwarded_to_privacy_filter",
+            );
+            screenpipe_a11y::capture_diagnostics::report_browser_click_failure(
+                "clicked_window",
+                "AXWindow read failed: Error(-25205); clicked AXParent read failed: Error(-25202)",
+                Duration::from_millis(19),
+                "withheld_unattributable",
+            );
+            screenpipe_a11y::capture_diagnostics::report_browser_click_failure(
+                "clicked_element",
+                "system-wide AX hit-test failed: Error(-25208); receiver window resolution failed: CGEvent receiver window ID missing",
+                Duration::from_millis(23),
+                "withheld_unattributable",
+            );
+        });
+        std::fs::rename(&current, dir.path().join("screenpipe.2026-11-06.1.log")).unwrap();
+        std::fs::write(&current, "recorder restarted\npassword=hunter2\n").unwrap();
+        let report = collect_redacted_from_dirs(&[dir.path().to_path_buf()])
+            .await
+            .unwrap();
+        for evidence in [
+            "browser click URL unavailable",
+            "clicked_window_url",
+            "AXDocument read failed",
+            "-25205",
+            "AXWebArea/AXURL and browser chrome yielded no URL",
+            "elapsed_ms=17",
+            "url_outcome=\"unavailable\"",
+            "event_outcome=\"forwarded_to_privacy_filter\"",
+            "active URL policy may withhold the click and its capture trigger",
+            "recorder restarted",
+            "clicked AXParent read failed",
+            "-25202",
+            "withheld_unattributable",
+            "clicked_element",
+            "system-wide AX hit-test failed",
+            "receiver window resolution failed",
+            "CGEvent receiver window ID missing",
+            "-25208",
+        ] {
+            assert!(
+                report.contains(evidence),
+                "support evidence missing {evidence}"
+            );
+        }
+        assert!(!report.contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn filtered_screenshot_failure_survives_rotation_and_support_redaction() {
+        let root = tempfile::tempdir().unwrap();
+        let emitted = include_str!(
+            "../../../../crates/screenpipe-screen/tests/fixtures/filtered-capture-diagnostic.txt"
+        );
+        tokio::fs::write(
+            root.path().join("screenpipe.2026-11-05.1.log"),
+            format!("{emitted}\npassword=hunter2\n"),
+        ).await.unwrap();
+        tokio::fs::write(root.path().join("screenpipe.2026-11-05.log"), "INFO recorder restarted\n")
+            .await.unwrap();
+        let report = collect_redacted_from_dirs(&[root.path().to_path_buf()]).await.unwrap();
+        assert!(report.contains("window-filtered screenshot withheld"));
+        assert!(report.contains("window privacy policy changed during capture"));
+        assert!(report.contains("monitor_id=2"));
+        assert!(report.contains("screenshot_outcome=\"withheld\""));
+        assert!(report.contains("accessibility_outcome=\"independent\""));
+        assert!(report.contains("recorder restarted"));
+        assert!(!report.contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn cached_screenshot_source_failure_and_recovery_survive_support_collection() {
+        let root = tempfile::tempdir().unwrap();
+        // Actual INFO/WARN output from the disposable macOS source recovery run.
+        let emitted = include_str!(
+            "../../../../crates/screenpipe-screen/tests/fixtures/cached-screenshot-source-diagnostic.txt"
+        );
+        tokio::fs::write(root.path().join("screenpipe-app.2026-11-13.1.log"), emitted)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.path().join("screenpipe-app.2026-11-13.log"),
+            "contact=cache-fixture@screenpipe.test\n",
+        )
+        .await
+        .unwrap();
+        let report = collect_redacted_from_dirs_at_root(
+            &[root.path().to_path_buf()],
+            root.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        for evidence in [
+            "desktop scene changed during privacy capture",
+            "window-filtered capture recovered after scene change",
+            "monitor_id=1",
+            "screenshot_outcome=\"retrying\"",
+            "screenshot_outcome=\"captured\"",
+            "next stream frame unavailable",
+            "screenshot_outcome=\"waiting_for_stream\"",
+            "cached_frame_available=false",
+        ] {
+            assert!(
+                report.contains(evidence),
+                "missing collected support evidence: {evidence}"
+            );
+        }
+        assert_eq!(
+            report
+                .matches("persistent whole-display screenshot stream started")
+                .count(),
+            1,
+            "redaction failure and recovery must retain the single native source"
+        );
+        assert!(report.contains("capture_scope=\"display\""));
+        assert!(report.contains("continuous screenshot source recovered"));
+        assert!(!report.contains("cache-fixture@screenpipe.test"));
+        println!("CACHE_SOURCE_COLLECTED_SUPPORT={report}");
+    }
+
     #[tokio::test]
     async fn enterprise_retention_failure_survives_support_redaction() {
         let root = tempfile::tempdir().unwrap();
         let emitted = include_str!(
             "../../../../crates/screenpipe-engine/tests/fixtures/retention-failure-diagnostic.txt"
         );
+        let bulk = include_str!(
+            "../../../../crates/screenpipe-engine/tests/fixtures/retention-bulk-failure-diagnostic.txt"
+        );
         tokio::fs::write(
             root.path().join("screenpipe.2026-10-21.log"),
-            format!("{emitted}\npassword=hunter2\n"),
+            format!("{emitted}\n{bulk}\npassword=hunter2\n"),
         )
         .await
         .unwrap();
@@ -250,8 +691,24 @@ mod tests {
             .unwrap();
         assert!(bundle.contains("retention: batch delete failed"));
         assert!(bundle.contains("no such table: video_chunks"));
+        assert!(bundle.contains("retention fixture interrupted after index mutation"));
+        assert!(bundle.contains("(code: 1811)"));
+        assert!(bundle.contains("range remains pending"));
+        assert!(bundle.contains("retention: batch deleted frames=1"));
         assert!(bundle.contains("2026-10-12 20:00:00"));
         assert!(!bundle.contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn recording_stop_failure_keeps_trigger_cause_and_outcome_in_support_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        crate::capture_session::record_stop_failure(root.path(), "update", &["vision_stop_timeout".into()]);
+        let report = collect_redacted_from_dirs(&[root.path().to_owned()]).await.unwrap();
+        assert!(report.contains("capture_stop_failed"));
+        assert!(report.contains("trigger=update"));
+        assert!(report.contains("vision_stop_timeout"));
+        assert!(report.contains("capture_shutdown_incomplete"));
+        assert!(!report.contains(root.path().to_str().unwrap()));
     }
 
     #[cfg(feature = "enterprise-build")]
@@ -271,6 +728,7 @@ mod tests {
             &event,
             &serde_json::json!({"ok": true, "recording_event_error": "persistence_failed", "recording_event_storage_code": "42P01"}),
         );
+        crate::enterprise::recording_events::acknowledge(&path, &event, &serde_json::json!({"recording_event_error":"expectation_state_mismatch"}));
         let report = collect_redacted_from_dirs(&[root.path().to_owned()])
             .await
             .unwrap();
@@ -278,10 +736,91 @@ mod tests {
         assert!(report.contains("persistence_failed"));
         assert!(report.contains("42P01"));
         assert!(report.contains("delivery_pending"));
+        assert!(report.contains("expectation_state_mismatch"));
         assert!(
             path.exists(),
             "support collection must preserve pending events"
         );
+    }
+
+    #[tokio::test]
+    async fn unattended_migration_evidence_survives_missing_logs_and_redaction() {
+        use screenpipe_db::{storage, DatabaseManager};
+        let root = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::new_hybrid(root.path(), Default::default(), Default::default())
+            .await
+            .unwrap();
+        db.close().await;
+        let descriptor = storage::StorageDescriptor::read(root.path())
+            .unwrap()
+            .unwrap();
+        let receipt = serde_json::json!({
+            "database_id": descriptor.database_id, "generation": descriptor.generation,
+            "frames": 0, "tables": [], "source_bytes": 4096,
+            "index_bytes": 2048, "payload_bytes": 0,
+        });
+        let receipt_path = root.path().join("storage-migration-complete.json");
+        std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        // No rolling logs: a later process must still expose the matching
+        // durable receipt without reading the recording database.
+        let report = collect_redacted_from_dirs_at_root(&[], root.path().to_path_buf())
+            .await
+            .unwrap();
+        assert!(report.contains("\"receipt_matches_active_storage\": true"));
+        assert!(report.contains("\"pending\": false"));
+        assert!(report.contains(&descriptor.database_id));
+
+        // Interrupted/failed work must remain diagnosable even with a receipt
+        // from another generation and enough log text to fill the old bundle.
+        let mut mismatched = receipt;
+        mismatched["generation"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+        std::fs::write(&receipt_path, serde_json::to_vec(&mismatched).unwrap()).unwrap();
+        std::fs::write(root.path().join("storage-migration.json"), "{}").unwrap();
+        std::fs::write(root.path().join("storage-migration-error.txt"),
+            "archive verification failed; pending data retained; contact private.person@example.com").unwrap();
+        let logs = root.path().join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        for day in 10..17 {
+            std::fs::write(
+                logs.join(format!("screenpipe.2026-10-{day}.log")),
+                "INFO normal recording resumed\n".repeat(8192),
+            )
+            .unwrap();
+        }
+        let report = collect_redacted_from_dirs_at_root(&[logs], root.path().to_path_buf())
+            .await
+            .unwrap();
+        assert!(report.contains("\"receipt_matches_active_storage\": false"));
+        assert!(report.contains("\"pending\": true"));
+        assert!(report.contains("archive verification failed"));
+        assert!(report.contains("pending data retained"));
+        assert!(!report.contains("private.person@example.com"));
+
+        // Verify the exact redacted bytes received by the support upload port,
+        // rather than only an unredacted snapshot or local tracing line.
+        use wiremock::{
+            matchers::{body_string_contains, method},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let support = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(body_string_contains("archive verification failed"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&support)
+            .await;
+        reqwest::Client::new()
+            .put(support.uri())
+            .body(report)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let uploads = support.received_requests().await.unwrap();
+        let received = String::from_utf8_lossy(&uploads[0].body);
+        assert!(received.contains("\"pending\": true"));
+        assert!(!received.contains("private.person@example.com"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -370,6 +909,61 @@ mod tests {
         assert!(!report.contains("private-person@example.com"));
     }
 
+    #[tokio::test]
+    async fn induced_wgc_interval_failure_and_recovery_reach_normal_redacted_collector() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("screenpipe-app.2026-11-13.log");
+        // Induced collector fixture only. The screenpipe-screen unit invokes the
+        // production WGC outcome recorder and checks these fields at their source.
+        std::fs::write(
+            &current,
+            concat!(
+                "WARN WGC native minimum update interval failed transiently requested_fps=2 interval_ticks=5000000 cause=FreshRequestRestore outcome=failed error=HRESULT(0x80004005): Unspecified error; retaining safe demand-driven capture; a later retry can recover native rate control\n",
+                "INFO WGC native minimum update interval recovered requested_fps=2 interval_ticks=5000000 cause=FreshRequestRestore outcome=recovered\n",
+                "INFO contact=private-person@example.com\n",
+            ),
+        )
+        .unwrap();
+        let report = collect_redacted_from_dirs(&[dir.path().to_path_buf()])
+            .await
+            .unwrap();
+        assert!(report.contains("requested_fps=2"));
+        assert!(report.contains("interval_ticks=5000000"));
+        assert!(report.contains("cause=FreshRequestRestore"));
+        assert!(report.contains("outcome=failed"));
+        assert!(report.contains("HRESULT(0x80004005)"));
+        assert!(report.contains("retaining safe demand-driven capture"));
+        assert!(report.contains("outcome=recovered"));
+        assert!(report.contains("native minimum update interval recovered"));
+        assert!(!report.contains("private-person@example.com"));
+        println!("redacted WGC interval support report:\n{report}");
+    }
+
+    #[tokio::test]
+    async fn pi_summary_failure_survives_rotation_and_support_redaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("screenpipe-app.2026-11-03.log");
+        // Same stderr envelope emitted by the pinned summarizer and retained by
+        // the existing Pi stderr reader. No conversation content is logged.
+        std::fs::write(&current, concat!(
+            "WARN Pi stderr: Summarization failed at record 1/1 (input 26215 bytes, output 6553 tokens, context 32768 tokens; original history retained): Summarization incomplete (error): provider rejected summary: context_length_exceeded\n",
+            "INFO contact=private-person@example.com\n"
+        )).unwrap();
+        std::fs::rename(&current, dir.path().join("screenpipe-app.2026-11-03.1.log")).unwrap();
+        std::fs::write(&current, "INFO recorder restarted\n").unwrap();
+        let report = collect_redacted_from_dirs(&[dir.path().to_path_buf()])
+            .await
+            .unwrap();
+        assert!(report.contains("Summarization failed at record 1/1"));
+        assert!(report.contains("input 26215 bytes"));
+        assert!(report.contains("output 6553 tokens"));
+        assert!(report.contains("context 32768 tokens"));
+        assert!(report.contains("original history retained"));
+        assert!(report.contains("context_length_exceeded"));
+        assert!(report.contains("recorder restarted"));
+        assert!(!report.contains("private-person@example.com"));
+    }
+
     #[cfg(feature = "enterprise-build")]
     #[tokio::test]
     async fn ingest_transport_cause_survives_rotation_and_support_redaction() {
@@ -394,6 +988,31 @@ mod tests {
         assert!(!report.contains("private-person@example.com"));
         assert!(!report.contains("private-signature"));
         assert!(!report.contains("private-license"));
+    }
+
+    #[cfg(feature = "enterprise-build")]
+    #[tokio::test]
+    async fn local_transport_cause_survives_rotation_and_support_redaction() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::enterprise::sync::tests::check_retained_local_transport_error(dir.path()).await;
+        for index in 0..7 {
+            tokio::fs::write(
+                dir.path()
+                    .join(format!("screenpipe-app.2026-10-27.{index}.log")),
+                "INFO recorder restarted\n",
+            )
+            .await
+            .unwrap();
+        }
+        let report = collect_redacted_from_dirs(&[dir.path().to_path_buf()])
+            .await
+            .unwrap();
+        assert!(report.contains("read frame recordings"));
+        assert!(report.to_lowercase().contains("refused"));
+        assert!(report.contains("os error"));
+        assert!(report.contains("pending data retained"));
+        assert!(!report.contains("private-person@example.com"));
+        assert!(!report.contains("private-signature"));
     }
 
     #[cfg(feature = "enterprise-build")]
@@ -450,6 +1069,98 @@ mod tests {
         assert!(!report.contains("private-person@example.com"));
     }
 
+    #[cfg(feature = "enterprise-build")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn image_source_revocation_and_recovery_survive_support_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = screenpipe_db::DatabaseManager::new(
+            dir.path().join("db.sqlite").to_str().unwrap(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        db.configure_release(&screenpipe_db::privacy_release::ReleasePolicy {
+            identity: "image-test-v1".into(),
+            text: false,
+            images: true,
+        })
+        .await
+        .unwrap();
+        db.execute_raw_sql_write("INSERT INTO frames(id,timestamp,snapshot_path) VALUES(1,'2026-10-16','private-person@example.com.jpg')").await.unwrap();
+        let job = db.release_pending("image", 1).await.unwrap().remove(0);
+        assert!(db.publish_image_release(&job).await.unwrap());
+        let export = db.storage_export_token().await.unwrap();
+        db.execute_raw_sql_write("UPDATE frames SET snapshot_path='replacement.jpg' WHERE id=1")
+            .await
+            .unwrap();
+        let error = export.admit(&db.pool).await.unwrap_err();
+        let job = db.release_pending("image", 1).await.unwrap().remove(0);
+        // Send the real database failure through the production sync worker,
+        // retry retention, recovery acknowledgement and support upload path.
+        let uploaded = crate::enterprise::sync::tests::check_sync_retry_failure_with_cause(
+            dir.path(),
+            Some(&error.to_string()),
+        )
+        .await;
+        assert!(uploaded.contains("privacy revision changed"));
+        assert!(uploaded.contains("pending data retained"));
+        let current = dir.path().join("screenpipe-app.log");
+        drop(export);
+        db.close().await;
+        tokio::fs::rename(&current, dir.path().join("screenpipe-app.2026-10-23.1.log"))
+            .await
+            .unwrap();
+        let db = screenpipe_db::DatabaseManager::new(
+            dir.path().join("db.sqlite").to_str().unwrap(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        assert!(db.publish_image_release(&job).await.unwrap());
+        let export = db.storage_export_token().await.unwrap();
+        drop(export.admit(&db.pool).await.unwrap());
+        drop(export);
+        db.close().await;
+        tokio::fs::write(
+            &current,
+            "INFO recorder restarted contact=private-person@example.com\n",
+        )
+        .await
+        .unwrap();
+        let report = collect_redacted_from_dirs(&[dir.path().to_path_buf()])
+            .await
+            .unwrap();
+        assert!(report.contains("privacy revision changed"));
+        assert!(report.contains("pending data retained"));
+        assert!(report.contains("recorder restarted"));
+        assert!(!report.contains("private-person@example.com"));
+    }
+
+    #[cfg(feature = "enterprise-support")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn protected_upload_revocation_survives_collected_support_redaction() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::enterprise_sync::check_protected_upload_revocations(dir.path()).await;
+        let path = dir.path().join("screenpipe-app.2026-10-23.log");
+        std::fs::rename(&path, dir.path().join("screenpipe-app.2026-10-23.1.log")).unwrap();
+        std::fs::write(
+            path,
+            "INFO recorder restarted contact=private-person@example.com\n",
+        )
+        .unwrap();
+        let report = collect_redacted_from_dirs(&[dir.path().to_path_buf()])
+            .await
+            .unwrap();
+        assert!(report.contains("privacy revision changed"));
+        assert!(report.contains("certified survivors retained; stale selections excluded"));
+        assert!(report.contains("selected_records="));
+        assert!(report.contains("retained_records="));
+        assert!(report.contains("recorder restarted"));
+        assert!(!report.contains("private-person@example.com"));
+        assert!(!report.contains("PRIVATE_ORIGINAL"));
+        assert!(!report.contains("UNPROCESSED_PRIVATE_EDIT"));
+    }
+
     #[tokio::test]
     async fn installer_failure_reaches_redacted_support_bundle() {
         let dir = tempfile::tempdir().unwrap();
@@ -458,6 +1169,7 @@ mod tests {
             concat!(
                 "installer_elevation_failed: result=1223 scope=all recovery=original_app_relaunch_succeeded contact=private-person@example.com\n",
                 "installer_migration_failed: operation=copy_enterprise_config windows_result=5 scope=current recovery=original_app_relaunch_result_0 contact=private-person@example.com\n",
+                "uninstaller_app_data_cleanup_failed: operation=remove_directory path=current_profile_screenpipe_data windows_result=145 outcome=data_retained contact=private-person@example.com\n",
             ),
         )
         .await
@@ -465,12 +1177,18 @@ mod tests {
         let report = collect_redacted_from_dirs(&[dir.path().to_path_buf()])
             .await
             .unwrap();
+        println!("redacted installer failure support report:\n{report}");
         assert!(report.contains("installer_elevation_failed: result=1223"));
         assert!(report.contains("recovery=original_app_relaunch_succeeded"));
         assert!(report.contains(
             "installer_migration_failed: operation=copy_enterprise_config windows_result=5"
         ));
         assert!(report.contains("recovery=original_app_relaunch_result_0"));
+        assert!(report.contains(
+            "uninstaller_app_data_cleanup_failed: operation=remove_directory"
+        ));
+        assert!(report.contains("path=current_profile_screenpipe_data"));
+        assert!(report.contains("windows_result=145 outcome=data_retained"));
         assert!(!report.contains("private-person@example.com"));
     }
 
@@ -485,6 +1203,19 @@ mod tests {
         assert!(report.contains("database disk image is malformed"));
         assert!(report.contains("pending work retained, retrying in 300s"));
         assert!(!report.contains("backing off 3600s"));
+    }
+
+    #[cfg(feature = "enterprise-build")]
+    #[tokio::test]
+    async fn screenshot_worker_origin_survives_collected_support_upload_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let report =
+            crate::enterprise::sync::screenshot_delivery::check_collected_failure(dir.path()).await;
+        assert!(report.contains("screenshot_fetch_failed"));
+        assert!(report.contains("PermissionDenied"));
+        assert!(report.contains("retry_pending"));
+        assert!(!report.contains("hunter2"));
+        assert!(!report.contains("private-person@example.com"));
     }
 
     #[cfg(feature = "enterprise-build")]
@@ -633,6 +1364,101 @@ mod tests {
         assert!(report.contains("attempted to acquire a connection on a closed pool"));
         assert!(report.contains("recorder restarted"));
         assert!(!report.contains("private-person@example.com"));
+    }
+
+    #[tokio::test]
+    async fn audio_recorder_handoff_survives_collection_and_redaction() {
+        let diagnostic = include_str!(
+            "../../../../crates/screenpipe-audio/tests/fixtures/audio-recorder-handoff-diagnostic.txt"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("screenpipe-app.2026-10-28.log"), diagnostic)
+            .await
+            .unwrap();
+
+        let report = collect_redacted_from_dirs(&[dir.path().to_path_buf()])
+            .await
+            .unwrap();
+        assert!(report.contains("detected stale recording handle"));
+        assert!(report.contains("starting recording for device"));
+        assert!(report.contains("attaching replacement recorder"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pi_bun_repair_failure_and_recovery_survive_support_redaction() {
+        let root = tempfile::tempdir().unwrap();
+        let logs = root.path().join("logs");
+        let config = root.path().join("pi-config");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let current = logs.join("screenpipe-app.2026-11-05.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(std::fs::File::create(&current).unwrap())
+            .finish();
+        let settings_path = config.join("settings.json");
+        let stale_bun = config.join("stale-install").join("bun.exe");
+        let replacement_bun = config.join("current-install").join("bun.exe");
+        std::fs::create_dir_all(replacement_bun.parent().unwrap()).unwrap();
+        std::fs::write(&replacement_bun, b"").unwrap();
+        let stale_settings = serde_json::to_vec(&serde_json::json!({
+            "npmCommand": [stale_bun],
+            "unrelated": {"keep": true}
+        }))
+        .unwrap();
+        std::fs::write(&settings_path, &stale_settings).unwrap();
+
+        let mut permissions = std::fs::metadata(&settings_path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&settings_path, permissions).unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                privacy_sentinel = "pi-bun-private-person@example.com",
+                "Pi repair privacy sentinel"
+            );
+            let error = screenpipe_core::agents::pi::ensure_pi_package_manager_settings(
+                &config,
+                replacement_bun.to_str().unwrap(),
+            )
+            .expect_err("Windows must refuse to replace a read-only settings file");
+            assert!(error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(|error| error.raw_os_error())
+                    == Some(5)
+            }));
+            assert_eq!(std::fs::read(&settings_path).unwrap(), stale_settings);
+
+            let mut permissions = std::fs::metadata(&settings_path).unwrap().permissions();
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&settings_path, permissions).unwrap();
+            screenpipe_core::agents::pi::ensure_pi_package_manager_settings(
+                &config,
+                replacement_bun.to_str().unwrap(),
+            )
+            .unwrap();
+            let repaired: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+            assert_eq!(repaired["npmCommand"], serde_json::json!([replacement_bun]));
+            assert_eq!(repaired["unrelated"], serde_json::json!({"keep": true}));
+        });
+        std::fs::rename(&current, logs.join("screenpipe-app.2026-11-05.1.log")).unwrap();
+        std::fs::write(&current, "screenpipe restarted after Pi settings repair\n").unwrap();
+
+        let report = collect_redacted_from_dirs(&[logs]).await.unwrap();
+        assert!(report.contains("failed to repair Pi package-manager command"));
+        assert!(report.contains("repaired Pi package-manager command"));
+        assert!(report.contains("stale_path="));
+        assert!(report.contains("stale-install"));
+        assert!(report.contains("replacement_path="));
+        assert!(report.contains("current-install"));
+        assert!(report.contains("outcome=\"failed\""));
+        assert!(report.contains("outcome=\"repaired\""));
+        assert!(report.contains("managed Bun executable is missing"));
+        assert!(report.contains("Access is denied") || report.contains("os error 5"));
+        assert!(report.contains("screenpipe restarted after Pi settings repair"));
+        assert!(!report.contains("pi-bun-private-person@example.com"));
     }
 
     #[cfg(windows)]
@@ -947,6 +1773,47 @@ mod tests {
         assert!(!report.contains("private-person@example.com"));
     }
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn windows_pipe_containment_failure_survives_rotation_and_support_redaction() {
+        // The process lifecycle is exercised on Windows. This representative
+        // assignment failure exercises the actual support collection boundary.
+        let logs = tempdir().unwrap();
+        let current = logs.path().join("screenpipe-app.2026-11-16.log");
+        let cause = "Access is denied. (os error 5)";
+        let failure = format!(
+            "failed to contain pi process 731: {cause}; process-state observation: live child observed; cleanup request: accepted; reap: completed"
+        );
+        std::fs::write(
+            &current,
+            format!(
+                "ERROR pipe 'digital-clone' error: {failure}\ncontact=private-person@example.com\n"
+            ),
+        )
+        .unwrap();
+        std::fs::rename(
+            &current,
+            logs.path().join("screenpipe-app.2026-11-16.1.log"),
+        )
+        .unwrap();
+        std::fs::write(
+            &current,
+            "screenpipe restarted; digital-clone remains disabled\n",
+        )
+        .unwrap();
+
+        let report = collect_redacted_from_dirs(&[logs.path().to_path_buf()])
+            .await
+            .unwrap();
+        for evidence in [
+            "pipe 'digital-clone' error:",
+            failure.as_str(),
+            "screenpipe restarted; digital-clone remains disabled",
+        ] {
+            assert!(report.contains(evidence), "support report lost {evidence}");
+        }
+        assert!(!report.contains("private-person@example.com"));
+    }
 
     #[tokio::test]
     async fn pi_compaction_failure_survives_rotation_and_support_redaction() {

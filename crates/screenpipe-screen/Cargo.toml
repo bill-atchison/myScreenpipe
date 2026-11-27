@@ -17,12 +17,15 @@ edition = { workspace = true }
 [features]
 default = []
 e2e = []
+screenshot-benchmark = ["windows/Win32_UI_HiDpi"]
 
 [dependencies]
 screenpipe-fs = { path = "../screenpipe-fs" }
+screenpipe-config = { path = "../screenpipe-config" }
 screenpipe-a11y = { path = "../screenpipe-a11y" }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
 
 # async
 tokio = { workspace = true }
@@ -54,6 +57,7 @@ url = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }
 criterion = { workspace = true }
 strsim = { workspace = true }
 memory-stats = "1.2.0"
@@ -86,7 +90,7 @@ harness = false
 sck-rs = { git = "https://github.com/screenpipe/sck-rs", rev = "62d79abed212015eb9beaa03138002807f61f59a" }
 xcap = { workspace = true }
 libc = { workspace = true }
-cidre = { git = "https://github.com/yury/cidre.git", rev = "8481f3f0dc7dd39bb5be80d9424bfac0cad3801a", features = ["vn", "cv", "cg", "app"] }
+cidre = { git = "https://github.com/yury/cidre.git", rev = "8481f3f0dc7dd39bb5be80d9424bfac0cad3801a", features = ["vn", "cv", "cg", "app", "mtl"] }
 accessibility-sys = { workspace = true }
 core-foundation = { workspace = true }
 core-graphics = { workspace = true }
@@ -115,7 +119,9 @@ windows = { workspace = true, features = [
   "Graphics_DirectX_Direct3D11",
   "Win32_Foundation",
   "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D_Fxc",
   "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dwm",
   "Win32_Graphics_Dxgi",
   "Win32_Graphics_Dxgi_Common",
   "Win32_Graphics_Gdi",
@@ -126,10 +132,12 @@ windows = { workspace = true, features = [
   # Detect Remote Desktop / Terminal Services sessions so WGC can be scoped to
   # individual screenshot requests instead of loading the remote compositor.
   "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Accessibility",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 xcap = { workspace = true }
+xcb = { version = "1.7", features = ["composite"] }
 ashpd = { version = "0.10.3", default-features = false, features = ["async-std"] }
 pipewire = "0.9"
 libc = { workspace = true }
@@ -137,3 +145,11 @@ atspi = { version = "0.25.0", features = ["tokio","proxies-tokio","zbus"] }
 zbus = { workspace = true, default-features = false }
 atspi-common     = { version = "0.9.0", default-features = false }
 atspi-proxies    = { version = "0.9.0", default-features = false }
+
+[[example]]
+name = "gpu_screenshot_benchmark"
+required-features = ["screenshot-benchmark"]
+
+[[example]]
+name = "gpu_preencode_benchmark"
+required-features = ["screenshot-benchmark"]

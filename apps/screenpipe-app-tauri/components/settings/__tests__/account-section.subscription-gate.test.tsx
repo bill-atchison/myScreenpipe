@@ -28,7 +28,7 @@ import {
 } from "@testing-library/react";
 
 const mocks = vi.hoisted(() => ({
-  state: { user: null as any, dataSyncEnabled: false },
+  state: { user: null as any, dataSyncEnabled: false, pipeSyncEnabled: false },
   managed: false,
   managedAuthenticated: true,
   updateSettings: vi.fn().mockResolvedValue(undefined),
@@ -53,9 +53,9 @@ vi.mock("@/lib/hooks/use-settings", () => ({
   useSettings: () => ({
     settings: {
       user: mocks.state.user,
-      pipeSyncEnabled: false,
+      pipeSyncEnabled: mocks.state.pipeSyncEnabled,
       memoriesSyncEnabled: false,
-      connectionSyncEnabled: false,
+      connectionsSyncEnabled: false,
       deviceId: "test-device-id",
       dataSyncEnabled: mocks.state.dataSyncEnabled,
       dataSyncDeviceName: "Work laptop",
@@ -148,6 +148,7 @@ describe("AccountSection subscription/login gating", () => {
     mocks.eventHandlers.clear();
     mocks.state.user = null;
     mocks.state.dataSyncEnabled = false;
+    mocks.state.pipeSyncEnabled = false;
     mocks.dataSyncFetch.mockReset();
     mocks.managed = false;
     mocks.managedAuthenticated = true;
@@ -462,12 +463,35 @@ describe("AccountSection subscription/login gating", () => {
     expect(loginStatus()).toContain("logged in as basic@screenpipe.test");
     expect(screen.queryByTestId(ACTIVE_CARD)).not.toBeInTheDocument();
     expect(screen.queryByTestId("account-data-sync-setting")).not.toBeInTheDocument();
+    expect(screen.getByTestId("account-data-sync-locked")).toBeInTheDocument();
     // Branch-3 named-plan badge still renders for the paying Basic user.
     expect(screen.getByText("Active")).toBeInTheDocument();
     expect(screen.getByTestId("account-plan-standard")).toHaveAttribute(
       "data-current", "true",
     );
     expect(screen.queryByText(/One-time purchase/)).not.toBeInTheDocument();
+  });
+
+  it("tracks and routes Basic users from the locked personal data sync card to Business upgrade", () => {
+    mocks.state.user = {
+      id: "u1",
+      email: "basic@screenpipe.test",
+      token: "tok",
+      cloud_subscribed: false,
+      subscription_plan: "standard",
+    };
+
+    render(<AccountSection />);
+
+    const lockedCard = screen.getByTestId("account-data-sync-locked");
+    expect(within(lockedCard).getByText("Data sync")).toBeVisible();
+    expect(within(lockedCard).queryByRole("switch")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("locked-data-sync-upgrade-button"));
+
+    expect(mocks.capture).toHaveBeenCalledWith("desktop_upgrade_entry_clicked", {
+      source: "locked-data-sync",
+      target_plan: "business",
+    });
   });
 
   it("sends existing Basic subscribers to billing even with a stale cloud flag", () => {
@@ -562,6 +586,7 @@ describe("AccountSection subscription/login gating", () => {
     expect(screen.queryByTestId(ACTIVE_CARD)).not.toBeInTheDocument();
     expect(screen.getByText(/sign in to screenpipe/i)).toBeInTheDocument();
     expect(screen.queryByTestId("account-data-sync-setting")).not.toBeInTheDocument();
+    expect(screen.getByTestId("account-data-sync-locked")).toBeInTheDocument();
   });
 
   function signInForDataSync() {
@@ -580,6 +605,38 @@ describe("AccountSection subscription/login gating", () => {
     };
   }
 
+  it("keeps an existing partial choice and enables both preferences with one write", async () => {
+    signInForDataSync();
+    mocks.state.pipeSyncEnabled = true;
+    render(<AccountSection />);
+
+    const sync = screen.getByRole("region", { name: "Data sync" });
+    const combined = within(sync).getByRole("checkbox", { name: "Tasks and memories" });
+    expect(combined).toHaveAttribute("aria-checked", "mixed");
+    expect(mocks.updateSettings).not.toHaveBeenCalled();
+
+    fireEvent.click(combined);
+    expect(mocks.updateSettings).toHaveBeenCalledTimes(1);
+    expect(mocks.updateSettings).toHaveBeenCalledWith({
+      pipeSyncEnabled: true,
+      memoriesSyncEnabled: true,
+    });
+    expect(mocks.dataSyncFetch).not.toHaveBeenCalled();
+    expect(within(sync).getByRole("switch", { name: "Connected accounts" })).not.toBeChecked();
+  });
+
+  it("keeps connection sync an independent opt-in", () => {
+    signInForDataSync();
+    render(<AccountSection />);
+
+    const sync = screen.getByRole("region", { name: "Data sync" });
+    fireEvent.click(within(sync).getByRole("switch", { name: "Connected accounts" }));
+
+    expect(mocks.updateSettings).toHaveBeenCalledTimes(1);
+    expect(mocks.updateSettings).toHaveBeenCalledWith({ connectionsSyncEnabled: true });
+    expect(mocks.dataSyncFetch).not.toHaveBeenCalled();
+  });
+
   it("enables account consent and this device from the visible switch before saving locally", async () => {
     signInForDataSync();
     let finishDevice!: (response: Response) => void;
@@ -589,7 +646,8 @@ describe("AccountSection subscription/login gating", () => {
         finishDevice = resolve;
       }));
     render(<AccountSection />);
-    const sync = screen.getByRole("switch", { name: "Sync this device" });
+    expect(screen.queryByTestId("account-data-sync-locked")).not.toBeInTheDocument();
+    const sync = screen.getByRole("switch", { name: "Upload history from this device" });
     expect(sync).toBeVisible();
     expect(sync.closest("details")).toBeNull();
     expect(mocks.dataSyncFetch).not.toHaveBeenCalled();
@@ -637,9 +695,9 @@ describe("AccountSection subscription/login gating", () => {
       JSON.stringify({ error: "sync service unavailable" }), { status: 503 },
     ));
     render(<AccountSection />);
-    fireEvent.click(screen.getByRole("switch", { name: "Sync this device" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Upload history from this device" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Could not update syncing on this device");
-    expect(screen.getByRole("switch", { name: "Sync this device" })).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByRole("switch", { name: "Upload history from this device" })).toHaveAttribute("aria-checked", "false");
     expect(mocks.updateSettings).not.toHaveBeenCalled();
     expect(mocks.dataSyncFetch).toHaveBeenCalledTimes(stage === "account" ? 1 : 2);
 
@@ -658,7 +716,7 @@ describe("AccountSection subscription/login gating", () => {
     render(<AccountSection />);
     await screen.findByText("Waiting for the first upload. Keep Screenpipe running.");
     mocks.dataSyncFetch.mockClear();
-    fireEvent.click(screen.getByRole("switch", { name: "Sync this device" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Upload history from this device" }));
     await waitFor(() => expect(mocks.updateSettings).toHaveBeenCalledWith({
       dataSyncEnabled: false,
       dataSyncDeviceName: "Work laptop",
@@ -673,4 +731,21 @@ describe("AccountSection subscription/login gating", () => {
     await waitFor(() => expect(mocks.openUrl).toHaveBeenCalledWith("https://screenpipe.com/account"));
     expect(mocks.dataSyncFetch).toHaveBeenCalledTimes(1);
   });
+});
+
+it("shows workspace access without a personal plan or activation button in managed mode", () => {
+  mocks.managed = true;
+  mocks.state.user = {
+    id: "workspace-member",
+    token: "fixture-token",
+    email: "member@example.test",
+    cloud_subscribed: true,
+    subscription_plan: "pro",
+    enterprise_account: { requires_enterprise_app: true },
+  };
+  render(<AccountSection />);
+
+  expect(screen.getByTestId("account-enterprise-managed-card")).toBeInTheDocument();
+  expect(screen.queryByTestId("account-cloud-active-card")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Use workspace on this device" })).not.toBeInTheDocument();
 });

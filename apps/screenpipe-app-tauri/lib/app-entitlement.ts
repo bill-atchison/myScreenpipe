@@ -56,12 +56,31 @@ export type AppEnterpriseAccount = {
   is_screenpipe_user?: boolean | null;
 };
 
+export type AppOrgSeatAvailable = {
+  team_id?: string | null;
+  license_id?: string | null;
+  org_name?: string | null;
+  domain?: string | null;
+  request_status?: "none" | "pending" | string | null;
+  requested_at?: string | null;
+};
+
+export type AppDeviceLimitStatus = {
+  allowed?: boolean | null;
+  reason?: "device_limit_exceeded" | string | null;
+  limit?: number | null;
+  active_count?: number | null;
+  evicted_device_ids?: string[] | null;
+};
+
 export type AppUser = User & {
   app_entitled?: boolean | null;
   subscription_plan?: string | null;
   plan_expires_at?: string | null;
   entitlement?: AppEntitlement | JsonValue | null;
   enterprise_account?: AppEnterpriseAccount | JsonValue | null;
+  org_seat_available?: AppOrgSeatAvailable | JsonValue | null;
+  device_limit_status?: AppDeviceLimitStatus | JsonValue | null;
   /**
    * Whether Stripe holds a payment method for this account. Server-derived
    * from the entitlement source; see website `/api/user`.
@@ -84,8 +103,7 @@ export const APP_ENTITLEMENT_MAX_STALE_MS = 72 * 60 * 60 * 1000;
 export const APP_ENTITLEMENT_CLOCK_SKEW_MS = 5 * 60 * 1000;
 export const TOKEN_HYDRATION_GRACE_MS = 60 * 1000;
 export const PRICING_URL = screenpipeWebUrl("/onboarding", "https://screenpipe.com");
-export const ENTERPRISE_BUILDS_URL = screenpipeWebUrl("/enterprise?tab=builds", "https://screenpipe.com");
-export const ENTERPRISE_DOWNLOAD_URL = screenpipeWebUrl("/api/download", "https://screenpipe.com");
+export const TEAM_SEAT_REQUEST_URL = screenpipeWebUrl("/api/team/seat-request", "https://screenpipe.com");
 const VERIFIED_PAID_PLAN_IDS = new Set([
   "basic",
   "standard",
@@ -180,6 +198,43 @@ export function getEnterpriseAccount(
     return null;
   }
   return account as AppEnterpriseAccount;
+}
+
+export function getOrgSeatAvailable(
+  user: AppUser | null | undefined,
+): AppOrgSeatAvailable | null {
+  const match = user?.org_seat_available;
+  if (!match || typeof match !== "object" || Array.isArray(match)) {
+    return null;
+  }
+  const candidate = match as AppOrgSeatAvailable;
+  const hasTarget =
+    (typeof candidate.team_id === "string" && candidate.team_id.trim().length > 0) ||
+    (typeof candidate.license_id === "string" && candidate.license_id.trim().length > 0);
+  const hasLabel =
+    (typeof candidate.org_name === "string" && candidate.org_name.trim().length > 0) ||
+    (typeof candidate.domain === "string" && candidate.domain.trim().length > 0);
+  if (!hasTarget || !hasLabel) return null;
+  return candidate;
+}
+
+export function getDeviceLimitStatus(
+  user: AppUser | null | undefined,
+): AppDeviceLimitStatus | null {
+  const status = user?.device_limit_status;
+  if (!status || typeof status !== "object" || Array.isArray(status)) {
+    return null;
+  }
+  return status as AppDeviceLimitStatus;
+}
+
+export function isDeviceLimitExceeded(
+  user: AppUser | null | undefined,
+): boolean {
+  const status = getDeviceLimitStatus(user);
+  return (
+    status?.allowed === false && status?.reason === "device_limit_exceeded"
+  );
 }
 
 function parseEntitlementTime(value: string | null | undefined) {
@@ -654,9 +709,45 @@ export function getBusinessCapacityUpgrade(
   }
 }
 
-export function normalizeAppUser(rawUser: any, token: string): AppUser {
-  const checkedAt = new Date().toISOString();
-  const rawEntitlement = asEntitlement(rawUser?.entitlement);
+function alignFreshEntitlementClock(
+  entitlement: AppEntitlement,
+  receivedAt: number,
+  requestStartedAt: number,
+): AppEntitlement {
+  const serverCheckedAt = parseEntitlementTime(entitlement.checked_at);
+  if (serverCheckedAt === null || serverCheckedAt - receivedAt <= APP_ENTITLEMENT_CLOCK_SKEW_MS) {
+    return entitlement;
+  }
+
+  // The authenticated POST generated checked_at on the server. Anchor the
+  // local snapshot at request start so response latency cannot add time to
+  // any remaining entitlement window. Never rebase a cached snapshot.
+  const localCheckedAt = Math.min(requestStartedAt, receivedAt);
+  const offset = serverCheckedAt - localCheckedAt;
+  const localTime = (value: string | null | undefined) => {
+    const timestamp = parseEntitlementTime(value);
+    return timestamp === null ? value : new Date(timestamp - offset).toISOString();
+  };
+  return {
+    ...entitlement,
+    checked_at: new Date(localCheckedAt).toISOString(),
+    current_period_end: localTime(entitlement.current_period_end),
+    expires_at: localTime(entitlement.expires_at),
+    grace_until: localTime(entitlement.grace_until),
+  };
+}
+
+export function normalizeAppUser(
+  rawUser: any,
+  token: string,
+  requestStartedAt?: number,
+): AppUser {
+  const receivedAt = Date.now();
+  const checkedAt = new Date(receivedAt).toISOString();
+  const serverEntitlement = asEntitlement(rawUser?.entitlement);
+  const rawEntitlement = serverEntitlement && requestStartedAt !== undefined
+    ? alignFreshEntitlementClock(serverEntitlement, receivedAt, requestStartedAt)
+    : serverEntitlement;
   const cloudSubscribed = rawUser?.cloud_subscribed === true;
   const appEntitled =
     typeof rawUser?.app_entitled === "boolean"

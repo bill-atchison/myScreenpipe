@@ -63,6 +63,8 @@ pub const BASE_NOTIFICATION_W: f32 = 340.0;
 /// leaves a ~3pt gutter instead of the ~8pt of dead air a 44pt row used to
 /// have. Keeps the toast in the same density family as the 30pt dock.
 pub const BASE_NOTIFICATION_H: f32 = 34.0;
+pub const BASE_MEETING_CARD_W: f32 = 460.0;
+pub const BASE_MEETING_CARD_H: f32 = 124.0;
 pub const RESTING_OPACITY: f32 = 0.50;
 
 /// Room around the content for the drop shadow. Layered windows composite the
@@ -204,7 +206,14 @@ fn primary_size(state: &OverlayState, s: f32) -> (f32, f32) {
         Health::Recovered => (HEALTH_RECOVERED_W * s, BASE_HEALTH_H * s),
         Health::Normal => {
             if expanded {
-                (BASE_EXPANDED_W * s, BASE_DOCK_H * s)
+                (
+                    (if state.simplified_ui {
+                        96.0
+                    } else {
+                        BASE_EXPANDED_W
+                    }) * s,
+                    BASE_DOCK_H * s,
+                )
             } else {
                 // The collapsed chip scales more gently than the dock: at rest
                 // the overlay should stay out of the way even at "large".
@@ -237,11 +246,13 @@ pub fn compute(state: &OverlayState) -> Layout {
         ));
     }
     if state.notification.is_some() {
-        blocks.push((
-            Block::Notification,
-            BASE_NOTIFICATION_W * s,
-            BASE_NOTIFICATION_H * s,
-        ));
+        let (notification_w, notification_h) = state
+            .notification
+            .as_ref()
+            .filter(|n| n.is_meeting_card)
+            .map(|_| (BASE_MEETING_CARD_W * s, BASE_MEETING_CARD_H * s))
+            .unwrap_or((BASE_NOTIFICATION_W * s, BASE_NOTIFICATION_H * s));
+        blocks.push((Block::Notification, notification_w, notification_h));
     }
 
     let content_w = blocks.iter().map(|b| b.1).fold(0.0f32, f32::max);
@@ -297,7 +308,7 @@ pub fn compute(state: &OverlayState) -> Layout {
     match state.health {
         Health::Failure => layout.hit.extend(failure_hits(state, primary, s)),
         Health::Normal if state.shows_dock() => {
-            let (cells, dividers) = dock_cells(primary, s);
+            let (cells, dividers) = dock_cells(primary, s, state.simplified_ui);
             layout.hit.extend(cells.iter().copied());
             layout.dock_cells = cells;
             layout.dock_dividers = dividers;
@@ -319,24 +330,29 @@ enum Block {
 
 /// Four icon buttons, the audio meter, and the rightmost brand control — the
 /// dock from `dockView` in shortcut_reminder.swift.
-fn dock_cells(dock: Rect, s: f32) -> (Vec<(Control, Rect)>, Vec<Rect>) {
+fn dock_cells(dock: Rect, s: f32, simplified: bool) -> (Vec<(Control, Rect)>, Vec<Rect>) {
     let divider_w = 1.0f32.max(s.round());
-    let icon_controls = [
+    let full_controls = [
         Control::Search,
         Control::Chat,
         Control::Star,
         Control::Timeline,
     ];
+    let icon_controls = if simplified {
+        &[Control::Star][..]
+    } else {
+        &full_controls[..]
+    };
     // Audio is a status cell, not a button, but it still highlights on hover.
     let usable = dock.w - divider_w * 2.0;
     // Six cells: four icons, the meter, and brand. The meter gets the same
     // share as an icon so the row reads as evenly spaced.
-    let cell_w = usable / 6.0;
+    let cell_w = usable / (icon_controls.len() + 2) as f32;
 
     let mut cells = Vec::new();
     let mut dividers = Vec::new();
     let mut x = dock.x;
-    for c in icon_controls {
+    for &c in icon_controls {
         cells.push((c, Rect::new(x, dock.y, cell_w, dock.h)));
         x += cell_w;
     }
@@ -396,6 +412,40 @@ pub fn notification_action_rects(state: &OverlayState, r: Rect, s: f32) -> Vec<(
     let Some(n) = state.notification.as_ref() else {
         return Vec::new();
     };
+    if n.is_meeting_card {
+        let pad = 14.0 * s;
+        let button_height = 36.0 * s;
+        let max_group_width = (r.w - pad * 2.0).max(0.0);
+        let ordered = n.ordered_actions();
+        let mut widths: Vec<f32> = ordered
+            .iter()
+            .take(crate::notification::MAX_ACTIONS)
+            .map(|a| (a.label.chars().count() as f32 * 7.8 + 24.0) * s)
+            .collect();
+        let total: f32 = widths.iter().sum();
+        if total > max_group_width && total > 0.0 {
+            let factor = max_group_width / total;
+            for width in &mut widths {
+                *width *= factor;
+            }
+        }
+        let mut x = r.right() - pad - widths.iter().sum::<f32>();
+        let y = r.bottom() - pad - button_height;
+        return widths
+            .into_iter()
+            .enumerate()
+            .map(|(i, width)| {
+                let control = if i == 0 {
+                    Control::NotificationAction0
+                } else {
+                    Control::NotificationAction1
+                };
+                let rect = Rect::new(x, y, width, button_height);
+                x += width;
+                (control, rect)
+            })
+            .collect();
+    }
     let pad = 10.0 * s;
     let dismiss_w = 14.0 * s;
     let btn_h = 22.0 * s;
@@ -848,5 +898,35 @@ mod tests {
         assert!(l.is_in_corridor(0.5, 0.5), "but it is not an exit either");
         assert!(!l.is_in_corridor(-1.0, gap_y), "outside the box is an exit");
         assert!(!l.is_in_corridor(gap_x, l.window.bottom() + 1.0));
+    }
+}
+
+#[cfg(test)]
+mod simplified_tests {
+    use super::*;
+    #[test]
+    fn simplified_cells_have_no_hidden_click_targets() {
+        let state = OverlayState {
+            simplified_ui: true,
+            force_expanded: true,
+            ..Default::default()
+        };
+        for scale in [1.0, 1.5, 2.0] {
+            assert_eq!(
+                primary_size(&state, scale),
+                (96.0 * scale, BASE_DOCK_H * scale)
+            );
+        }
+        let (cells, dividers) = dock_cells(Rect::new(0.0, 0.0, 192.0, 30.0), 1.0, true);
+        assert_eq!(
+            cells
+                .iter()
+                .map(|(control, _)| *control)
+                .collect::<Vec<_>>(),
+            vec![Control::Star, Control::Audio, Control::Brand]
+        );
+        let width: f32 = cells.iter().map(|(_, rect)| rect.w).sum::<f32>()
+            + dividers.iter().map(|rect| rect.w).sum::<f32>();
+        assert!((width - 192.0).abs() < 0.01);
     }
 }

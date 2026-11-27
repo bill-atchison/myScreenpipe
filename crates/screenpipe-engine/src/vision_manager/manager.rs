@@ -63,8 +63,12 @@ pub struct VisionManagerConfig {
     /// Max width (px) of the macOS screen capture that OCR reads. 0 = native.
     /// Independent of `video_quality`, which only sizes what is stored.
     pub capture_max_width: u32,
+    /// Preview acquisition rate, independent of HD's encoded frame rate.
+    pub screenshot_frame_rate: u32,
+    pub streaming_mode: bool,
     /// Skip screenshot pixels/JPEG/OCR while keeping accessibility-tree capture.
     pub disable_screenshots: bool,
+    pub focused_window_screenshots: bool,
     /// Enable the bounded semantic projection worker. Off by default.
     pub enable_semantic_context: bool,
     /// Choose memory, computer-use, or both projections over one capture.
@@ -113,7 +117,7 @@ pub(crate) struct MonitorLivenessSnapshot {
 /// Manages vision recording across multiple monitors with dynamic detection
 pub struct VisionManager {
     config: VisionManagerConfig,
-    db: Arc<DatabaseManager>,
+    db: Option<Arc<DatabaseManager>>,
     vision_handle: Handle,
     status: Arc<RwLock<VisionManagerStatus>>,
     /// Map of monitor_id -> JoinHandle
@@ -122,6 +126,9 @@ pub struct VisionManager {
     /// recovery from fallback both require replacing that immutable handle.
     #[cfg(target_os = "macos")]
     monitor_configurations: Arc<DashMap<u32, screenpipe_screen::monitor::CaptureConfiguration>>,
+    /// Clones of active Windows Streaming handles for topology updates.
+    #[cfg(target_os = "windows")]
+    streaming_monitors: Arc<DashMap<u32, screenpipe_screen::monitor::SafeMonitor>>,
     /// Per-monitor pipeline heartbeat. Aggregate metrics remain in `config` for
     /// `/health`; these independent clocks are exclusively the recovery source
     /// so partial multi-display stalls are observable.
@@ -143,6 +150,7 @@ pub struct VisionManager {
     linker_stop: Arc<AtomicBool>,
     /// Hot frame cache — capture pushes frames here for zero-DB timeline reads.
     hot_frame_cache: Option<Arc<HotFrameCache>>,
+    recording_stream: Option<Arc<crate::recording_stream::StreamEndpoint>>,
     /// Power profile receiver — each monitor gets a clone.
     power_profile_rx: Option<watch::Receiver<PowerProfile>>,
     /// Focus-aware capture controller — always constructed.
@@ -178,6 +186,10 @@ pub struct VisionManager {
     /// Health reads this cached value without introducing CoreGraphics calls
     /// into the 1 Hz endpoint.
     monitor_capture_expected: Arc<AtomicBool>,
+    /// Initialize once per manager. Monitor hotplug and watchdog restart must
+    /// not overwrite a later live screenshot-rate update with startup config.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    screenshot_frame_rate_initialized: AtomicBool,
 }
 
 impl VisionManager {
@@ -192,6 +204,16 @@ impl VisionManager {
         db: Arc<DatabaseManager>,
         vision_handle: Handle,
     ) -> Self {
+        Self::new_with_optional_db(config, Some(db), vision_handle)
+    }
+
+    /// `None` runs native capture with the configured raw ledger and without SQLite projections.
+    pub fn new_with_optional_db(
+        config: VisionManagerConfig,
+        db: Option<Arc<DatabaseManager>>,
+        runtime_handle: Handle,
+    ) -> Self {
+        let vision_handle = runtime_handle;
         // Single broadcast channel shared across all monitors + UI recorder.
         let (trigger_tx, _rx) = tokio::sync::broadcast::channel::<CaptureTriggerMsg>(
             crate::event_driven_capture::TRIGGER_CHANNEL_BUFFER,
@@ -203,7 +225,7 @@ impl VisionManager {
         // VisionManager.
         let (linker_tx, linker_rx) = linker_channel();
         let linker_stop = Arc::new(AtomicBool::new(false));
-        {
+        if let Some(db) = &db {
             let _guard = vision_handle.enter();
             spawn_frame_linker(db.clone(), linker_rx, linker_stop.clone());
         }
@@ -219,17 +241,22 @@ impl VisionManager {
             FocusAwareController::new(tracker)
         };
 
-        let semantic_tx = (config.enable_semantic_context
-            && config.semantic_context_mode.includes_memory())
-        .then(|| {
-            spawn_semantic_projection_worker(
-                db.clone(),
-                &vision_handle,
-                config.semantic_context_mode,
-            )
-        });
+        let semantic_tx = db
+            .as_ref()
+            .filter(|_| {
+                config.enable_semantic_context && config.semantic_context_mode.includes_memory()
+            })
+            .map(|db| {
+                spawn_semantic_projection_worker(
+                    db.clone(),
+                    &vision_handle,
+                    config.semantic_context_mode,
+                )
+            });
 
         Self {
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            screenshot_frame_rate_initialized: AtomicBool::new(false),
             config,
             db,
             vision_handle,
@@ -237,12 +264,15 @@ impl VisionManager {
             recording_tasks: Arc::new(DashMap::new()),
             #[cfg(target_os = "macos")]
             monitor_configurations: Arc::new(DashMap::new()),
+            #[cfg(target_os = "windows")]
+            streaming_monitors: Arc::new(DashMap::new()),
             monitor_liveness: Arc::new(DashMap::new()),
             hd_recording_tasks: Arc::new(DashMap::new()),
             trigger_tx,
             linker_tx,
             linker_stop,
             hot_frame_cache: None,
+            recording_stream: None,
             power_profile_rx: None,
             focus_controller,
             high_fps_controller: None,
@@ -259,6 +289,14 @@ impl VisionManager {
     /// hot cache is only consumed by the timeline streaming endpoint).
     pub fn with_hot_frame_cache(mut self, cache: Option<Arc<HotFrameCache>>) -> Self {
         self.hot_frame_cache = cache;
+        self
+    }
+
+    pub fn with_recording_stream(
+        mut self,
+        endpoint: Option<crate::recording_stream::StreamEndpoint>,
+    ) -> Self {
+        self.recording_stream = endpoint.map(Arc::new);
         self
     }
 
@@ -350,6 +388,20 @@ impl VisionManager {
 
     /// Start recording on all currently connected monitors
     pub async fn start(&self) -> Result<()> {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if !self
+            .screenshot_frame_rate_initialized
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            if let Err(error) = screenpipe_screen::screenshot_rate::initialize(
+                self.config.screenshot_frame_rate,
+                self.config.idle_capture_interval_ms,
+            ) {
+                self.screenshot_frame_rate_initialized
+                    .store(false, std::sync::atomic::Ordering::Release);
+                return Err(error);
+            }
+        }
         let mut status = self.status.write().await;
         if *status == VisionManagerStatus::Running {
             debug!("VisionManager already running");
@@ -581,6 +633,8 @@ impl VisionManager {
 
         #[cfg(target_os = "macos")]
         let configuration = monitor.capture_configuration();
+        #[cfg(target_os = "windows")]
+        let streaming_monitor = self.config.streaming_mode.then(|| monitor.clone());
         let liveness = Arc::new(PipelineMetrics::new());
         let handle = self
             .start_event_driven_monitor(monitor_id, monitor, liveness.clone())
@@ -590,6 +644,10 @@ impl VisionManager {
         #[cfg(target_os = "macos")]
         self.monitor_configurations
             .insert(monitor_id, configuration);
+        #[cfg(target_os = "windows")]
+        if let Some(monitor) = streaming_monitor {
+            self.streaming_monitors.insert(monitor_id, monitor);
+        }
         self.recording_tasks.insert(monitor_id, handle);
 
         Ok(())
@@ -657,6 +715,7 @@ impl VisionManager {
             monitor_y: monitor.y() as f64,
             monitor_width: monitor.width() as f64,
             monitor_height: monitor.height() as f64,
+            capture_window_bounds: self.config.focused_window_screenshots,
             ignore_incognito_windows: self.config.ignore_incognito_windows,
             enhanced_incognito_detection: self.config.enhanced_incognito_detection,
             capture_app_identity: self.config.enable_semantic_context
@@ -675,6 +734,8 @@ impl VisionManager {
         let mut capture_config = EventDrivenCaptureConfig {
             jpeg_quality: baseline_q,
             disable_screenshots: self.config.disable_screenshots,
+            focused_window_screenshots: self.config.focused_window_screenshots,
+            streaming_mode: self.config.streaming_mode,
             ..EventDrivenCaptureConfig::default()
         };
         // Mitsukeru fork: apply per-parameter CLI / settings overrides if any.
@@ -708,23 +769,30 @@ impl VisionManager {
         // Stop signal
         let stop_signal = Arc::new(AtomicBool::new(false));
 
+        // One display on the wire; never stream stale monitor-allowlist fallback.
+        let stream_endpoint = self.recording_stream.clone().filter(|_| {
+            monitor.is_primary()
+                && !self
+                    .stale_allowlist_fallback
+                    .load(std::sync::atomic::Ordering::Relaxed)
+        });
         let monitor = Arc::new(monitor);
         let vision_metrics = self.config.vision_metrics.clone();
-        let hot_frame_cache = self.hot_frame_cache.clone();
+        let hot_frame_cache = db.as_ref().and(self.hot_frame_cache.clone());
         let use_pii_removal = self.config.use_pii_removal;
         let pause_on_drm_content = self.config.pause_on_drm_content;
         let languages = self.config.languages.clone();
         let power_profile_rx = self.power_profile_rx.clone();
         let recording_detail = self.config.recording_detail.clone();
         let focus_controller = self.focus_controller.clone();
-        let linker_tx = Some(self.linker_tx.clone());
+        let linker_tx = db.as_ref().map(|_| self.linker_tx.clone());
         let high_fps_controller = self.high_fps_controller.clone();
         let semantic_tx = self.semantic_tx.clone();
 
         // Spawn the decoupled high-fps HD recorder only when screen pixels are
         // enabled. Otherwise an active meeting could open its own OS capture
         // stream despite `disableScreenshots`.
-        if !self.config.disable_screenshots {
+        if let Some(db) = db.as_ref().filter(|_| !self.config.disable_screenshots) {
             let hd_config = crate::hd_recorder::HdRecorderConfig {
                 ignored_windows: self.config.ignored_windows.clone(),
                 included_windows: self.config.included_windows.clone(),
@@ -737,7 +805,7 @@ impl VisionManager {
             let hd_handle = self
                 .vision_handle
                 .spawn(crate::hd_recorder::hd_recorder_loop(
-                    self.db.clone(),
+                    db.clone(),
                     monitor.clone(),
                     monitor_id,
                     device_name.clone(),
@@ -780,6 +848,7 @@ impl VisionManager {
                 high_fps_controller,
                 semantic_tx,
                 recording_detail,
+                stream_endpoint,
             )
             .await
             {
@@ -797,6 +866,8 @@ impl VisionManager {
     /// Stop recording on a specific monitor
     pub async fn stop_monitor(&self, monitor_id: u32) -> Result<()> {
         self.monitor_liveness.remove(&monitor_id);
+        #[cfg(target_os = "windows")]
+        self.streaming_monitors.remove(&monitor_id);
         #[cfg(target_os = "macos")]
         self.monitor_configurations.remove(&monitor_id);
         // Stop the HD recorder first. Aborting drops its ffmpeg stdin, which
@@ -809,6 +880,10 @@ impl VisionManager {
 
             // Abort the task
             handle.abort();
+            // Stop sampling immediately even if the old task is still inside
+            // native IPC. Its source-owner guard handles delayed cancellation.
+            #[cfg(target_os = "macos")]
+            screenpipe_screen::stream_invalidation::release_screenshot_stream(monitor_id);
 
             // Wait for it to finish with a timeout — if the capture task is stuck
             // in a spawn_blocking AX tree walk, cancellation can be delayed.
@@ -833,7 +908,7 @@ impl VisionManager {
     /// Removes dead tasks (finished JoinHandles) so MonitorWatcher can restart them.
     /// DB handle for sibling vision_manager modules (the monitor watcher
     /// persists display-layout snapshots). Cheap Arc clone.
-    pub(crate) fn db_handle(&self) -> Arc<DatabaseManager> {
+    pub(crate) fn db_handle(&self) -> Option<Arc<DatabaseManager>> {
         self.db.clone()
     }
 
@@ -848,6 +923,8 @@ impl VisionManager {
 
         for id in &dead {
             self.monitor_liveness.remove(id);
+            #[cfg(target_os = "windows")]
+            self.streaming_monitors.remove(id);
             #[cfg(target_os = "macos")]
             self.monitor_configurations.remove(id);
             if let Some((_, handle)) = self.recording_tasks.remove(id) {
@@ -892,6 +969,16 @@ impl VisionManager {
                     .should_replace(*active.value())
             })
             .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn refresh_streaming_monitor_geometry(
+        &self,
+        fresh: &screenpipe_screen::monitor::SafeMonitor,
+    ) {
+        if let Some(active) = self.streaming_monitors.get(&fresh.id()) {
+            active.update_streaming_geometry(fresh);
+        }
     }
 
     /// Independent liveness for each active capture loop. Never derive this
@@ -1055,7 +1142,10 @@ mod tests {
             languages: vec![Language::English],
             video_quality: "balanced".to_string(),
             capture_max_width: 0,
+            screenshot_frame_rate: screenpipe_config::DEFAULT_SCREENSHOT_FRAME_RATE,
+            streaming_mode: false,
             disable_screenshots: false,
+            focused_window_screenshots: false,
             enable_semantic_context,
             semantic_context_mode: SemanticContextMode::Memory,
             idle_capture_interval_ms: None,
@@ -1081,7 +1171,7 @@ mod tests {
         vm.config.semantic_context_mode = SemanticContextMode::ComputerUse;
         let db = vm.db.clone();
         let config = vm.config.clone();
-        let automation_vm = VisionManager::new(config, db, Handle::current());
+        let automation_vm = VisionManager::new_with_optional_db(config, db, Handle::current());
         assert!(automation_vm.semantic_tx.is_none());
         assert!(automation_vm.prefers_computer_use_context());
     }

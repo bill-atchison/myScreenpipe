@@ -298,8 +298,7 @@ fn main() -> anyhow::Result<()> {
 
     let runtime = tokio::runtime::Runtime::new()?;
     #[cfg(target_os = "macos")]
-    if let Some(code) = runtime.block_on(screenpipe_audio::core::vpio_process::run_hidden_mode())
-    {
+    if let Some(code) = runtime.block_on(screenpipe_audio::core::vpio_process::run_hidden_mode()) {
         std::process::exit(code);
     }
 
@@ -1068,7 +1067,10 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
     let audio_devices_clone = audio_devices.clone();
 
     let resource_reporter = ResourceTelemetryReporter::new(config.analytics_enabled);
-    resource_reporter.start_monitoring(Duration::from_secs(30), Some(Duration::from_secs(60)));
+    resource_reporter.start_monitoring(
+        Duration::from_secs(30),
+        Some(screenpipe_engine::telemetry_reporting::RESOURCE_DIAGNOSTIC_REPORT_INTERVAL),
+    );
 
     // Initialize analytics for API tracking
     analytics::init(config.analytics_enabled);
@@ -1122,8 +1124,8 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
             config.pii_redaction_columns,
             config.pii_redaction_pseudonyms
         ),
-        text: config.async_pii_redaction,
-        images: config.async_image_pii_redaction,
+        text: config.require_pii_completion && config.async_pii_redaction,
+        images: config.require_pii_completion && config.async_image_pii_redaction,
     })
     .await?;
     let database_failure = Arc::new(tokio::sync::Notify::new());
@@ -1504,6 +1506,7 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
         config.use_pii_removal,
         config.video_quality.clone(),
     );
+    server.diagnostic_shutdown = resource_reporter.shutdown_handle();
     server.vision_metrics = vision_metrics;
     server.audio_metrics = audio_manager.metrics.clone();
     server.hot_frame_cache = Some(hot_frame_cache);
@@ -2222,6 +2225,8 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
         let frame_storage_db = Arc::clone(&db);
         let writer = db.coordinated_writer();
         let labels = config.pii_redaction_labels.clone();
+        let use_tinfoil = matches!(config.pii_backend.as_str(), "tinfoil" | "cloud" | "enclave");
+        let tinfoil_api_key = config.user_id.clone().filter(|s| !s.is_empty());
         let database_error_hook = redact_database_error_hook.clone();
         // Consistent-pseudonym tokens (issue #4206), opt-in. Loads (or
         // creates on first run) the per-install key under the data dir;
@@ -2249,67 +2254,64 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
             // this policy; the env-gated tinfoil fallback forwards the
             // raw labels so the enclave filters server-side.
             let policy = TextRedactionPolicy::from_labels(&labels);
-            info!(
-                "fetching v45 phase 3 ONNX text redactor (~278 MB INT8 on first run, \
-                 cached at ~/.screenpipe/models/v45_phase3_onnx/)"
-            );
-            let pipeline = match OnnxRedactor::load_or_download(OnnxConfig::default()).await {
-                Ok(adapter) => {
-                    info!(
-                        "text-PII AI step: local v45_phase3 ONNX — same checkpoint as the \
+            let pipeline = if use_tinfoil {
+                info!(
+                    has_api_key = tinfoil_api_key.is_some(),
+                    "text-PII AI step: tinfoil CPU enclave (pii_backend=tinfoil)"
+                );
+                let ai: Arc<dyn Redactor> = Arc::new(TinfoilRedactor::new(TinfoilConfig {
+                    api_key: tinfoil_api_key,
+                    labels: labels.clone(),
+                    ..Default::default()
+                }));
+                Pipeline::regex_then_ai(
+                    ai,
+                    PipelineConfig {
+                        policy: policy.clone(),
+                        ..Default::default()
+                    },
+                )
+            } else {
+                info!(
+                    "fetching v45 phase 3 ONNX text redactor (~278 MB INT8 on first run, \
+                     cached at ~/.screenpipe/models/v45_phase3_onnx/)"
+                );
+                match OnnxRedactor::load_or_download(OnnxConfig::default()).await {
+                    Ok(adapter) => {
+                        info!(
+                            "text-PII AI step: local v45_phase3 ONNX — same checkpoint as the \
                          desktop app + Tinfoil container, sub-10 ms p50 on CPU"
-                    );
-                    let ai: Arc<dyn Redactor> = Arc::new(adapter);
-                    Pipeline::regex_then_ai(
-                        ai,
-                        PipelineConfig {
-                            policy: policy.clone(),
-                            ..Default::default()
-                        },
-                    )
-                }
-                Err(onnx_err) => {
-                    tracing::warn!(
-                        "couldn't load v45 phase 3 ONNX redactor ({onnx_err}); falling back \
+                        );
+                        let ai: Arc<dyn Redactor> = Arc::new(adapter);
+                        Pipeline::regex_then_ai(
+                            ai,
+                            PipelineConfig {
+                                policy: policy.clone(),
+                                ..Default::default()
+                            },
+                        )
+                    }
+                    Err(onnx_err) => {
+                        tracing::warn!(
+                            "couldn't load v45 phase 3 ONNX redactor ({onnx_err}); falling back \
                          to OPF v6 candle"
-                    );
-                    info!(
-                        "fetching local OPF v6 checkpoint (~2.8 GB on first run, cached at \
+                        );
+                        info!(
+                            "fetching local OPF v6 checkpoint (~2.8 GB on first run, cached at \
                          ~/.screenpipe/models/opf-v6/)"
-                    );
-                    match OpfAdapter::load_or_download(OpfConfig::default()).await {
-                        Ok(adapter) => {
-                            info!(
-                                "text-PII AI step: local opf-rs (candle) fallback — lazy load \
-                                 on first batch, idle-unload after 60s of no work"
-                            );
-                            // Wrap in Arc first so we can spawn the idle
-                            // unloader (which needs `Arc<Self>`) and still
-                            // hand the same Arc to the Pipeline.
-                            let adapter = Arc::new(adapter);
-                            let _unloader = Arc::clone(&adapter).spawn_idle_unloader();
-                            let ai: Arc<dyn Redactor> = adapter;
-                            Pipeline::regex_then_ai(
-                                ai,
-                                PipelineConfig {
-                                    policy: policy.clone(),
-                                    ..Default::default()
-                                },
-                            )
-                        }
-                        Err(e) => {
-                            if std::env::var("TINFOIL_API_KEY").is_ok()
-                                || std::env::var("TINFOIL_BASE_URL").is_ok()
-                            {
+                        );
+                        match OpfAdapter::load_or_download(OpfConfig::default()).await {
+                            Ok(adapter) => {
                                 info!(
-                                    "text-PII AI step: tinfoil enclave (local adapters \
-                                     unavailable: opf-rs={e})"
+                                    "text-PII AI step: local opf-rs (candle) fallback — lazy load \
+                                 on first batch, idle-unload after 60s of no work"
                                 );
-                                let ai: Arc<dyn Redactor> =
-                                    Arc::new(TinfoilRedactor::new(TinfoilConfig {
-                                        labels: labels.clone(),
-                                        ..Default::default()
-                                    }));
+                                // Wrap in Arc first so we can spawn the idle
+                                // unloader (which needs `Arc<Self>`) and still
+                                // hand the same Arc to the Pipeline.
+                                let adapter = Arc::new(adapter);
+                                let _unloader = Arc::clone(&adapter).spawn_idle_unloader();
+                                let ai: Arc<dyn Redactor> = adapter;
                                 Pipeline::regex_then_ai(
                                     ai,
                                     PipelineConfig {
@@ -2317,13 +2319,35 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
                                         ..Default::default()
                                     },
                                 )
-                            } else {
-                                tracing::warn!(
-                                    "text-PII AI step disabled — both v45 ONNX and opf-rs \
+                            }
+                            Err(e) => {
+                                if std::env::var("TINFOIL_API_KEY").is_ok()
+                                    || std::env::var("TINFOIL_BASE_URL").is_ok()
+                                {
+                                    info!(
+                                        "text-PII AI step: tinfoil enclave (local adapters \
+                                     unavailable: opf-rs={e})"
+                                    );
+                                    let ai: Arc<dyn Redactor> =
+                                        Arc::new(TinfoilRedactor::new(TinfoilConfig {
+                                            labels: labels.clone(),
+                                            ..Default::default()
+                                        }));
+                                    Pipeline::regex_then_ai(
+                                        ai,
+                                        PipelineConfig {
+                                            policy: policy.clone(),
+                                            ..Default::default()
+                                        },
+                                    )
+                                } else {
+                                    tracing::warn!(
+                                        "text-PII AI step disabled — both v45 ONNX and opf-rs \
                                      unavailable ({e}), and no TINFOIL_* env vars set. Worker \
                                      will run regex-only."
-                                );
-                                Pipeline::regex_only_with_policy(policy.clone())
+                                    );
+                                    Pipeline::regex_only_with_policy(policy.clone())
+                                }
                             }
                         }
                     }
@@ -2370,25 +2394,38 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
     if !config.async_image_pii_redaction {
         info!(
             "image-PII worker skipped at startup — async_image_pii_redaction=false. \
-             rfdetr_v9 model (~108 MB) will NOT be downloaded or loaded. \
+             rfdetr_v108b + pii_role_fusion_v4 (~37 MiB) will NOT be downloaded or loaded. \
              Toggle via Settings → Privacy → AI PII removal."
         );
     }
     if config.async_image_pii_redaction {
         use screenpipe_redact::adapters::rfdetr::{RfdetrConfig, RfdetrRedactor};
+        use screenpipe_redact::adapters::tinfoil_image::{
+            TinfoilImageConfig, TinfoilImageRedactor,
+        };
         use screenpipe_redact::image::worker::{ImageWorker, ImageWorkerConfig};
         use screenpipe_redact::{ImageRedactionPolicy, ImageRedactor};
         use std::sync::Arc;
 
-        // The desktop app intentionally uses the ONNX image redactor for
-        // local mode. Keep the standalone CLI on that same stable path by
-        // default: the MLX RF-DETR port is still experimental and can crash
-        // the process while reconciling large frame backlogs. Developers can
-        // still opt in while iterating on that runtime.
+        let use_tinfoil = matches!(config.pii_backend.as_str(), "tinfoil" | "cloud" | "enclave");
+        let tinfoil_api_key = config.user_id.clone().filter(|s| !s.is_empty());
+
         #[allow(unused_mut)]
-        let mut detector_arc: Option<Arc<dyn ImageRedactor>> = None;
+        let mut detector_arc: Option<Arc<dyn ImageRedactor>> = if use_tinfoil {
+            info!(
+                has_api_key = tinfoil_api_key.is_some(),
+                "image-PII detector: tinfoil CPU enclave (pii_backend=tinfoil)"
+            );
+            Some(Arc::new(TinfoilImageRedactor::new(TinfoilImageConfig {
+                api_key: tinfoil_api_key,
+                labels: config.pii_redaction_labels.clone(),
+                ..Default::default()
+            })) as Arc<dyn ImageRedactor>)
+        } else {
+            None
+        };
         #[cfg(all(feature = "rfdetr-mlx", target_os = "macos", target_arch = "aarch64"))]
-        {
+        if !use_tinfoil {
             if std::env::var_os("SCREENPIPE_ENABLE_EXPERIMENTAL_RFDETR_MLX").is_some() {
                 use screenpipe_redact::adapters::rfdetr_mlx::{RfdetrMlxConfig, RfdetrMlxRedactor};
                 let mlx_cfg = RfdetrMlxConfig::default();
@@ -2437,8 +2474,8 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
                     // redactor (if enabled) keeps running.
                     tracing::warn!(
                         "image-PII redaction enabled but couldn't load model; skipping: {e}. \
-                         check network reachability to huggingface.co or pre-stage \
-                         rfdetr_v9.onnx at ~/.screenpipe/models/."
+                         check network reachability or pre-stage \
+                         rfdetr_v108b.onnx (+ optional pii_role_fusion_v4.onnx) at ~/.screenpipe/models/."
                     );
                 }
             }
@@ -2495,6 +2532,7 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
         handle.stop();
     }
     let teardown = async {
+        resource_reporter.shutdown().await;
         if let Err(error) = audio_manager.shutdown().await {
             warn!("audio shutdown during database recovery: {error}");
         }

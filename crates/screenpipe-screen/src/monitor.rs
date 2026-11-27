@@ -14,10 +14,14 @@ use std::sync::{Arc, RwLock};
 mod linux;
 #[cfg(target_os = "linux")]
 mod linux_portal;
+#[cfg(target_os = "linux")]
+mod linux_portal_token;
 #[cfg(any(target_os = "linux", test))]
 mod linux_wayland;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+pub(crate) use macos::sck_capture_max_width;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -126,10 +130,19 @@ pub struct SafeMonitor {
     /// desktops that do not implement the wlroots screencopy protocol.
     #[cfg(target_os = "linux")]
     portal_capture: Arc<linux_portal::PortalCaptureSession>,
+    /// Geometry refreshed by the monitor watcher for the active Streaming session.
+    #[cfg(target_os = "windows")]
+    streaming_geometry: Arc<RwLock<Arc<MonitorData>>>,
     /// Persistent WGC capture session to avoid orange border flash from per-frame session lifecycle.
     /// Lazy-initialized on first capture_image() call.
     #[cfg(target_os = "windows")]
     persistent_capture: Arc<std::sync::Mutex<Option<crate::wgc_capture::PersistentCapture>>>,
+    /// Display stream owned only by sustained recording and privacy capture.
+    /// Legacy one-shot callers must never drain or close this source.
+    #[cfg(target_os = "windows")]
+    recorder_capture: Arc<std::sync::Mutex<Option<windows::RecorderCapture>>>,
+    #[cfg(target_os = "windows")]
+    privacy_session: Arc<crate::screenshot_privacy::WindowsPrivacySession>,
     /// If true, skip persistent capture and use per-frame fallback for this session.
     #[cfg(target_os = "windows")]
     persistent_capture_disabled: Arc<AtomicBool>,
@@ -148,6 +161,13 @@ pub struct MonitorData {
     pub y: i32,
     pub name: String,
     pub is_primary: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl MonitorData {
+    pub(crate) fn bounds(&self) -> (i32, i32, u32, u32) {
+        (self.x, self.y, self.width, self.height)
+    }
 }
 
 impl SafeMonitor {
@@ -249,16 +269,19 @@ mod tests {
         x: i32,
         y: i32,
     ) -> SafeMonitor {
+        let monitor_data = Arc::new(MonitorData {
+            width,
+            height,
+            x,
+            y,
+            name: name.to_string(),
+            is_primary: false,
+        });
         SafeMonitor {
             monitor_id: id,
-            monitor_data: Arc::new(MonitorData {
-                width,
-                height,
-                x,
-                y,
-                name: name.to_string(),
-                is_primary: false,
-            }),
+            #[cfg(target_os = "windows")]
+            streaming_geometry: Arc::new(RwLock::new(monitor_data.clone())),
+            monitor_data,
             #[cfg(target_os = "macos")]
             use_sck: false,
             #[cfg(target_os = "macos")]
@@ -274,10 +297,32 @@ mod tests {
             #[cfg(target_os = "windows")]
             persistent_capture: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(target_os = "windows")]
+            recorder_capture: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(target_os = "windows")]
+            privacy_session: Arc::new(crate::screenshot_privacy::WindowsPrivacySession::default()),
+            #[cfg(target_os = "windows")]
             persistent_capture_disabled: Arc::new(AtomicBool::new(false)),
             #[cfg(target_os = "windows")]
             persistent_capture_failures: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn same_size_monitor_move_updates_the_active_streaming_handle() {
+        let active = make_test_monitor(1, "fixture", 1024, 768, 0, 0);
+        let reader = active.clone();
+        let old_geometry = reader.streaming_geometry();
+        let same = make_test_monitor(1, "fixture", 1024, 768, 0, 0);
+        active.update_streaming_geometry(&same);
+        assert!(Arc::ptr_eq(&old_geometry, &reader.streaming_geometry()));
+
+        let moved = make_test_monitor(1, "fixture", 1024, 768, -1024, 120);
+        active.update_streaming_geometry(&moved);
+        let current = reader.streaming_geometry();
+        assert_eq!(current.bounds(), (-1024, 120, 1024, 768));
+        assert!(!Arc::ptr_eq(&old_geometry, &current));
+        assert_eq!(old_geometry.bounds(), (0, 0, 1024, 768));
     }
 
     #[test]

@@ -534,12 +534,16 @@ pub struct RecordArgs {
 
     /// Enable the async PII reconciliation worker. Runs a background
     /// task after capture that OVERWRITES PII in the source columns
-    /// of ocr_text, audio_transcriptions, frames.accessibility_text,
+    /// of ocr_text, frames.accessibility_text,
     /// ui_events.text_content, and elements.text. Raw secrets are
     /// gone after the worker processes the row. Off by default —
     /// capture path is unaffected either way.
     #[arg(long, default_value_t = false)]
     pub async_pii_redaction: bool,
+
+    /// Wait for AI privacy processing before reads and sync. Off by default.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub require_pii_completion: bool,
 
     /// Strip secrets from coding-agent (pi) session logs at rest. A
     /// background worker runs a secrets-only regex scrub over idle
@@ -582,7 +586,7 @@ pub struct RecordArgs {
     /// WHICH columns the redaction worker scrubs (comma-separated stable
     /// keys; orthogonal to --pii-redaction-labels which picks categories).
     /// Keys: accessibility_text, accessibility_tree, window_name,
-    /// browser_url, audio_transcription, ui_text_content, ui_element_value,
+    /// browser_url, ui_text_content, ui_element_value,
     /// ui_window_title, ui_element_name, ui_element_description,
     /// ui_element_ancestors, element_text, element_properties,
     /// a11y_url_field. The list is exact (key present → on, absent → off);
@@ -596,7 +600,7 @@ pub struct RecordArgs {
     #[arg(
         long,
         value_delimiter = ',',
-        default_value = "accessibility_text,accessibility_tree,window_name,audio_transcription,ui_text_content,ui_element_value,ui_window_title,ui_element_ancestors,element_text,element_properties"
+        default_value = "accessibility_text,accessibility_tree,window_name,ui_text_content,ui_element_value,ui_window_title,ui_element_ancestors,element_text,element_properties"
     )]
     pub pii_redaction_columns: Vec<String>,
 
@@ -621,6 +625,12 @@ pub struct RecordArgs {
     /// Disable screenshot pixels/JPEG/OCR while keeping accessibility-tree capture
     #[arg(long, default_value_t = false)]
     pub disable_screenshots: bool,
+
+    /// Black out pixels outside the focused window area, keeping image dimensions.
+    /// False keeps desktop context. Missing focus/bounds suppresses screenshots.
+    #[arg(long, action = ArgAction::Set, num_args = 0..=1,
+        default_value_t = false, default_missing_value = "true")]
+    pub focused_window_screenshots: bool,
 
     /// Select structured app context: off, memory, automation, or both.
     /// Memory builds compact context for retrieval and pipes; automation keeps
@@ -662,6 +672,7 @@ pub struct RecordArgs {
     /// scope to one window of one app (e.g. `Slack::#hr`). `::title` matches
     /// any app whose focused window title contains `title`. `App::` blocks
     /// the entire app (equivalent to bare `App`).
+    /// Removes the same patterns from saved includes unless --included-windows is also supplied.
     #[arg(long)]
     pub ignored_windows: Vec<String>,
 
@@ -669,6 +680,7 @@ pub struct RecordArgs {
     /// (`App::Title`) create a per-app whitelist; other apps remain
     /// unaffected. Unscoped entries keep the legacy "must match app or
     /// title" global-include semantics.
+    /// Removes the same patterns from saved ignores unless --ignored-windows is also supplied.
     #[arg(long)]
     pub included_windows: Vec<String>,
 
@@ -942,6 +954,7 @@ pub struct RecordArgSources {
     pub language: bool,
     pub use_pii_removal: bool,
     pub async_pii_redaction: bool,
+    pub require_pii_completion: bool,
     pub redact_agent_session_secrets: bool,
     pub async_image_pii_redaction: bool,
     pub pii_backend: bool,
@@ -951,6 +964,7 @@ pub struct RecordArgSources {
     pub filter_music: bool,
     pub disable_vision: bool,
     pub disable_screenshots: bool,
+    pub focused_window_screenshots: bool,
     pub app_context: bool,
     pub enable_semantic_context: bool,
     pub enable_semantic_search: bool,
@@ -1011,6 +1025,7 @@ impl RecordArgSources {
             language: from_command_line(record, "language"),
             use_pii_removal: from_command_line(record, "use_pii_removal"),
             async_pii_redaction: from_command_line(record, "async_pii_redaction"),
+            require_pii_completion: from_command_line(record, "require_pii_completion"),
             redact_agent_session_secrets: from_command_line(record, "redact_agent_session_secrets"),
             async_image_pii_redaction: from_command_line(record, "async_image_pii_redaction"),
             pii_backend: from_command_line(record, "pii_backend"),
@@ -1020,6 +1035,7 @@ impl RecordArgSources {
             filter_music: from_command_line(record, "filter_music"),
             disable_vision: from_command_line(record, "disable_vision"),
             disable_screenshots: from_command_line(record, "disable_screenshots"),
+            focused_window_screenshots: from_command_line(record, "focused_window_screenshots"),
             app_context: from_command_line(record, "app_context"),
             enable_semantic_context: matches!(
                 record.value_source("enable_semantic_context"),
@@ -1075,6 +1091,7 @@ impl RecordArgSources {
             || self.language
             || self.use_pii_removal
             || self.async_pii_redaction
+            || self.require_pii_completion
             || self.redact_agent_session_secrets
             || self.async_image_pii_redaction
             || self.pii_backend
@@ -1084,6 +1101,7 @@ impl RecordArgSources {
             || self.filter_music
             || self.disable_vision
             || self.disable_screenshots
+            || self.focused_window_screenshots
             || self.app_context
             || self.enable_semantic_context
             || self.enable_semantic_search
@@ -1251,6 +1269,7 @@ impl RecordArgs {
             disable_audio: self.disable_audio,
             disable_vision: self.disable_vision,
             disable_screenshots: self.disable_screenshots,
+            focused_window_screenshots: self.focused_window_screenshots,
             enable_semantic_context,
             semantic_context_mode,
             enable_semantic_search: self.enable_semantic_search,
@@ -1259,6 +1278,7 @@ impl RecordArgs {
             disable_timeline: false,
             use_pii_removal: self.use_pii_removal,
             async_pii_redaction: self.async_pii_redaction,
+            require_pii_completion: self.require_pii_completion,
             redact_agent_session_secrets: self.redact_agent_session_secrets,
             async_image_pii_redaction: self.async_image_pii_redaction,
             pii_backend: self.pii_backend.clone(),
@@ -1544,6 +1564,9 @@ impl RecordArgs {
         if sources.use_pii_removal {
             settings.use_pii_removal = self.use_pii_removal;
         }
+        if sources.require_pii_completion {
+            settings.require_pii_completion = self.require_pii_completion;
+        }
         if sources.async_pii_redaction {
             settings.async_pii_redaction = self.async_pii_redaction;
         }
@@ -1574,6 +1597,9 @@ impl RecordArgs {
         if sources.disable_screenshots {
             settings.disable_screenshots = self.disable_screenshots;
         }
+        if sources.focused_window_screenshots {
+            settings.focused_window_screenshots = self.focused_window_screenshots;
+        }
         if sources.app_context {
             let (enabled, mode) = self
                 .app_context
@@ -1602,9 +1628,21 @@ impl RecordArgs {
         }
         if sources.ignored_windows {
             settings.ignored_windows = self.ignored_windows.clone();
+            if !sources.included_windows {
+                remove_explicit_window_patterns(
+                    &mut settings.included_windows,
+                    &self.ignored_windows,
+                );
+            }
         }
         if sources.included_windows {
             settings.included_windows = self.included_windows.clone();
+            if !sources.ignored_windows {
+                remove_explicit_window_patterns(
+                    &mut settings.ignored_windows,
+                    &self.included_windows,
+                );
+            }
         }
         if sources.ignored_urls || sources.url_block {
             settings.ignored_urls = self.combined_ignored_urls();
@@ -1680,6 +1718,18 @@ impl RecordArgs {
             }
         }
     }
+}
+
+/// An explicit CLI choice supersedes an equivalent saved opposite choice.
+/// Compare parsed patterns, not matching windows: broader privacy exclusions stay intact.
+fn remove_explicit_window_patterns(saved: &mut Vec<String>, explicit: &[String]) {
+    use screenpipe_core::window_pattern::WindowPattern;
+
+    let explicit = WindowPattern::parse_list(explicit);
+    saved.retain(|raw| match WindowPattern::parse(raw) {
+        Some(pattern) => !explicit.contains(&pattern),
+        None => true,
+    });
 }
 
 fn load_recording_settings_from_store(
@@ -2644,6 +2694,141 @@ mod tests {
         RecordArgSources::from_cli_matches(&matches)
     }
 
+    #[tokio::test]
+    async fn explicit_window_filter_replaces_saved_opposite_and_survives_restart() {
+        use screenpipe_screen::capture_screenshot_by_window::WindowFilters;
+
+        for (flag, include) in [("--included-windows", true), ("--ignored-windows", false)] {
+            let root = tempfile::tempdir().unwrap();
+            let saved = screenpipe_config::RecordingSettings {
+                user_id: "window-filter-test".into(),
+                device_tier: Some("mid".into()),
+                ignored_windows: vec!["Cursor".into(), "Private".into()],
+                included_windows: vec!["Cursor".into(), "Editor".into()],
+                ..Default::default()
+            };
+            persist_recording_settings_to_store(root.path(), &saved, false).unwrap();
+            let argv = ["screenpipe", "record", "--api-auth=false", flag, "cursor"];
+            let config = record_args(argv)
+                .into_recording_config(root.path().into(), &record_sources(argv))
+                .await
+                .unwrap();
+            let (ignored, included) = if include {
+                (vec!["Private".to_string()], vec!["cursor".to_string()])
+            } else {
+                (vec!["cursor".to_string()], vec!["Editor".to_string()])
+            };
+            assert_eq!(config.ignored_windows, ignored);
+            assert_eq!(config.included_windows, included);
+            let filters =
+                WindowFilters::new(&config.ignored_windows, &config.included_windows, &[]);
+            assert_eq!(filters.is_valid("Cursor", "Project"), include);
+            assert!(!filters.is_valid("Private", "Secrets"));
+
+            let reloaded = load_recording_settings_from_store(root.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(reloaded.ignored_windows, ignored);
+            assert_eq!(reloaded.included_windows, included);
+            let argv = ["screenpipe", "record", "--api-auth=false"];
+            let restarted = record_args(argv)
+                .into_recording_config(root.path().into(), &record_sources(argv))
+                .await
+                .unwrap();
+            assert_eq!(restarted.ignored_windows, ignored);
+            assert_eq!(restarted.included_windows, included);
+        }
+    }
+
+    #[test]
+    fn explicit_window_filter_only_removes_equivalent_saved_patterns() {
+        let argv = [
+            "screenpipe",
+            "record",
+            "--included-windows",
+            " CURSOR :: Project ",
+            "--included-windows",
+            " ÉDITEUR ",
+        ];
+        let mut settings = screenpipe_config::RecordingSettings {
+            ignored_windows: vec![
+                "cursor::project".into(),
+                "Éditeur".into(),
+                "Cursor::Private".into(),
+                "Cursor".into(),
+                "Cur".into(),
+                "::Project".into(),
+                "Private".into(),
+            ],
+            ..Default::default()
+        };
+        record_args(argv).apply_explicit_overrides(&mut settings, &record_sources(argv));
+        assert_eq!(
+            settings.ignored_windows,
+            vec!["Cursor::Private", "Cursor", "Cur", "::Project", "Private",]
+        );
+    }
+
+    #[test]
+    fn explicit_window_filter_preserves_both_lists_when_both_are_supplied() {
+        use screenpipe_screen::capture_screenshot_by_window::WindowFilters;
+
+        for argv in [
+            [
+                "screenpipe",
+                "record",
+                "--included-windows",
+                "Cursor",
+                "--ignored-windows",
+                "Cursor",
+            ],
+            [
+                "screenpipe",
+                "record",
+                "--ignored-windows",
+                "Cursor",
+                "--included-windows",
+                "Cursor",
+            ],
+        ] {
+            let args = record_args(argv);
+            let mut settings = screenpipe_config::RecordingSettings::default();
+            args.apply_explicit_overrides(&mut settings, &record_sources(argv));
+            assert_eq!(settings.ignored_windows, vec!["Cursor"]);
+            assert_eq!(settings.included_windows, vec!["Cursor"]);
+            let filters =
+                WindowFilters::new(&settings.ignored_windows, &settings.included_windows, &[]);
+            assert!(!filters.is_valid("Cursor", "Project"));
+        }
+    }
+
+    #[test]
+    fn absent_window_filter_flags_and_desktop_conversion_preserve_saved_policy() {
+        use screenpipe_screen::capture_screenshot_by_window::WindowFilters;
+
+        let mut settings = screenpipe_config::RecordingSettings {
+            ignored_windows: vec!["Cursor".into(), "Private".into()],
+            included_windows: vec!["Cursor".into()],
+            ..Default::default()
+        };
+        let saved = serde_json::to_value(&settings).unwrap();
+        let argv = ["screenpipe", "record"];
+        record_args(argv).apply_explicit_overrides(&mut settings, &record_sources(argv));
+        assert_eq!(serde_json::to_value(&settings).unwrap(), saved);
+        let config = crate::recording_config::RecordingConfig::from_settings(
+            &settings,
+            PathBuf::from("/tmp/window-filter-desktop-test"),
+            None,
+        );
+        assert_eq!(config.ignored_windows, settings.ignored_windows);
+        assert_eq!(config.included_windows, settings.included_windows);
+        let ui = config.to_ui_recorder_config();
+        assert_eq!(ui.excluded_windows, settings.ignored_windows);
+        assert_eq!(ui.included_windows, settings.included_windows);
+        let filters = WindowFilters::new(&config.ignored_windows, &config.included_windows, &[]);
+        assert!(!filters.is_valid("Cursor", "Project"));
+    }
+
     #[test]
     fn test_incognito_flags_default_to_basic_filtering() {
         let cli = Cli::try_parse_from(["screenpipe", "record"]).unwrap();
@@ -3393,6 +3578,47 @@ mod tests {
             }
             _ => panic!("expected Record command"),
         }
+    }
+
+    #[test]
+    fn focused_window_screenshots_explicit_on_off_and_saved_choice() {
+        for (argv, saved, expected) in [
+            (vec!["screenpipe", "record"], true, true),
+            (
+                vec!["screenpipe", "record", "--focused-window-screenshots"],
+                false,
+                true,
+            ),
+            (
+                vec!["screenpipe", "record", "--focused-window-screenshots=false"],
+                true,
+                false,
+            ),
+        ] {
+            let matches = Cli::command().try_get_matches_from(&argv).unwrap();
+            let sources = RecordArgSources::from_cli_matches(&matches);
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let mut settings = screenpipe_config::RecordingSettings {
+                focused_window_screenshots: saved,
+                ..Default::default()
+            };
+            let Command::Record(args) = cli.command else {
+                panic!("expected record")
+            };
+            args.apply_explicit_overrides(&mut settings, &sources);
+            assert_eq!(settings.focused_window_screenshots, expected);
+            assert_eq!(
+                args.to_recording_settings().focused_window_screenshots,
+                args.focused_window_screenshots
+            );
+        }
+        let Command::Record(args) = Cli::try_parse_from(["screenpipe", "record"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected record")
+        };
+        assert!(!args.focused_window_screenshots);
     }
 
     #[test]

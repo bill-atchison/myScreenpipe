@@ -17,6 +17,7 @@ import {
 import React, { createContext, useContext, useEffect, useRef, useState } from "react";
 import posthog from "posthog-js";
 import { cacheAnalyticsId, cacheAnalyticsEnabled } from "@/lib/analytics-id";
+import { syncPostHogIdentity } from "@/lib/posthog-identity";
 import { captureSettingsChange } from "@/lib/analytics/settings-change";
 import { resolveTelemetryDisabledByEnv, shouldIdentifyInPostHog } from "@/lib/telemetry-env";
 import { User } from "../utils/tauri";
@@ -43,13 +44,6 @@ import {
 	isResolvedConsumerBuild,
 	resolveEnterpriseBuild,
 } from "./use-is-enterprise-build";
-import {
-	clearLegacyUserGoalCategory,
-	DEFAULT_USER_GOAL_CATEGORY,
-	normalizeUserGoalCategory,
-	readLegacyUserGoalCategory,
-	type UserGoalCategory,
-} from "@/lib/live-views/onboarding-activation";
 import {
 	cloneLocalDesktopRemotePolicy,
 	LOCAL_DESKTOP_REMOTE_POLICY,
@@ -332,7 +326,6 @@ export type Settings = SettingsStore & {
 	/** Native account allowance backoff; null clears it for an explicit retry. */
 	activitiesQuotaPause?: { context: string; code: string; retry_at: string | null } | null;
 	/** Goal used to prioritize the Home cards. Persisted in store.bin. */
-	userGoalCategory?: UserGoalCategory;
 	/** Where the user says they found screenpipe, answered once during setup.
 	 *  A fixed enum from the onboarding step — never free text. */
 	acquisitionSource?: string;
@@ -410,12 +403,7 @@ export type Settings = SettingsStore & {
 	openaiCompatibleHeaders?: Record<string, string>;
 	/** Send raw WAV audio instead of MP3 to OpenAI-compatible endpoint */
 	openaiCompatibleRawAudio?: boolean;
-	/** Let Pi / Claude Code call the confidential cloud enclave
-	 * (Gemma 4 E4B inside an attested Tinfoil CVM) to analyze audio,
-	 * video frames, and images from screenpipe data. Default true. When
-	 * false, the "Cloud audio + video + image analysis" section is
-	 * stripped from `~/.claude/skills/screenpipe-api/SKILL.md` so agents
-	 * literally cannot see the endpoint and won't try to call it. */
+	/** @deprecated Retained only to read old settings. Cloud media analysis is retired. */
 	cloudMediaAnalysisEnabled?: boolean;
 	/** Filter music-dominant audio before transcription (reduces Spotify/YouTube music noise) */
 	filterMusic?: boolean;
@@ -742,7 +730,6 @@ let DEFAULT_SETTINGS: Settings = {
 			activitiesEnabled: false,
 			activitiesIntervalMinutes: 15,
 			aiPresets: makeDefaultPresets(false) as any,
-			userGoalCategory: DEFAULT_USER_GOAL_CATEGORY,
 			// Native startup persists the device identity before opening a webview.
 			deviceId: "",
 			deepgramApiKey: "",
@@ -827,6 +814,7 @@ let DEFAULT_SETTINGS: Settings = {
 			starSessionShortcut: "Control+Super+B",
 			disableVision: false,
 			disableScreenshots: false,
+			focusedWindowScreenshots: false,
 			enableSemanticContext: true,
 			remoteControlPreferences: {
 				...NEW_INSTALL_REMOTE_CONTROL_PREFERENCES,
@@ -914,6 +902,7 @@ export function createDefaultSettingsObject(isEnterprise = false): Settings {
 		disableClipboardCapture: !isEnterprise,
 		disableKeyboardCapture: !isEnterprise,
 		asyncPiiRedaction: isEnterprise,
+		requirePiiCompletion: false,
 		asyncImagePiiRedaction: isEnterprise,
 		piiBackend: isEnterprise ? "tinfoil" : "local",
 	});
@@ -926,7 +915,9 @@ export function normalizeSettingsArrays(settings: Settings): boolean {
 	};
 	let changed = false;
 	const presets = settings.aiPresets;
-	if (!Array.isArray(presets) || presets.length === 0) {
+	const managedAiPolicy = settings.enterpriseAiPresetPolicy;
+	const nativeManagedAi = managedAiPolicy && typeof managedAiPolicy === "object" && !Array.isArray(managedAiPolicy) && managedAiPolicy.version === 2;
+	if (!Array.isArray(presets) || (presets.length === 0 && !nativeManagedAi)) {
 		settings.aiPresets = [defaults.aiPresets[0]] as any;
 		changed = true;
 	}
@@ -1118,7 +1109,7 @@ async function activeManagedValues(
 
 // Store utilities similar to Cap's implementation
 function createSettingsStore() {
-	const get = async (): Promise<Settings> => {
+	const get = async (persistMigrations = true): Promise<Settings> => {
 		const store = await getStore();
 		const settings = await store.get<Settings>("settings");
 		// Existing explicit choices do not need a build-identity lookup.
@@ -1139,7 +1130,7 @@ function createSettingsStore() {
 		await hydrateCloudToken(settings);
 
 		let needsUpdate = normalizeSettingsArrays(settings);
-		for (const key of ["disableClipboardCapture", "disableKeyboardCapture", "asyncPiiRedaction", "asyncImagePiiRedaction"] as const) {
+		for (const key of ["disableClipboardCapture", "disableKeyboardCapture", "asyncPiiRedaction", "asyncImagePiiRedaction", "requirePiiCompletion"] as const) {
 			if (settings[key] === undefined) {
 				settings[key] = defaults[key];
 				needsUpdate = true;
@@ -1152,16 +1143,6 @@ function createSettingsStore() {
 		}
 
 		// Migration: Ensure existing users have deviceId for free tier tracking
-		const existingUserGoal = normalizeUserGoalCategory(
-			settings.userGoalCategory,
-		);
-		const shouldMigrateUserGoal = existingUserGoal === null;
-		if (shouldMigrateUserGoal) {
-			settings.userGoalCategory = readLegacyUserGoalCategory();
-			needsUpdate = true;
-		} else {
-			settings.userGoalCategory = existingUserGoal;
-		}
 		if (!settings.deviceId) {
 			settings.deviceId = crypto.randomUUID();
 			needsUpdate = true;
@@ -1469,25 +1450,24 @@ function createSettingsStore() {
 			}
 
 		// Save migrations if needed
-		if (needsUpdate) {
+		if (needsUpdate && persistMigrations) {
 			await setSettingsStripped(store, settings);
 			await saveAndEncrypt(store);
 		}
 
-		// Remove browser-only values only after the durable app setting exists.
-		// This makes the migration one-shot without risking data loss on a failed
-		// settings write.
-		if (shouldMigrateUserGoal) clearLegacyUserGoalCategory();
-
 		return settings;
 	};
 
-	const set = (value: Partial<Settings>) =>
+	const set = (value: Partial<Settings>, isCurrent = () => true) =>
 		enqueueSettingsStoreWrite(async () => {
+			if (!isCurrent()) return;
 			assertValidAiPresetUpdate(value);
 			const store = await getStore();
-			const current = await get();
+			// Merge first, then persist once. Writing migrations here would mirror
+			// the preceding account token while a sign-out is clearing it.
+			const current = await get(false);
 			const managedValues = await activeManagedValues(current);
+			if (!isCurrent()) return;
 			if (current.workflowSharing && value.workflowSharing !== null && value.piiBackend !== undefined && value.piiBackend !== "tinfoil") {
 				throw new Error("Turn off Workflows sharing before changing cloud redaction.");
 			}
@@ -1601,7 +1581,11 @@ interface SettingsContextType {
 	resetSettings: () => Promise<void>;
 	resetSetting: <K extends keyof Settings>(key: K) => Promise<void>;
 	reloadStore: () => Promise<void>;
-	loadUser: (token: string, verify?: boolean) => Promise<void>;
+	loadUser: (
+		token: string,
+		verify?: boolean,
+		options?: { claimDevice?: boolean },
+	) => Promise<void>;
 	getDataDir: () => Promise<string>;
 	isSettingsLoaded: boolean;
 	loadingError: string | null;
@@ -1830,12 +1814,6 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
 		const identifyNow = () => {
 			const clerkId = settings.user?.clerk_id || undefined;
-			const distinctId = clerkId || settings.analyticsId;
-
-			if (clerkId) {
-				try { posthog.alias(clerkId); } catch {}
-			}
-
 			const baseProps = {
 				email: settings.user?.email,
 				name: settings.user?.name,
@@ -1853,11 +1831,19 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 			getVersion()
 				.then((appVersion) => {
 					if (cancelled) return;
-					posthog.identify(distinctId, { ...baseProps, app_version: appVersion });
+					syncPostHogIdentity(posthog, {
+						analyticsId: settings.analyticsId,
+						clerkId,
+						properties: { ...baseProps, app_version: appVersion },
+					});
 				})
 				.catch(() => {
 					if (cancelled) return;
-					posthog.identify(distinctId, baseProps);
+					syncPostHogIdentity(posthog, {
+						analyticsId: settings.analyticsId,
+						clerkId,
+						properties: baseProps,
+					});
 				});
 		};
 
@@ -1935,7 +1921,8 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		applyFontSize(settings.fontSize);
 	}, [settings.fontSize]);
 
-	const updateSettings = async (updates: Partial<Settings>) => {
+	const updateSettings = async (updates: Partial<Settings>, isCurrent = () => true) => {
+		if (!isCurrent()) return;
 		if (settingsRef.current.workflowSharing && updates.workflowSharing !== null &&
 			updates.piiBackend !== undefined && updates.piiBackend !== "tinfoil") {
 			throw new Error("Turn off Workflows sharing before changing cloud redaction.");
@@ -1974,7 +1961,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 			emit("screenpipe-auth-signout").catch(() => {});
 		}
 		try {
-			await settingsStore.set(updates);
+			await settingsStore.set(updates, isCurrent);
 		} catch (error) {
 			// Do not let an older failed write overwrite a newer optimistic click.
 			// The queued newer write (and its store event) owns reconciliation.
@@ -2038,7 +2025,11 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		return `${homeDirPath}/.screenpipe`;
 	};
 
-	const loadUser = async (token: string, verify = false) => {
+	const loadUser = async (
+		token: string,
+		verify = false,
+		options?: { claimDevice?: boolean },
+	) => {
 		// Every background verifier funnels through loadUser. E2E account fixtures
 		// already contain their scenario's exact server response, and their tokens
 		// must never be sent to the production account API. Check this webview's
@@ -2077,6 +2068,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 			}
 		};
 		try {
+			const requestStartedAt = Date.now();
 			const response = await fetch(
 				screenpipeWebUrl("/api/user", "https://screenpipe.com"),
 				{
@@ -2086,8 +2078,17 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 					},
 					// verify=true asks the server to consult Stripe directly (used by the
 					// entitlement gate right after purchase); normal polls omit it to keep
-					// the hot path off Stripe.
-					body: JSON.stringify({ token, ...(verify ? { verify: true } : {}) }),
+					// the hot path off Stripe. device_id enables per-plan active device
+					// tracking and eviction enforcement on the server.
+					body: JSON.stringify({
+						token,
+						prefer_workspace: true,
+						...(verify ? { verify: true } : {}),
+						...(settingsRef.current.deviceId
+							? { device_id: settingsRef.current.deviceId }
+							: {}),
+						...(options?.claimDevice ? { claim_device: true } : {}),
+					}),
 				},
 			);
 
@@ -2128,13 +2129,14 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 				throw new Error("account session was rejected by the server");
 			}
 
-			const userData = normalizeAppUser(data.user, token) as User;
+			const userData = normalizeAppUser(data.user, token, requestStartedAt) as User;
 			const localPlanPolicy = getLocalPlanPolicy(userData as any);
 			if (localPlanPolicy === "unknown") {
 				// Preserve the authenticated identity so the user can retry, but
 				// replace any cached paid state with this unknown state immediately.
 				// setCloudToken then refreshes the native PipeManager's safe cap.
-				await updateSettings({ user: userData });
+				await updateSettings({ user: userData }, requestStillCurrent);
+				if (!requestStillCurrent()) return;
 				try {
 					await commands.setCloudToken(token);
 				} catch (e) {
@@ -2163,7 +2165,10 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 				}
 			}
 
-			await updateSettings({ user: userData });
+			await updateSettings({ user: userData }, requestStillCurrent);
+			// Persistence can yield while logout invalidates this refresh. Never
+			// re-send its token to native storage after the sign-out deletion.
+			if (!requestStillCurrent()) return;
 
 			// Push the fresh token into the running sidecar so the
 			// `Server.cloud_token` (used by /v1/chat/completions proxy) and

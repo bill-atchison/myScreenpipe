@@ -173,7 +173,7 @@ fn prefetch_tray_menu_data(app: &AppHandle) -> TrayMenuData {
 /// Business-equivalent features here — is shown as "Business" rather than
 /// "Enterprise". Only the enterprise build surfaces the real org label.
 fn plan_display_name(plan: Option<&str>) -> &'static str {
-    let enterprise_build = cfg!(feature = "enterprise-build");
+    let enterprise_build = crate::app_mode::is_enterprise_package();
     match plan.unwrap_or("none").to_ascii_lowercase().as_str() {
         "standard" | "basic" => "Basic",
         "pro" | "business" => "Business",
@@ -1496,7 +1496,7 @@ fn create_dynamic_menu(
             .item(
                 &MenuItemBuilder::with_id(
                     "version",
-                    if cfg!(feature = "enterprise-build") {
+                    if crate::app_mode::is_enterprise_package() {
                         format!("version {} (Enterprise)", app.package_info().version)
                     } else {
                         format!("version {}", app.package_info().version)
@@ -1525,6 +1525,12 @@ fn create_dynamic_menu(
     let show_shortcut = &data.show_shortcut;
     let search_shortcut = &data.search_shortcut;
     let chat_shortcut = &data.chat_shortcut;
+
+    if crate::enterprise_policy::is_simplified_ui() {
+        menu_builder = menu_builder.item(
+            &MenuItemBuilder::with_id("star_session", ui_text("Star / end work session")).build(app)?
+        ).item(&PredefinedMenuItem::separator(app)?);
+    }
 
     // --- Open screenpipe ---
     if !data.app_ui_hidden {
@@ -1696,7 +1702,7 @@ fn create_dynamic_menu(
 
     // --- Version (below update item) ---
     let is_beta = app.config().identifier.contains("beta");
-    let is_enterprise = cfg!(feature = "enterprise-build");
+    let is_enterprise = crate::app_mode::is_enterprise_package();
     let version_text = match (is_beta, is_enterprise) {
         (_, true) => format!("screenpipe v{} (Enterprise)", app.package_info().version),
         (true, false) => format!("screenpipe v{} (Beta)", app.package_info().version),
@@ -2037,6 +2043,11 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
     track_tray_menu_item_clicked(app_handle, event.id().as_ref());
 
     match event.id().as_ref() {
+        "star_session" => {
+            if crate::enterprise_policy::is_simplified_ui() {
+                let _ = crate::commands::starred_sessions::toggle(app_handle);
+            }
+        }
         "show" => {
             let app = app_handle.clone();
             let _ = app_handle.run_on_main_thread(move || {

@@ -32,11 +32,17 @@ import {
 } from "./qualified-value";
 import { discoverTeamConfig } from "./team-config";
 import { teamFrameContent, teamFramePath } from "./team-frame";
+import { jpegImageContent } from "./frame-image";
+import { CHAT_SEARCH_TOOL, searchChats } from "./chat-search";
 import { WORKFLOW_TOOLS, readWorkflowTool, frameAutomationContent } from "./workflow-tools";
 import { PKG_VERSION } from "./version";
 import { BUNDLED_SKILLS_TOOL, readBundledSkills } from "./bundled-skills";
 import { formatForElementPurpose } from "./element-format";
 import { buildActivitySummaryResult } from "./activity-summary-tool";
+import {
+  handleSearchSyncedContent,
+  handleSyncedDevices,
+} from "./data-sync-tool";
 import {
   localContextDayStarts,
   normalizeTime,
@@ -44,7 +50,13 @@ import {
 } from "./time-normalization";
 import { createCallObserver, currentMcpRequestId, observeMcpError, observeSearchResult } from "./call-observation";
 import { formatSearchHit, searchContentCap, searchResultHeader } from "./search-result";
+import {
+  normalizeNonNegativeInt,
+  normalizePositiveInt,
+  zeroHitCoverageText,
+} from "./result-contracts";
 import { resolveScreenpipeApiBase } from "./api-base";
+import { findMeetingScreenRefs, MEETING_LIST_SCREEN_REF_LIMIT } from "./meeting-screen-refs";
 
 initMcpTelemetry({ transport: "stdio" });
 
@@ -128,6 +140,11 @@ async function discoverApiKey(): Promise<string> {
   // spent we stop attempting further fallbacks.
   const PER_CANDIDATE_MS = 30000;
   const OVERALL_DEADLINE = Date.now() + 60000;
+  // Every helper below is a console program run in the background. On Windows,
+  // a host that starts this server without a console (e.g. detached) would make
+  // each helper open its own visible terminal window (#7560). windowsHide keeps
+  // the helper's console hidden whatever console state the host gave us.
+  const HIDE_HELPER_WINDOW = { windowsHide: true } as const;
   const budgetLeft = () => Math.max(0, OVERALL_DEADLINE - Date.now());
 
   // 2. CLI via bundled `bun` shipped with the desktop app. The Tauri
@@ -191,6 +208,7 @@ async function discoverApiKey(): Promise<string> {
       const { stdout } = await execFileAsync(bunPath, ["x", "screenpipe@latest", "auth", "token"], {
         timeout: Math.min(PER_CANDIDATE_MS, budgetLeft()),
         encoding: "utf-8",
+        ...HIDE_HELPER_WINDOW,
       });
       const token = String(stdout).trim();
       if (token && token.startsWith("sp-")) return token;
@@ -208,6 +226,7 @@ async function discoverApiKey(): Promise<string> {
       const { stdout } = await execFileAsync(npxPath, ["screenpipe@latest", "auth", "token"], {
         timeout: Math.min(PER_CANDIDATE_MS, budgetLeft()),
         encoding: "utf-8",
+        ...HIDE_HELPER_WINDOW,
       });
       const token = String(stdout).trim();
       if (token && token.startsWith("sp-")) return token;
@@ -221,6 +240,7 @@ async function discoverApiKey(): Promise<string> {
       const { stdout } = await execAsync("npx screenpipe@latest auth token", {
         timeout: Math.min(PER_CANDIDATE_MS, budgetLeft()),
         encoding: "utf-8",
+        ...HIDE_HELPER_WINDOW,
       });
       const token = String(stdout).trim();
       if (token && token.startsWith("sp-")) return token;
@@ -325,6 +345,7 @@ const server = new Server(
 // Tools
 // ---------------------------------------------------------------------------
 const TOOLS: Tool[] = [
+  CHAT_SEARCH_TOOL,
   ...WORKFLOW_TOOLS,
   BUNDLED_SKILLS_TOOL,
   {
@@ -345,9 +366,9 @@ const TOOLS: Tool[] = [
         },
         content_type: {
           type: "string",
-          enum: ["all", "ocr", "audio", "input", "accessibility", "memory", "parsed"],
+          enum: ["all", "screen", "ocr", "audio", "input", "accessibility", "memory", "parsed"],
           description:
-            "Filter by content type. Use 'parsed' for compact app-specific records such as messages, emails, tasks, documents, and code review; it is experimental and may be empty when parsing is disabled or unsupported. NOTE on screen text: 'ocr' is a legacy label — it returns ALL screen-text rows, which are accessibility-derived for most apps (the result tag [Screen·a11y] vs [Screen·ocr] tells you which). Use 'ocr' for screen text (covers both paths), 'audio' for transcriptions, 'input' for keyboard/mouse events, 'memory' for stored facts. Default: 'all'.",
+            "Filter by content type. Use 'screen' for screen text: accessibility is the primary capture path, with OCR fallback. Results identify the actual source as [Screen·a11y] or [Screen·ocr]; [Screen] means the source is unknown. 'ocr' is a legacy alias for 'screen', not an OCR-only filter. Use 'accessibility' only when you explicitly need accessibility-only results; it excludes OCR fallback. Use 'parsed' for compact app-specific messages, emails, tasks, documents, and code review (experimental; may be empty when parsing is disabled or unsupported), 'audio' for transcriptions, 'input' for keyboard/mouse events, 'memory' for stored facts. Default: 'all'.",
           default: "all",
         },
         limit: { type: "integer", description: "Max results (default 10, max 20). Start with 5 for exploration.", default: 10 },
@@ -370,7 +391,7 @@ const TOOLS: Tool[] = [
         max_length: { type: "integer", description: "Max content length in characters" },
         include_frames: {
           type: "boolean",
-          description: "Include base64 screenshots (OCR only). Warning: large response.",
+          description: "Return screenshots as image content for screen results. For visual evidence, use content_type=screen, a narrow time/app/window filter, and limit=1 or 2. If you already have the exact frame_id, use get-screenshot.",
           default: false,
         },
         speaker_ids: { type: "string", description: "Comma-separated speaker IDs to filter audio" },
@@ -378,7 +399,7 @@ const TOOLS: Tool[] = [
         tags: {
           type: "string",
           description:
-            "Comma-separated tags; returns only items carrying ALL of them (e.g. 'person:ada,project:atlas'). Works for screen + audio (content_type 'ocr'/'audio'/'all', tags written by add-tags) AND memories (content_type 'memory', tags written by update-memory). Same tag string links across all three, so two items sharing a tag are connected. Use namespaced tags (person:, project:, topic:) to link people/projects/topics. content_type 'input' and 'accessibility' have no tags and return nothing when this is set; 'parsed' does not support tags.",
+            "Comma-separated tags; returns only items carrying ALL of them (e.g. 'person:ada,project:atlas'). Works for screen + audio (content_type 'screen'/'ocr'/'audio'/'all', tags written by add-tags) AND memories (content_type 'memory', tags written by update-memory). Same tag string links across all three, so two items sharing a tag are connected. Use namespaced tags (person:, project:, topic:) to link people/projects/topics. content_type 'input' and 'accessibility' have no tags and return nothing when this is set; 'parsed' does not support tags.",
         },
         include_related: {
           type: "boolean",
@@ -431,7 +452,7 @@ const TOOLS: Tool[] = [
       "looking for a meeting with a person or on a topic ('when did I last talk to Noah?'), pass `q` and OMIT start_time. " +
       "Only constrain the time range when the question itself is time-bound. Results are newest-first; without `q`, old " +
       "meetings only surface via time range or offset pagination. Follow up with get-meeting (id from results) for the " +
-      "full note and transcript.",
+      "full note and transcript. Set include_screen_refs=true for one related screenshot/accessibility frame ID per meeting.",
     annotations: { title: "List Meetings", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
     inputSchema: {
       type: "object",
@@ -441,6 +462,7 @@ const TOOLS: Tool[] = [
         q: { type: "string", description: "Case-insensitive substring filter on title, attendees (names/emails), and note. Searches all history." },
         limit: { type: "integer", description: "Max results (default 20)", default: 20 },
         offset: { type: "integer", description: "Pagination offset", default: 0 },
+        include_screen_refs: { type: "boolean", description: "Look up one matching screen frame for each of the first 10 results. Use smaller pages and offset to cover more meetings." },
       },
     },
   },
@@ -458,7 +480,7 @@ const TOOLS: Tool[] = [
       type: "object",
       properties: {
         start_time: { type: "string", description: "ISO 8601, relative (e.g. '3h ago'), or local calendar ('today', 'yesterday', 'tomorrow', 'YYYY-MM-DD')" },
-        end_time: { type: "string", description: "ISO 8601, relative (e.g. 'now'), or local calendar ('today', 'yesterday', 'tomorrow', 'YYYY-MM-DD')" },
+        end_time: { type: "string", description: "ISO 8601, relative (e.g. 'now'), or local calendar ('today', 'yesterday', 'tomorrow', 'YYYY-MM-DD'). Defaults to 'now'." },
         include_starred: { type: "boolean", description: "Include bounded starred-session context (default true; omitted for app/data-restricted reads)." },
         app_name: { type: "string", description: "Optional app name filter to focus on one app" },
         include_parsed_context: {
@@ -475,7 +497,7 @@ const TOOLS: Tool[] = [
           default: 10,
         },
       },
-      required: ["start_time", "end_time"],
+      required: ["start_time"],
     },
   },
   {
@@ -511,10 +533,24 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "get-screenshot",
+    description:
+      "Inspect one exact recorded screen frame as a compact image. Use when the answer depends on visible UI, layout, charts, slides, or a before/after state. " +
+      "Pass the frame_id from search-content, get-meeting, or get-workflow. Use frame-context for captured accessibility text and nodes.",
+    annotations: { title: "Get Screenshot", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
+    inputSchema: {
+      type: "object",
+      properties: {
+        frame_id: { type: "integer", minimum: 1, description: "Exact recorded frame ID" },
+      },
+      required: ["frame_id"],
+    },
+  },
+  {
     name: "frame-context",
     description:
       "Get full accessibility text, parsed tree nodes, and URLs for a specific frame ID. " +
-      "Use after search-content or get-workflow for a specific moment. Set purpose=automation for paginated nodes preserving exact captured bounds and automation properties; these are historical, not live targets.",
+      "Use after search-content or get-workflow for a specific moment. Use get-screenshot for the image. Set purpose=automation for paginated nodes preserving exact captured bounds and automation properties; these are historical, not live targets.",
     annotations: { title: "Frame Context", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
     inputSchema: {
       type: "object",
@@ -766,12 +802,14 @@ const TOOLS: Tool[] = [
     description:
       "Get a meeting by ID: title, attendees, times, and the full note. " +
       "Pass include_transcript=true to also get the speaker-attributed transcript segments — do this when the note is " +
-      "empty and you need to reconstruct what was said (much better than searching raw audio by time range).",
+      "empty and you need to reconstruct what was said (much better than searching raw audio by time range). " +
+      "Set include_screen_refs=true to find candidate frames for a shared slide or demo, then call get-screenshot on the relevant ID.",
     annotations: { title: "Get Meeting", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "integer", description: "Meeting ID (from list-meetings results)" },
+        include_screen_refs: { type: "boolean", description: "Look up up to three matching screen frame IDs and screenshot links. Use get-screenshot for the image and frame-context for accessibility." },
         include_transcript: {
           type: "boolean",
           description: "Also return the meeting's transcript segments with speaker names and timestamps.",
@@ -1157,7 +1195,8 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 | 1 | activity-summary | Broad questions: "what was I doing?", "which apps?", "how long on X?" |
 | 2 | search-content | Need specific text, transcriptions, memories, or compact app data (use content_type=parsed) |
 | 3 | search-elements | Need UI structure: buttons, links, form fields |
-| 4 | frame-context | Need full detail for a specific moment (use frame_id from step 2) |
+| 4 | frame-context | Need full accessibility text and nodes for a specific frame |
+| 5 | get-screenshot | Need to inspect the pixels of a known frame |
 
 For another/named device or an across-device question, use synced-devices to
 resolve the device name, then search-synced-content. Keep search-content for the
@@ -1170,10 +1209,12 @@ current machine. Synced results must be attributed with their device and timesta
 - **Use max_content_length=500** to keep responses compact
 - **Don't use q for audio** — transcriptions are noisy, q filters too aggressively. Search audio by time range and speaker instead
 - **app_name is case-sensitive** — use exact names: "Google Chrome" not "chrome"
-- **Screen text is mostly accessibility-derived, not OCR.** Screenpipe walks the OS accessibility tree first; OCR is only a fallback (terminals, canvas-rendered apps, games). \`content_type=ocr\` returns both paths — the result label \`[Screen·a11y]\` vs \`[Screen·ocr]\` tells you which produced the row. Don't pre-filter to a11y/ocr unless you specifically need one or the other
+- **Use content_type=screen for screen text.** Screenpipe walks the OS accessibility tree first, with OCR fallback. The result label \`[Screen·a11y]\` or \`[Screen·ocr]\` identifies the actual capture source; \`[Screen]\` means unknown. \`content_type=ocr\` is a legacy alias for the same search, not an OCR-only filter. Use \`accessibility\` only for an explicit accessibility-only request, since it excludes OCR fallback.
 
 ## Common Patterns
 
+- "What was visible?" → if you have a frame_id, call get-screenshot. Otherwise use search-content with content_type=screen, include_frames=true, and limit=1 or 2 over the relevant time and app/window. For before/after, inspect one frame on each side.
+- "What did they show in the demo?" → get-meeting with include_screen_refs=true, then get-screenshot on the relevant frame. Use the transcript to locate the part of the demo when needed.
 - "What was I doing for the last 2 hours?" → activity-summary with start_time='2h ago'
 - "What did I discuss in my meeting?" → list-meetings to find it, then get-meeting with include_transcript=true
 - "When did I last talk to <person>?" → list-meetings with q=<name or email>, NO start_time (q searches all history)
@@ -1414,7 +1455,8 @@ const observeCall = createCallObserver({
   send: (payload, signal) => callAPI("/internal/telemetry/mcp-call", { method: "POST", body: JSON.stringify(payload), signal }),
 });
 server.setRequestHandler(CallToolRequestSchema, async (request) => observeCall(request.params.name, async () => {
-  const { name, arguments: args } = request.params;
+  const { name, arguments: suppliedArgs } = request.params;
+  const args = suppliedArgs ?? (name === CHAT_SEARCH_TOOL.name ? {} : undefined);
 
   if (name === BUNDLED_SKILLS_TOOL.name) return readBundledSkills(args);
 
@@ -1548,71 +1590,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeCall(r
       }
 
       case "synced-devices": {
-        const response = await callAPI("/data-sync/devices");
-        const data = await response.json();
-        const devices = Array.isArray(data.devices) ? data.devices : [];
-        if (devices.length === 0) {
-          return {
-            content: [{
-              type: "text",
-              text: data.enabled === false
-                ? "Data Sync is off and no synced devices are available. Enable Data Sync in Screenpipe settings on the devices you want to query."
-                : "No synced devices are available yet. Enable Data Sync and let a device complete its first upload.",
-            }],
-          };
-        }
-        return {
-          content: [{
-            type: "text",
-            text: devices
-              .map((device: any) =>
-                `${device.device_name} (${device.device_id}) — last synced ${device.last_synced_at}` +
-                `${device.platform ? ` — ${device.platform}` : ""}`
-              )
-              .join("\n"),
-          }],
-        };
+        return await handleSyncedDevices(callAPI);
       }
 
       case "search-synced-content": {
-        const params = new URLSearchParams();
-        for (const key of ["q", "device_name", "device_id", "app_name", "since", "until", "since_hours_ago", "limit"]) {
-          const value = args[key];
-          if (value !== null && value !== undefined && value !== "") {
-            params.set(key, String(value));
-          }
-        }
-        const response = await callAPI(`/data-sync/search?${params.toString()}`);
-        const data = await response.json();
-        const results = Array.isArray(data.results) ? data.results : [];
-        if (results.length === 0) {
-          return {
-            content: [{
-              type: "text",
-              text: data.enabled === false
-                ? "No matching synced records. Data Sync is currently off, so no new records are uploading."
-                : "No matching synced records. Try a wider time range, confirm the device with synced-devices, or use a broader query.",
-            }],
-          };
-        }
-        const prefix = data.truncated
-          ? "Results are truncated; narrow the device, time range, or query.\n\n"
-          : "";
-        return {
-          content: [{
-            type: "text",
-            text: prefix + results.map((record: any) => {
-              const content = record.text || record.transcription || record.content || "";
-              return `[${record.device || record.device_id || "unknown device"}] ${record.t || "unknown time"}` +
-                `${record.app ? ` — ${record.app}` : ""}\n${truncateMiddle(String(content), DEFAULT_SEARCH_CONTENT_TRUNCATE)}`;
-            }).join("\n\n"),
-          }],
-        };
+        return await handleSearchSyncedContent(args, callAPI);
       }
 
       case "search-content": {
         const includeFrames = args.include_frames === true;
         const normalized = normalizeTimeFields(args);
+        // Keep the clearer MCP name compatible with APIs that still call all
+        // screen-text rows "ocr", including accessibility-derived captures.
+        if (normalized.content_type === "screen") normalized.content_type = "ocr";
         // Default text cap if the caller didn't pass max_content_length.
         // Keeps single calls under Claude Code's per-tool output limit.
         const userCap = normalized.max_content_length;
@@ -1631,11 +1621,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeCall(r
         observeSearchResult(results.length, false);
 
         if (results.length === 0) {
+          // A zero-hit reply is a successful result, not an error. Disclose the
+          // exact window and filters that were scanned so callers can widen the
+          // right knob instead of guessing or retrying the same query.
           return {
             content: [
               {
                 type: "text",
-                text: "No results found. Try: broader terms, different content_type, or wider time range.",
+                text: zeroHitCoverageText("search-content", {
+                  query: normalized.q as string | undefined,
+                  start_time: normalized.start_time as string | undefined,
+                  end_time: normalized.end_time as string | undefined,
+                  app: (normalized.app_name ?? normalized.app_names) as string | undefined,
+                  limit: normalized.limit as string | number | undefined,
+                  offset: normalized.offset as string | number | undefined,
+                  details: `content_type=${normalized.content_type ?? "all"}`,
+                }),
               },
             ],
           };
@@ -1651,14 +1652,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeCall(r
         const formattedResults: string[] = [];
         const images: Array<{ data: string; context: string }> = [];
         let truncated = false;
+        let hasScreenFrame = false;
 
         for (const result of results) {
           const content = result.content;
           if (!content) continue;
           const hit = formatSearchHit(result, effectiveCap);
           if (hit) { formattedResults.push(hit.text); truncated ||= hit.truncated; }
+          const frameId = normalizePositiveInt(content.frame_id);
+          if (hit && (result.type === "OCR" || result.type === "Parsed") && frameId !== null) {
+            hasScreenFrame = true;
+          }
           if (includeFrames && result.type === "OCR" && content.frame) {
-            images.push({ data: content.frame, context: `${content.app_name} at ${content.timestamp}` });
+            const frameLabel = frameId === null ? "" : ` (frame_id=${frameId})`;
+            images.push({ data: content.frame, context: `${content.app_name} at ${content.timestamp}${frameLabel}` });
           }
         }
 
@@ -1676,9 +1683,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeCall(r
                 .join(" | ")
             : "";
 
+        const screenshotHint = hasScreenFrame && images.length === 0
+          ? "\nFor visual evidence, inspect a returned frame with get-screenshot(frame_id)."
+          : "";
         contentItems.push({
           type: "text",
-          text: header + "\n\n" + formattedResults.join("\n---\n") + relatedStr,
+          text: header + screenshotHint + "\n\n" + formattedResults.join("\n---\n") + relatedStr,
         });
 
         for (const img of images) {
@@ -1690,7 +1700,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeCall(r
       }
 
       case "list-meetings": {
-        const normalized = normalizeTimeFields(args);
+        const { include_screen_refs, ...filters } = args;
+        const normalized = normalizeTimeFields(filters);
         const params = new URLSearchParams();
         for (const [key, value] of Object.entries(normalized)) {
           if (value !== null && value !== undefined) {
@@ -1716,7 +1727,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeCall(r
 
         qualifiedValue.meetingResult();
 
-        const formatted = meetings.map((m: Record<string, unknown>) => {
+        let meetingRefs: Awaited<ReturnType<typeof findMeetingScreenRefs>>[] | undefined;
+        if (include_screen_refs === true) {
+          meetingRefs = [];
+          const lookupMeetings = meetings.slice(0, MEETING_LIST_SCREEN_REF_LIMIT);
+          for (let i = 0; i < lookupMeetings.length; i += 2) {
+            meetingRefs.push(...await Promise.all(
+              lookupMeetings.slice(i, i + 2).map(m => findMeetingScreenRefs(m, 1, callAPI)),
+            ));
+          }
+        }
+
+        const formatted = meetings.map((m: Record<string, unknown>, i: number) => {
           const start = m.meeting_start as string;
           const end = (m.meeting_end as string) || "ongoing";
           const app = m.meeting_app as string;
@@ -1726,7 +1748,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeCall(r
           const note = noteStr
             ? `\nNote: ${noteStr.length > 200 ? `${noteStr.slice(0, 200)}…` : noteStr}`
             : "\nNote: (none — use get-meeting with include_transcript to reconstruct)";
-          return `[id ${m.id}] [${m.detection_source}] ${app}${title}\n  ${start} → ${end}${attendees}${note}`;
+          const refs = meetingRefs
+            ? `\nScreen refs: ${JSON.stringify(meetingRefs[i] ?? { screen_refs: [], screen_refs_status: "not_checked" })}`
+            : "";
+          return `[id ${m.id}] [${m.detection_source}] ${app}${title}\n  ${start} → ${end}${attendees}${note}${refs}`;
         });
 
         return {
@@ -1776,6 +1801,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeCall(r
                 ? text
                 : "No elements found. Try: broader search, different role/source, or wider time range.",
             },
+          ],
+        };
+      }
+
+      case "get-screenshot": {
+        const frameId = normalizePositiveInt(args.frame_id);
+        if (frameId === null) {
+          return { isError: true, content: [{ type: "text", text: "frame_id must be a positive integer." }] };
+        }
+        const [thumbnail, metadata] = await Promise.all([
+          callAPI(`/frames/${frameId}/thumbnail?width=768&fallback=false`),
+          callAPI(`/frames/${frameId}/metadata`),
+        ]);
+        const [image, frame] = await Promise.all([
+          jpegImageContent(thumbnail, name, 300_000),
+          metadata.json(),
+        ]);
+        if (frame?.frame_id !== frameId || typeof frame.timestamp !== "string" || !Number.isFinite(Date.parse(frame.timestamp))) {
+          throw new Error("Screenshot metadata did not identify the requested frame and timestamp.");
+        }
+        qualifiedValue.searchResult();
+        return {
+          content: [
+            { type: "text", text: `Frame ${frameId} at ${frame.timestamp}. Source: screenpipe://frame/${frameId}` },
+            image,
           ],
         };
       }
@@ -2138,13 +2188,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeCall(r
       }
 
       case "get-meeting": {
-        const meetingId = args.id as number;
-        if (!meetingId) {
-          return { content: [{ type: "text", text: "Error: id is required" }] };
+        // Clients sometimes serialize integer ids as floats or numeric strings
+        // ("268.0"); the Rust route parses the path segment as i64 and 400s.
+        const meetingId = normalizePositiveInt(args.id);
+        if (meetingId === null) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error: id must be a positive integer (received ${JSON.stringify(args.id)}).`,
+              },
+            ],
+          };
         }
         const response = await callAPI(`/meetings/${meetingId}`);
         const meeting = await response.json();
-        let text = JSON.stringify(meeting, null, 2);
+        const refs = args.include_screen_refs === true ? await findMeetingScreenRefs(meeting, 3, callAPI) : undefined;
+        let text = JSON.stringify(refs ? { ...meeting, ...refs } : meeting, null, 2);
 
         if (args.include_transcript) {
           const tRes = await callAPI(`/meetings/${meetingId}/transcript`);
@@ -2153,7 +2213,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeCall(r
             text += "\n\nTranscript: (no segments recorded for this meeting)";
           } else {
             // Cap the payload: long meetings can have hundreds of segments.
-            const offset = Math.max(0, (args.transcript_offset as number) || 0);
+            // Clients can serialize the offset as "400.0"; coerce it back to a
+            // whole number so slice() and the "more" hint stay correct.
+            const offset = normalizeNonNegativeInt(args.transcript_offset) ?? 0;
             const MAX_SEGMENTS = 200;
             const MAX_CHARS = 40_000;
             const page = segments.slice(offset, offset + MAX_SEGMENTS);
@@ -2257,7 +2319,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeCall(r
           ? data
           : (data.data ?? []);
         if (results.length === 0) {
-          return { content: [{ type: "text", text: "No keyword search results found." }] };
+          return {
+            content: [
+              {
+                type: "text",
+                text: zeroHitCoverageText("keyword-search", {
+                  query: queryStr,
+                  start_time: normalized.start_time as string | undefined,
+                  end_time: normalized.end_time as string | undefined,
+                  app: (normalized.app_name ?? normalized.app_names) as string | undefined,
+                  limit: normalized.limit as string | number | undefined,
+                  offset: normalized.offset as string | number | undefined,
+                  details: `fuzzy_match=${args.fuzzy_match ?? false}`,
+                }),
+              },
+            ],
+          };
         }
         qualifiedValue.searchResult();
         const formatted = results.map((r) => {
@@ -2276,6 +2353,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeCall(r
           content: [{ type: "text", text: `Results: ${results.length}\n\n${formatted.join("\n---\n")}` }],
         };
       }
+
+      case "search-chats":
+        return await searchChats(args, callAPI);
 
       case "list-workflows":
       case "get-workflow":

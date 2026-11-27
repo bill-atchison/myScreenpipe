@@ -20,6 +20,10 @@
 use crate::enterprise::sync as ee_sync;
 
 #[cfg(feature = "enterprise-support")]
+pub(crate) const NATIVE_POLICY_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
+#[cfg(feature = "enterprise-support")]
 mod imp {
     use super::ee_sync;
     use crate::recording::local_api_context_from_app;
@@ -49,6 +53,7 @@ mod imp {
         // customer's storage backend.
         app: tauri::AppHandle,
         http: reqwest::Client,
+        screenshot_work: tokio::sync::Notify,
     }
 
     impl ScreenpipeLocalClient {
@@ -56,6 +61,7 @@ mod imp {
             Self {
                 api_url_base,
                 app,
+                screenshot_work: tokio::sync::Notify::new(),
                 http: reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(30))
                     .build()
@@ -211,8 +217,11 @@ mod imp {
 
     struct StorageExport {
         db: Arc<screenpipe_db::DatabaseManager>,
-        token: screenpipe_db::storage::StorageReadToken,
-        activities: Option<(tauri::AppHandle, std::collections::BTreeMap<String, String>)>,
+        token: tokio::sync::Mutex<screenpipe_db::storage::StorageReadToken>,
+        policy_generation: Option<i64>,
+        refresh_cause: std::sync::Mutex<Option<String>>,
+        activities: Option<tauri::AppHandle>,
+        selected_activities: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
     }
 
     impl StorageExport {
@@ -221,21 +230,14 @@ mod imp {
             app: tauri::AppHandle,
         ) -> Result<Self, EnterpriseSyncError> {
             let mut export = Self::begin_storage(db.clone()).await?;
-            let activities = if crate::enterprise_policy::current_sync_streams().activities
+            if crate::enterprise_policy::current_sync_streams().activities
                 && db
                     .release_policy()
                     .await
                     .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))?
                     .text
             {
-                db.activity_export_versions()
-                    .await
-                    .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))?
-            } else {
-                Default::default()
-            };
-            if !activities.is_empty() {
-                export.activities = Some((app, activities));
+                export.activities = Some(app);
             }
             Ok(export)
         }
@@ -250,10 +252,19 @@ mod imp {
                         operation: "prepare export",
                         cause: error.to_string(),
                     })?;
+            let policy_generation = db.release_policy_generation().await.map_err(|error| {
+                EnterpriseSyncError::Storage {
+                    operation: "prepare export policy",
+                    cause: error.to_string(),
+                }
+            })?;
             Ok(Self {
                 db,
-                token,
+                token: tokio::sync::Mutex::new(token),
+                policy_generation,
+                refresh_cause: Default::default(),
                 activities: None,
+                selected_activities: Default::default(),
             })
         }
     }
@@ -261,7 +272,12 @@ mod imp {
     #[async_trait::async_trait]
     impl crate::enterprise::sync::ExportFilter for StorageExport {
         async fn admit(&self) -> Result<Option<Box<dyn Send>>, EnterpriseSyncError> {
-            let history = if let Some((app, activities)) = &self.activities {
+            let selected_activities = self.selected_activities.lock().unwrap().clone();
+            let history = if let Some(app) = self
+                .activities
+                .as_ref()
+                .filter(|_| !selected_activities.is_empty())
+            {
                 let guard = app
                     .state::<crate::activity_history::ActivityHistoryState>()
                     .export_lock
@@ -275,18 +291,25 @@ mod imp {
                     .map(serde_json::to_value)
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))?;
-                screenpipe_db::privacy_exports::validate_activity_exports(activities, &rows)
-                    .map_err(|e| EnterpriseSyncError::Configuration(e.to_string()))?;
+                screenpipe_db::privacy_exports::validate_activity_exports(
+                    &selected_activities,
+                    &rows,
+                )
+                .map_err(|e| EnterpriseSyncError::Configuration(e.to_string()))?;
                 Some(guard)
             } else {
                 None
             };
-            let storage = self.token.admit(&self.db.pool).await.map_err(|error| {
-                EnterpriseSyncError::Storage {
+            let storage = self
+                .token
+                .lock()
+                .await
+                .admit(&self.db.pool)
+                .await
+                .map_err(|error| EnterpriseSyncError::Storage {
                     operation: "admit export",
                     cause: error.to_string(),
-                }
-            })?;
+                })?;
             Ok(Some(Box::new((storage, history))))
         }
 
@@ -296,11 +319,117 @@ mod imp {
             local: &dyn LocalApiClient,
         ) -> Result<ee_sync::ExportFilterReport, EnterpriseSyncError> {
             if local.privacy_release_required().await? {
-                drop(self.admit().await?);
+                let generation = self.db.release_policy_generation().await.map_err(|e| {
+                    EnterpriseSyncError::Storage {
+                        operation: "validate export policy",
+                        cause: e.to_string(),
+                    }
+                })?;
+                if generation != self.policy_generation {
+                    return Err(EnterpriseSyncError::Configuration(
+                        "privacy policy changed during export; retry pending".into(),
+                    ));
+                }
+                // Activity sources live outside SQLite. Scope their validation
+                // to this request, retaining only unchanged certified versions.
+                self.selected_activities.lock().unwrap().clear();
+                if let Some(app) = self
+                    .activities
+                    .as_ref()
+                    .filter(|_| !rows.activities.is_empty())
+                {
+                    let history = app.state::<crate::activity_history::ActivityHistoryState>();
+                    let _guard = history.export_lock.lock().await;
+                    let staged = self.db.activity_export_versions().await.map_err(|e| {
+                        EnterpriseSyncError::Storage {
+                            operation: "read certified activity versions",
+                            cause: e.to_string(),
+                        }
+                    })?;
+                    let current = crate::activity_history::export_rows(app)
+                        .map_err(EnterpriseSyncError::LocalApi)?;
+                    let mut versions = std::collections::BTreeMap::new();
+                    for row in current {
+                        let value = serde_json::to_value(row)
+                            .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))?;
+                        let id = value["activity_id"].as_str().ok_or_else(|| {
+                            EnterpriseSyncError::LocalApi("activity ID missing".into())
+                        })?;
+                        let version = screenpipe_db::privacy_exports::export_version(&value)
+                            .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))?;
+                        if staged.get(id) == Some(&version) {
+                            versions.insert(id.to_string(), version);
+                        }
+                    }
+                    rows.activities
+                        .retain(|row| versions.contains_key(&row.activity_id));
+                    versions
+                        .retain(|id, _| rows.activities.iter().any(|row| &row.activity_id == id));
+                    *self.selected_activities.lock().unwrap() = versions;
+                }
+                let previous_cause = self.refresh_cause.lock().unwrap().clone();
+                let cause = match previous_cause {
+                    Some(cause) => cause,
+                    None => match self.admit().await {
+                        Ok(guard) => {
+                            drop(guard);
+                            return Ok(Default::default());
+                        }
+                        Err(EnterpriseSyncError::Storage { cause, .. })
+                            if screenpipe_db::storage::is_revision_change_message(&cause)
+                                || cause.contains("privacy revision changed") =>
+                        {
+                            cause
+                        }
+                        Err(error) => return Err(error),
+                    },
+                };
+                // The policy generation remains authoritative. A
+                // record revocation refreshes certified copies only.
+                let fresh = self.db.storage_export_token().await.map_err(|e| {
+                    EnterpriseSyncError::Storage {
+                        operation: "refresh protected admission",
+                        cause: e.to_string(),
+                    }
+                })?;
+                let selected_records = rows.record_count();
+                rows.refresh_protected(&self.db, local).await?;
+                let retained_records = rows.record_count();
+                drop(fresh.admit(&self.db.pool).await.map_err(|e| {
+                    EnterpriseSyncError::Storage {
+                        operation: "validate refreshed protected export",
+                        cause: e.to_string(),
+                    }
+                })?);
+                if self.db.release_policy_generation().await.map_err(|e| {
+                    EnterpriseSyncError::Storage {
+                        operation: "validate refreshed export policy",
+                        cause: e.to_string(),
+                    }
+                })? != self.policy_generation
+                {
+                    return Err(EnterpriseSyncError::Configuration(
+                        "privacy policy changed during export; retry pending".into(),
+                    ));
+                }
+                *self.token.lock().await = fresh;
+                // The serialized remainder still belongs to the old
+                // selection, so renewal must not authorize later chunks
+                // without checking their own certified copies.
+                *self.refresh_cause.lock().unwrap() = Some(cause.clone());
+                tracing::info!(
+                    cause,
+                    selected_records,
+                    retained_records,
+                    outcome = "certified survivors retained; stale selections excluded",
+                    "enterprise export refreshed after record revocation"
+                );
                 return Ok(Default::default());
             }
             // A token also detects enabling privacy after raw selection.
             self.token
+                .lock()
+                .await
                 .validate_privacy(&self.db.pool)
                 .await
                 .map_err(|error| EnterpriseSyncError::Storage {
@@ -312,7 +441,7 @@ mod imp {
             if self.db.storage_mode() == screenpipe_db::storage::StorageMode::Sqlite {
                 return rows.refresh(local).await;
             }
-            match self.token.admit(&self.db.pool).await {
+            match self.token.lock().await.admit(&self.db.pool).await {
                 Ok(guard) => {
                     drop(guard);
                     Ok(Default::default())
@@ -333,6 +462,28 @@ mod imp {
 
     #[async_trait::async_trait]
     impl LocalApiClient for ScreenpipeLocalClient {
+        fn screenshot_capture_disabled(&self) -> Result<bool, EnterpriseSyncError> {
+            // Missing or unreadable settings fail closed.
+            let settings = crate::store::SettingsStore::get(&self.app)
+                .map_err(|error| {
+                    tracing::warn!(
+                        "enterprise screenshot recovery: recording settings read failed: {error}"
+                    );
+                    EnterpriseSyncError::BackfillImages("screenshot_settings_unavailable")
+                })?
+                .ok_or(EnterpriseSyncError::BackfillImages(
+                    "screenshot_settings_unavailable",
+                ))?;
+            Ok(settings.recording.disable_screenshots)
+        }
+
+        fn screenshot_work_accepted(&self) {
+            self.screenshot_work.notify_one();
+        }
+        async fn wait_for_screenshot_work(&self) {
+            self.screenshot_work.notified().await;
+        }
+
         async fn release_replay_pending(
             &self,
             request_id: &str,
@@ -511,7 +662,7 @@ mod imp {
                 .query(&query)
                 .send()
                 .await
-                .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))?;
+                .map_err(|e| ee_sync::local_api_http_error("read certified recording page", e))?;
             if !response.status().is_success() {
                 return Err(EnterpriseSyncError::LocalApi(
                     "privacy release page unavailable; retry pending".into(),
@@ -520,7 +671,7 @@ mod imp {
             response
                 .json()
                 .await
-                .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))
+                .map_err(|e| ee_sync::local_api_http_error("read certified recording page", e))
         }
 
         async fn begin_export(
@@ -645,14 +796,14 @@ mod imp {
                 .auth(self.http.get(&url))
                 .send()
                 .await
-                .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))?;
+                .map_err(|e| ee_sync::local_api_http_error("read frame recordings", e))?;
             if !resp.status().is_success() {
                 return Err(local_api_error(resp, &url).await);
             }
             let body: LocalSearchResponse = resp
                 .json()
                 .await
-                .map_err(|e| EnterpriseSyncError::LocalApi(format!("decode: {e}")))?;
+                .map_err(|e| ee_sync::local_api_http_error("decode frame recordings", e))?;
             let mut out = Vec::with_capacity(body.data.len());
             for item in body.data {
                 if let LocalSearchItem::OCR(o) = item {
@@ -715,14 +866,14 @@ mod imp {
                 .auth(self.http.get(&url))
                 .send()
                 .await
-                .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))?;
+                .map_err(|e| ee_sync::local_api_http_error("read audio recordings", e))?;
             if !resp.status().is_success() {
                 return Err(local_api_error(resp, &url).await);
             }
             let body: LocalSearchResponse = resp
                 .json()
                 .await
-                .map_err(|e| EnterpriseSyncError::LocalApi(format!("decode: {e}")))?;
+                .map_err(|e| ee_sync::local_api_http_error("decode audio recordings", e))?;
             let mut out = Vec::with_capacity(body.data.len());
             for item in body.data {
                 if let LocalSearchItem::Audio(a) = item {
@@ -756,14 +907,14 @@ mod imp {
                 .auth(self.http.get(&url))
                 .send()
                 .await
-                .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))?;
+                .map_err(|e| ee_sync::local_api_http_error("read parsed recordings", e))?;
             if !resp.status().is_success() {
                 return Err(local_api_error(resp, &url).await);
             }
             let body: LocalSearchResponse = resp
                 .json()
                 .await
-                .map_err(|e| EnterpriseSyncError::LocalApi(format!("decode: {e}")))?;
+                .map_err(|e| ee_sync::local_api_http_error("decode parsed recordings", e))?;
             let mut out = body
                 .data
                 .into_iter()
@@ -878,14 +1029,14 @@ mod imp {
                 .auth(self.http.get(&url))
                 .send()
                 .await
-                .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))?;
+                .map_err(|e| ee_sync::local_api_http_error("read UI recordings", e))?;
             if !resp.status().is_success() {
                 return Err(local_api_error(resp, &url).await);
             }
             let body: LocalSearchResponse = resp
                 .json()
                 .await
-                .map_err(|e| EnterpriseSyncError::LocalApi(format!("decode: {e}")))?;
+                .map_err(|e| ee_sync::local_api_http_error("decode UI recordings", e))?;
             let mut out = Vec::with_capacity(body.data.len());
             for item in body.data {
                 if let LocalSearchItem::Input(i) = item {
@@ -949,14 +1100,14 @@ mod imp {
                 .auth(self.http.get(&search_url))
                 .send()
                 .await
-                .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))?;
+                .map_err(|e| ee_sync::local_api_http_error("read recording snapshot", e))?;
             if !resp.status().is_success() {
                 return Err(local_api_error(resp, &search_url).await);
             }
             let body: LocalSearchResponse = resp
                 .json()
                 .await
-                .map_err(|e| EnterpriseSyncError::LocalApi(format!("decode: {e}")))?;
+                .map_err(|e| ee_sync::local_api_http_error("decode recording snapshot", e))?;
 
             // Newest first, so we snapshot the freshest frame that decodes.
             let mut candidates: Vec<(i64, chrono::DateTime<chrono::Utc>)> = body
@@ -985,7 +1136,7 @@ mod imp {
                     .auth(self.http.get(&img_url))
                     .send()
                     .await
-                    .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))?;
+                    .map_err(|e| ee_sync::local_api_http_error("read recording snapshot", e))?;
                 if !resp.status().is_success() {
                     continue;
                 }
@@ -1017,21 +1168,9 @@ mod imp {
             &self,
             frame_id: i64,
         ) -> Result<Option<Vec<u8>>, EnterpriseSyncError> {
-            // Separate the local recording preference from the org sync mode.
-            // Missing/unreadable settings fail closed and remain retryable too.
-            let settings = crate::store::SettingsStore::get(&self.app)
-                .map_err(|error| {
-                    tracing::warn!(
-                        "enterprise screenshot recovery: recording settings read failed: {error}"
-                    );
-                    EnterpriseSyncError::BackfillImages("screenshot_settings_unavailable")
-                })?
-                .ok_or(EnterpriseSyncError::BackfillImages(
-                    "screenshot_settings_unavailable",
-                ))?;
-            if settings.recording.disable_screenshots {
+            if self.screenshot_capture_disabled()? {
                 return Err(EnterpriseSyncError::BackfillImages(
-                    "screenshot_local_settings_disabled",
+                    ee_sync::SCREENSHOT_LOCAL_SETTINGS_DISABLED,
                 ));
             }
 
@@ -1067,14 +1206,14 @@ mod imp {
                 .auth(self.http.get(&url))
                 .send()
                 .await
-                .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))?;
+                .map_err(|e| ee_sync::local_api_http_error("read recording memories", e))?;
             if !resp.status().is_success() {
                 return Err(local_api_error(resp, &url).await);
             }
             let body: LocalMemoriesResponse = resp
                 .json()
                 .await
-                .map_err(|e| EnterpriseSyncError::LocalApi(format!("decode: {e}")))?;
+                .map_err(|e| ee_sync::local_api_http_error("decode recording memories", e))?;
             let out = body
                 .data
                 .into_iter()
@@ -1112,14 +1251,13 @@ mod imp {
                 .auth(self.http.get(&url))
                 .send()
                 .await
-                .map_err(|error| EnterpriseSyncError::LocalApi(error.to_string()))?;
+                .map_err(|error| ee_sync::local_api_http_error("read recording feedback", error))?;
             if !resp.status().is_success() {
                 return Err(local_api_error(resp, &url).await);
             }
-            let body: LocalFeedbackResponse = resp
-                .json()
-                .await
-                .map_err(|error| EnterpriseSyncError::LocalApi(format!("decode: {error}")))?;
+            let body: LocalFeedbackResponse = resp.json().await.map_err(|error| {
+                ee_sync::local_api_http_error("decode recording feedback", error)
+            })?;
             Ok(body
                 .data
                 .into_iter()
@@ -1156,6 +1294,23 @@ mod imp {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .or_else(crate::commands::get_enterprise_license_key)
+    }
+
+    pub(crate) fn recording_stream_endpoint(
+        app: &tauri::AppHandle,
+    ) -> Option<screenpipe_engine::recording_stream::StreamEndpoint> {
+        if !crate::app_mode::is_managed(app) { return None; }
+        let device = settings_device_id(app)?;
+        let license = license_key_from_env_or_config()?;
+        let file = crate::commands::get_enterprise_file_config();
+        let ingest = std::env::var("SCREENPIPE_ENTERPRISE_INGEST_URL").ok()
+            .filter(|url| !url.trim().is_empty()).or(file.ingest_url)
+            .unwrap_or_else(crate::enterprise::sync::default_ingest_url);
+        let origin = crate::enterprise::sync::control_plane_base(&ingest)?;
+        let host = origin.strip_prefix("https://")?;
+        screenpipe_engine::recording_stream::StreamEndpoint::new(
+            &format!("wss://{host}/api/enterprise/recordings/stream"), &license, &device,
+        ).ok()
     }
 
     /// Default policy endpoint on the baked control-plane base
@@ -1212,7 +1367,7 @@ mod imp {
             .unwrap_or_else(default_heartbeat_url);
         (policy_url, heartbeat_url)
     }
-    const NATIVE_POLICY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+    use super::NATIVE_POLICY_POLL_INTERVAL;
     const NATIVE_POLICY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     const NATIVE_POLICY_STARTUP_DELAY: std::time::Duration = std::time::Duration::from_secs(15);
     const RECORDING_DISABLED_BY_ADMIN_CODE: &str = "recording_disabled_by_admin";
@@ -1233,18 +1388,23 @@ mod imp {
         true
     }
 
+    fn default_parsed_sync_stream() -> bool {
+        let enabled = crate::enterprise_policy::SyncStreams::default().parsed;
+        info!("enterprise: parsed sync policy omitted; applying shared default parsed={enabled}");
+        enabled
+    }
+
     /// Native mirror of the policy endpoint's `syncStreams` block.
     ///
     /// The Home webview normally applies this block through a Tauri command,
     /// but managed-background deployments may never create that webview. Keep
-    /// the defaults aligned with the frontend: established text/event streams
-    /// remain enabled for older control planes, while newer data classes fail
-    /// closed until the server explicitly opts in.
+    /// parsed-data default aligned with the shared sync state and frontend.
+    /// Explicit opt-outs remain off; image and feedback modes fail closed.
     #[derive(Debug, PartialEq, Eq, Deserialize)]
     struct NativeSyncStreams {
         #[serde(default = "default_enabled_sync_stream")]
         frames: bool,
-        #[serde(default)]
+        #[serde(default = "default_parsed_sync_stream")]
         parsed: bool,
         #[serde(default)]
         activities: bool,
@@ -1268,7 +1428,7 @@ mod imp {
         fn default() -> Self {
             Self {
                 frames: true,
-                parsed: false,
+                parsed: default_parsed_sync_stream(),
                 activities: false,
                 starred: true,
                 audio: true,
@@ -1325,6 +1485,10 @@ mod imp {
         hidden_sections: Vec<String>,
         #[serde(rename = "lockedSettings", default)]
         locked_settings: HashMap<String, serde_json::Value>,
+        #[serde(rename = "appUpdatePolicy", default)]
+        app_update_policy: Option<serde_json::Value>,
+        #[serde(flatten)]
+        extra: serde_json::Map<String, serde_json::Value>,
         #[serde(rename = "requireAccountLogin", default)]
         require_account_login: bool,
         #[serde(rename = "recordingAllowed", default = "default_recording_allowed")]
@@ -1335,6 +1499,10 @@ mod imp {
 
     #[derive(Debug, PartialEq, Eq)]
     struct NativeEnterprisePolicy {
+        license_id: Option<String>,
+        app_update_policy: serde_json::Value,
+        extra: serde_json::Map<String, serde_json::Value>,
+        settings_saved: bool,
         hidden_sections: Vec<String>,
         locked_settings: HashMap<String, serde_json::Value>,
         enforce_auto_start: bool,
@@ -1363,6 +1531,13 @@ mod imp {
                 self.locked_settings.get("autoConnectAiTools"),
             );
             NativeEnterprisePolicy {
+                license_id: self.license_id,
+                app_update_policy: self
+                    .app_update_policy
+                    .or_else(|| self.locked_settings.get("app_update_policy").cloned())
+                    .unwrap_or(serde_json::Value::Null),
+                extra: self.extra,
+                settings_saved: false,
                 auto_connect_ai_tools,
                 hidden_sections: self.hidden_sections,
                 locked_settings: self.locked_settings,
@@ -1443,6 +1618,8 @@ mod imp {
         Unavailable(String),
     }
 
+    const POLICY_REFRESH_SUPERSEDED: &str = "enterprise_policy_refresh_superseded";
+
     #[derive(Deserialize)]
     struct EnterpriseErrorResponse {
         code: Option<String>,
@@ -1489,7 +1666,7 @@ mod imp {
         policy_url: &str,
         device_id: &str,
         credential: &EnterprisePolicyCredential,
-        apply_ai_tool_policy: impl FnOnce(bool),
+        apply_runtime_policy: impl FnOnce(&mut NativeEnterprisePolicy) -> bool,
     ) -> Result<NativeEnterprisePolicy, NativePolicyFetchError> {
         let request = http.get(policy_url).header("X-Device-Id", device_id);
         let request = apply_enterprise_credential(request, credential);
@@ -1525,11 +1702,14 @@ mod imp {
                 &endpoint,
             );
         }
-        let policy = response.into_native_policy();
-        // GET authenticated this workspace's policy. Apply AI setup before
-        // recording-paused branches or fallible enrollment/settings work can
-        // discard it. This never grants recording or bypasses seat checks.
-        apply_ai_tool_policy(policy.auto_connect_ai_tools);
+        let mut policy = response.into_native_policy();
+        // Policy delivery is independent of permission to record or seat
+        // enrollment. Paused and hidden devices must remain manageable.
+        if !apply_runtime_policy(&mut policy) {
+            return Err(NativePolicyFetchError::Unavailable(
+                POLICY_REFRESH_SUPERSEDED.into(),
+            ));
+        }
         Ok(policy)
     }
 
@@ -1590,7 +1770,7 @@ mod imp {
                 if let Some(logs) = logs {
                     crate::recording::recovery_log::append(
                         logs,
-                        "enterprise_recording_measurement_failed",
+                        crate::recording::recovery_log::MEASUREMENT_FAILED,
                         &format!("cause={cause}; outcome=enrollment_only; previous_measurement_not_refreshed"),
                     );
                 }
@@ -1636,12 +1816,90 @@ mod imp {
         ))
     }
 
+    fn begin_runtime_policy_refresh(
+        app: &tauri::AppHandle,
+        account: bool,
+        request: u64,
+    ) -> impl FnOnce(&mut NativeEnterprisePolicy) -> bool + Send {
+        let app = app.clone();
+        let apply_ai = crate::enterprise_policy::begin_ai_tool_policy_refresh();
+        move |policy| {
+            crate::enterprise::managed_settings::POLICY_REFRESH
+                .apply(request, || {
+                    let root = crate::db_relaunch::active_data_dir();
+                    let saved = crate::enterprise::managed_settings::persist_snapshot(
+                        &app,
+                        &policy.locked_settings,
+                        &policy.app_update_policy,
+                        &policy.extra,
+                    );
+                    for key in ["managedPipes", "managedSkills"] {
+                        if policy.extra.get(key).is_some_and(|value| !value.is_array()) {
+                            crate::enterprise::runtime_policy::failure(
+                                &root,
+                                key,
+                                "invalid desired-state type; last valid policy retained",
+                            );
+                        }
+                    }
+                    policy.settings_saved = saved.is_ok();
+                    if let Err(error) = &saved {
+                        crate::enterprise::runtime_policy::failure(&root, "settings", error);
+                    } else {
+                        crate::enterprise::runtime_policy::queue_saved_files(&app);
+                    }
+                    apply_ai(policy.auto_connect_ai_tools);
+                    policy.sync_streams.apply();
+                    crate::enterprise_policy::set_enterprise_policy(
+                        policy.hidden_sections.clone(),
+                        policy.enforce_auto_start,
+                    );
+                    let config = screenpipe_core::paths::default_screenpipe_data_dir()
+                        .join("enterprise.json");
+                    if let Err(error) = crate::enterprise::runtime_policy::apply_team(
+                        &policy.extra,
+                        account,
+                        &config,
+                    ) {
+                        crate::enterprise::runtime_policy::failure(&root, "team_config", &error);
+                    }
+                })
+                .is_some()
+        }
+    }
+
     async fn resolve_native_authorization(
+        app: &tauri::AppHandle,
         http: &reqwest::Client,
         policy_url: &str,
         heartbeat_url: &str,
         device_id: &str,
         measurement: Option<&RecordingMeasurement>,
+    ) -> (u64, NativeAuthorizationResult) {
+        let request = crate::enterprise::managed_settings::POLICY_REFRESH.begin();
+        (
+            request,
+            resolve_native_authorization_at(
+                app,
+                http,
+                policy_url,
+                heartbeat_url,
+                device_id,
+                measurement,
+                request,
+            )
+            .await,
+        )
+    }
+
+    async fn resolve_native_authorization_at(
+        app: &tauri::AppHandle,
+        http: &reqwest::Client,
+        policy_url: &str,
+        heartbeat_url: &str,
+        device_id: &str,
+        measurement: Option<&RecordingMeasurement>,
+        request: u64,
     ) -> NativeAuthorizationResult {
         let credentials = current_policy_credentials();
         if credentials.is_empty() {
@@ -1658,7 +1916,11 @@ mod imp {
                 policy_url,
                 device_id,
                 &credential,
-                crate::enterprise_policy::begin_ai_tool_policy_refresh(),
+                begin_runtime_policy_refresh(
+                    app,
+                    credential.kind() == EnterprisePolicyCredentialKind::AccountToken,
+                    request,
+                ),
             )
             .await
             {
@@ -1741,6 +2003,88 @@ mod imp {
         NativeAuthorizationResult::Unavailable("enterprise policy could not be verified".into())
     }
 
+    fn raw_capture_scope(
+        policy: &NativeEnterprisePolicy,
+        policy_url: &str,
+        device_id: &str,
+    ) -> Option<crate::enterprise::raw_upload::Scope> {
+        use crate::enterprise::{raw_upload, raw_upload_attestation};
+        if !raw_upload_attestation::startup_allowed(
+            crate::app_mode::is_enterprise_package(),
+            policy.locked_settings.get("cloudProcessing"),
+        ) {
+            return None;
+        }
+        let workspace = policy.license_id.clone()?;
+        let device = if screenpipe_telemetry_wire::identity::is_stable_device_id(device_id) {
+            Ok(device_id.to_owned())
+        } else {
+            crate::enterprise::host_identity::new_install_device_id().map_err(anyhow::Error::msg)
+        };
+        match device.and_then(|device| raw_upload::Scope::new(policy_url, workspace, device)) {
+            Ok(scope) => Some(scope),
+            Err(error) => {
+                warn!(%error, "raw capture scope unavailable");
+                None
+            }
+        }
+    }
+
+    fn configure_raw_spool(scope: &crate::enterprise::raw_upload::Scope) -> bool {
+        let root = crate::config::app_data_dir().join("raw-capture-ledger");
+        match scope.configure(&root) {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(%error, "raw capture spool unavailable");
+                false
+            }
+        }
+    }
+
+    fn grant_current_policy(
+        app: &tauri::AppHandle,
+        request: u64,
+        policy: &NativeEnterprisePolicy,
+        startup: bool,
+    ) -> Result<(), String> {
+        crate::enterprise::managed_settings::POLICY_REFRESH
+            .apply(request, || {
+                if !policy.settings_saved {
+                    return Err(
+                        "managed policy save failed; recording grant deferred until retry".into(),
+                    );
+                }
+                if startup {
+                    crate::enterprise::managed_settings::persist(
+                        app,
+                        &policy.locked_settings,
+                        true,
+                    )?;
+                }
+                let (policy_url, _) = authorization_endpoint_urls();
+                let device_id = settings_device_id(app).unwrap_or_else(|| "unknown".to_string());
+                if let Some(scope) = raw_capture_scope(policy, &policy_url, &device_id) {
+                    configure_raw_spool(&scope);
+                } else {
+                    screenpipe_core::raw_capture_ledger::disable();
+                }
+                if crate::enterprise_policy::update_recording_authorized(true) {
+                    app.state::<crate::recording::RecordingState>()
+                        .set_capture_intent(true);
+                }
+                Ok(())
+            })
+            .ok_or(POLICY_REFRESH_SUPERSEDED)?
+    }
+
+    fn revoke_current_policy(app: &tauri::AppHandle, request: u64, reason: &'static str) {
+        crate::enterprise::managed_settings::POLICY_REFRESH.apply(request, || {
+            crate::enterprise_recording_access::revoke_enterprise_recording_from_watcher(
+                app, reason,
+            );
+        });
+    }
+
     /// Resolve Enterprise credentials before the shared application bootstrap
     /// proceeds. Tauri's setup callback is synchronous and already runs under
     /// the main Tokio runtime, so the network check owns a small worker runtime
@@ -1766,6 +2110,7 @@ mod imp {
                     tokio::time::timeout(
                         std::time::Duration::from_secs(12),
                         resolve_native_authorization(
+                            &worker_app,
                             &http,
                             &policy_url,
                             &heartbeat_url,
@@ -1778,7 +2123,7 @@ mod imp {
                 })
             });
 
-        let result = match worker {
+        let (request, result) = match worker {
             Ok(worker) => match worker.join() {
                 Ok(Ok(result)) => result,
                 Ok(Err(error)) => {
@@ -1798,17 +2143,9 @@ mod imp {
 
         match result {
             NativeAuthorizationResult::Authorized(policy) => {
-                if crate::enterprise::managed_settings::persist(app, &policy.locked_settings, true)
-                    .is_err()
-                {
+                if grant_current_policy(app, request, &policy, true).is_err() {
                     return false;
                 }
-                policy.sync_streams.apply();
-                crate::enterprise_policy::set_enterprise_policy(
-                    policy.hidden_sections,
-                    policy.enforce_auto_start,
-                );
-                crate::enterprise_policy::update_recording_authorized(true);
                 info!("enterprise: startup authentication completed");
                 true
             }
@@ -1842,121 +2179,100 @@ mod imp {
         credential_type: Option<&str>,
         credential: Option<&str>,
     ) -> Result<(), String> {
-        let Some(credential_value) = credential.map(str::trim).filter(|value| !value.is_empty())
-        else {
-            let _ = crate::enterprise_recording_access::revoke_enterprise_recording(app).await;
-            return Err("no enterprise credential was provided".to_string());
-        };
-        let credential = match credential_type {
-            Some("license_key") => {
-                EnterprisePolicyCredential::LicenseKey(credential_value.to_string())
+        let request = crate::enterprise::managed_settings::POLICY_REFRESH.begin();
+        let credential = match (
+            credential_type,
+            credential.map(str::trim).filter(|value| !value.is_empty()),
+        ) {
+            (Some("license_key"), Some(value)) => {
+                EnterprisePolicyCredential::LicenseKey(value.into())
             }
-            Some("account") => {
-                EnterprisePolicyCredential::AccountToken(credential_value.to_string())
+            (Some("account"), Some(value)) => {
+                EnterprisePolicyCredential::AccountToken(value.into())
             }
             _ => {
-                let _ = crate::enterprise_recording_access::revoke_enterprise_recording(app).await;
-                return Err("unsupported enterprise credential type".to_string());
+                revoke_current_policy(app, request, "authorization_rejected");
+                return Err("no supported enterprise credential was provided".into());
             }
         };
         let (policy_url, heartbeat_url) = authorization_endpoint_urls();
         let http = reqwest::Client::builder()
-            // The caller's IPC deadline is twenty seconds. Finish first so a
-            // timed-out webview request cannot grant access later in the
-            // background after the UI has already reported failure.
             .timeout(std::time::Duration::from_secs(9))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| format!("enterprise policy client: {error}"))?;
         let device_id = settings_device_id(app).unwrap_or_else(|| "unknown".to_string());
-
-        match fetch_and_apply_native_policy(
+        let fetched = fetch_and_apply_native_policy(
             &http,
             &policy_url,
             &device_id,
             &credential,
-            crate::enterprise_policy::begin_ai_tool_policy_refresh(),
+            begin_runtime_policy_refresh(
+                app,
+                credential.kind() == EnterprisePolicyCredentialKind::AccountToken,
+                request,
+            ),
         )
-        .await
-        {
+        .await;
+        let (reason, error) = match fetched {
+            Ok(policy) if !policy.recording_allowed => (
+                "admin_disabled",
+                RECORDING_DISABLED_BY_ADMIN_CODE.to_string(),
+            ),
             Ok(policy)
-                if credential_authorizes_policy(
+                if !credential_authorizes_policy(
                     credential.kind(),
                     policy.require_account_login,
-                ) && policy.recording_allowed =>
+                ) =>
             {
-                match send_enrollment_heartbeat(
-                    &http,
-                    &heartbeat_url,
-                    &device_id,
-                    &credential,
-                    None,
+                (
+                    "account_required",
+                    "organization requires account sign-in".into(),
                 )
-                .await
-                {
-                    Ok(()) => {
-                        // Save native settings before the UI can start capture;
-                        // completing a restart must not hold authentication IPC.
-                        crate::enterprise::managed_settings::prepare(app, &policy.locked_settings)
-                            .await?;
-                        let newly_authorized =
-                            crate::enterprise_policy::update_recording_authorized(true);
-                        if newly_authorized {
-                            app.state::<crate::recording::RecordingState>()
-                                .set_capture_intent(true);
-                        }
-                        if newly_authorized {
-                            crate::recording::resume_enterprise_recording(app).await;
-                        } else {
-                            let apply_app = app.clone();
-                            tauri::async_runtime::spawn(async move {
-                                let _ =
-                                    crate::enterprise::managed_settings::apply(&apply_app).await;
-                            });
-                        }
-                        crate::enterprise_policy::set_enterprise_policy(
-                            policy.hidden_sections,
-                            policy.enforce_auto_start,
-                        );
-                        Ok(())
-                    }
-                    Err(NativePolicyFetchError::RecordingDisabled) => {
-                        let _ =
-                            crate::enterprise_recording_access::revoke_enterprise_recording(app)
-                                .await;
-                        Err(RECORDING_DISABLED_BY_ADMIN_CODE.to_string())
-                    }
-                    Err(NativePolicyFetchError::CredentialRejected(_)) => {
-                        let _ =
-                            crate::enterprise_recording_access::revoke_enterprise_recording(app)
-                                .await;
-                        Err("enterprise enrollment was rejected".to_string())
-                    }
-                    Err(NativePolicyFetchError::Unavailable(error)) => {
-                        Err(format!("enterprise heartbeat is unavailable: {error}"))
-                    }
+            }
+            Ok(policy) => match send_enrollment_heartbeat(
+                &http,
+                &heartbeat_url,
+                &device_id,
+                &credential,
+                None,
+            )
+            .await
+            {
+                Ok(()) => {
+                    grant_current_policy(app, request, &policy, false)?;
+                    crate::recording::resume_enterprise_recording(app).await;
+                    return Ok(());
                 }
-            }
-            Ok(policy) if !policy.recording_allowed => {
-                let _ = crate::enterprise_recording_access::revoke_enterprise_recording(app).await;
-                Err(RECORDING_DISABLED_BY_ADMIN_CODE.to_string())
-            }
-            Ok(_) => {
-                let _ = crate::enterprise_recording_access::revoke_enterprise_recording(app).await;
-                Err("organization requires account sign-in".to_string())
-            }
-            Err(NativePolicyFetchError::CredentialRejected(_)) => {
-                let _ = crate::enterprise_recording_access::revoke_enterprise_recording(app).await;
-                Err("enterprise credential was rejected".to_string())
-            }
-            Err(NativePolicyFetchError::RecordingDisabled) => {
-                let _ = crate::enterprise_recording_access::revoke_enterprise_recording(app).await;
-                Err(RECORDING_DISABLED_BY_ADMIN_CODE.to_string())
-            }
+                Err(NativePolicyFetchError::RecordingDisabled) => (
+                    "admin_disabled",
+                    RECORDING_DISABLED_BY_ADMIN_CODE.to_string(),
+                ),
+                Err(NativePolicyFetchError::CredentialRejected(_)) => (
+                    "authorization_rejected",
+                    "enterprise enrollment was rejected".into(),
+                ),
+                Err(NativePolicyFetchError::Unavailable(error)) => {
+                    return Err(format!("enterprise heartbeat is unavailable: {error}"))
+                }
+            },
+            Err(NativePolicyFetchError::RecordingDisabled) => (
+                "admin_disabled",
+                RECORDING_DISABLED_BY_ADMIN_CODE.to_string(),
+            ),
+            Err(NativePolicyFetchError::CredentialRejected(_)) => (
+                "authorization_rejected",
+                "enterprise credential was rejected".into(),
+            ),
             Err(NativePolicyFetchError::Unavailable(error)) => {
-                Err(format!("enterprise policy is unavailable: {error}"))
+                if error == POLICY_REFRESH_SUPERSEDED {
+                    return Err(error);
+                }
+                return Err(format!("enterprise policy is unavailable: {error}"))
             }
-        }
+        };
+        revoke_current_policy(app, request, reason);
+        Err(error)
     }
 
     fn show_enterprise_auth_recovery(app: &tauri::AppHandle) {
@@ -1987,6 +2303,7 @@ mod imp {
     fn spawn_native_policy_watcher(app: &tauri::AppHandle) {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
+            crate::enterprise::runtime_policy::queue_saved_files(&app);
             let (policy_url, heartbeat_url) = authorization_endpoint_urls();
             let http = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
@@ -2005,19 +2322,31 @@ mod imp {
             if !startup_delay.is_zero() {
                 tokio::time::sleep(startup_delay).await;
             }
+            use crate::enterprise::raw_upload_attestation;
+            use screenpipe_core::raw_capture_ledger;
+            let mut raw_upload_check: Option<tokio::task::JoinHandle<()>> = None;
+            let mut raw_upload_scope = None;
+            let mut attestation = Arc::new(raw_upload_attestation::RawUploadAttestation::default());
             loop {
                 if !crate::app_mode::is_managed(&app) {
+                    if let Some(worker) = raw_upload_check.take() {
+                        worker.abort();
+                        let _ = worker.await;
+                    }
+                    raw_capture_ledger::disable();
+                    raw_upload_scope = None;
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
-                let was_hidden = crate::enterprise_policy::is_app_ui_hidden();
+
                 let device_id = settings_device_id(&app).unwrap_or_else(|| "unknown".to_string());
                 // Re-resolve the live instance port and auth key each turn:
                 // startup/restart may replace either after this task starts.
                 let api = local_api_context_from_app(&app);
                 let logs = crate::log_files::get_screenpipe_data_dir(&app).ok();
                 let measurement = measure_recording(&http, &api, logs.as_deref()).await;
-                let authorization = resolve_native_authorization(
+                let (request, authorization) = resolve_native_authorization(
+                    &app,
                     &http,
                     &policy_url,
                     &heartbeat_url,
@@ -2025,67 +2354,58 @@ mod imp {
                     Some(&measurement),
                 )
                 .await;
+                let _ = crate::commands::apply_enterprise_ui_visibility(app.clone());
                 // Also release the first-pass barrier after an offline/rejected
                 // response; an unknown policy keeps its documented default,
                 // while a cached disable remains disabled.
                 crate::enterprise_policy::finish_initial_ai_tool_policy_refresh();
                 let mut next_poll = native_policy_poll_interval(&authorization);
+                if !matches!(
+                    &authorization,
+                    NativeAuthorizationResult::Authorized(_) | NativeAuthorizationResult::Unavailable(_)
+                ) {
+                    if let Some(worker) = raw_upload_check.take() {
+                        worker.abort();
+                        let _ = worker.await;
+                    }
+                    raw_capture_ledger::disable();
+                    raw_upload_scope = None;
+                }
                 match authorization {
                     NativeAuthorizationResult::Authorized(policy) => {
-                        let was_authorized = crate::enterprise_policy::recording_authorized();
-                        // Save before granting access so a concurrent app
-                        // start cannot capture with the previous policy.
-                        let mut newly_authorized = false;
-                        let settings_applied = if crate::enterprise::managed_settings::prepare(
-                            &app,
-                            &policy.locked_settings,
-                        )
-                        .await
-                        .is_ok()
-                        {
-                            newly_authorized =
-                                crate::enterprise_policy::update_recording_authorized(true);
-                            if newly_authorized {
-                                app.state::<crate::recording::RecordingState>()
-                                    .set_capture_intent(true);
-                            }
-                            if newly_authorized {
-                                // The recovery owner retries both settings and
-                                // startup without blocking policy revocation.
-                                true
-                            } else {
-                                crate::enterprise::managed_settings::apply(&app)
-                                    .await
-                                    .is_ok()
-                            }
-                        } else {
-                            false
-                        };
-                        if !settings_applied {
+                        let settings_prepared =
+                            grant_current_policy(&app, request, &policy, false).is_ok();
+                        if !settings_prepared {
                             next_poll = NATIVE_POLICY_RETRY_INTERVAL;
-                            crate::enterprise_policy::update_recording_authorized(was_authorized);
                         }
-                        // Managed-background deployments may never create the
-                        // Home webview, so the native watcher must apply the
-                        // complete upload policy it just authenticated. This
-                        // is idempotent when the visible frontend is running.
-                        policy.sync_streams.apply();
-                        crate::enterprise_policy::set_enterprise_policy(
-                            policy.hidden_sections,
-                            policy.enforce_auto_start,
-                        );
-                        if was_hidden
-                            && !crate::commands::apply_enterprise_ui_visibility(app.clone())
-                        {
-                            info!("enterprise: native policy watcher restored visible UI");
-                        } else if !was_hidden {
-                            let _ = crate::commands::apply_enterprise_ui_visibility(app.clone());
+                        let scope = settings_prepared
+                            .then(|| raw_capture_scope(&policy, &policy_url, &device_id))
+                            .flatten()
+                            .map(Arc::new);
+                        if scope != raw_upload_scope {
+                            if let Some(worker) = raw_upload_check.take() {
+                                worker.abort();
+                                let _ = worker.await;
+                            }
+                            if scope.is_none() {
+                                raw_capture_ledger::disable();
+                            }
+                            attestation = Arc::new(raw_upload_attestation::RawUploadAttestation::default());
+                            raw_upload_scope = scope;
                         }
-
-                        // Autostart and hidden-UI launches can have no webview,
-                        // so AppEntitlementGate cannot perform the usual resume.
-                        if newly_authorized && settings_applied {
+                        let spool_ready = raw_upload_scope.as_deref().is_some_and(configure_raw_spool);
+                        // Start capture without waiting for enclave verification.
+                        if settings_prepared {
                             crate::recording::resume_enterprise_recording(&app).await;
+                        }
+                        if let Some(scope) = raw_upload_scope.clone().filter(|_| {
+                            spool_ready && raw_upload_check.as_ref().is_none_or(|task| task.is_finished())
+                        }) {
+                            let http = http.clone();
+                            let attestation = attestation.clone();
+                            raw_upload_check = Some(tokio::spawn(async move {
+                                scope.run(&http, &attestation, license_key_from_env_or_config).await;
+                            }));
                         }
                         // Hidden installs may never create the migration UI.
                         // This returns after scheduling native maintenance so
@@ -2095,11 +2415,9 @@ mod imp {
                     }
                     NativeAuthorizationResult::RecordingDisabled => {
                         info!("enterprise: recording paused for this device by workspace admin");
-                        let _ =
-                            crate::enterprise_recording_access::revoke_enterprise_recording(&app)
-                                .await;
-                        // Stop capture before any reporting I/O: a failed
-                        // heartbeat must never delay the admin's pause.
+                        revoke_current_policy(&app, request, "admin_disabled");
+                        // Publish cancellation and retain native teardown before
+                        // reporting I/O; heartbeat failure cannot delay the stop.
                         if crate::enterprise::recording_events::pending(&device_id, &heartbeat_url)
                             .is_some()
                         {
@@ -2123,28 +2441,25 @@ mod imp {
                         warn!(
                             "enterprise: organization requires account sign-in; device key cannot authorize recording"
                         );
-                        if was_hidden {
-                            // Authentication recovery must be visible. The Home
-                            // webview will fetch and reapply the complete policy
-                            // after the employee signs in.
-                            crate::enterprise_policy::set_enterprise_policy(Vec::new(), false);
-                            let _ = crate::commands::apply_enterprise_ui_visibility(app.clone());
-                        }
-                        let _ =
-                            crate::enterprise_recording_access::revoke_enterprise_recording(&app)
-                                .await;
-                        show_enterprise_auth_recovery(&app);
+                        crate::enterprise::managed_settings::POLICY_REFRESH.apply(request, || {
+                            if crate::enterprise_policy::is_app_ui_hidden() {
+                                crate::enterprise_policy::set_enterprise_policy(Vec::new(), false);
+                                let _ = crate::commands::apply_enterprise_ui_visibility(app.clone());
+                            }
+                            crate::enterprise_recording_access::revoke_enterprise_recording_from_watcher(&app, "account_required");
+                            show_enterprise_auth_recovery(&app);
+                        });
                     }
                     NativeAuthorizationResult::Rejected
                     | NativeAuthorizationResult::NoCredential => {
-                        if was_hidden {
-                            crate::enterprise_policy::set_enterprise_policy(Vec::new(), false);
-                            let _ = crate::commands::apply_enterprise_ui_visibility(app.clone());
-                        }
-                        let _ =
-                            crate::enterprise_recording_access::revoke_enterprise_recording(&app)
-                                .await;
-                        show_enterprise_auth_recovery(&app);
+                        crate::enterprise::managed_settings::POLICY_REFRESH.apply(request, || {
+                            if crate::enterprise_policy::is_app_ui_hidden() {
+                                crate::enterprise_policy::set_enterprise_policy(Vec::new(), false);
+                                let _ = crate::commands::apply_enterprise_ui_visibility(app.clone());
+                            }
+                            crate::enterprise_recording_access::revoke_enterprise_recording_from_watcher(&app, "authorization_rejected");
+                            show_enterprise_auth_recovery(&app);
+                        });
                     }
                     NativeAuthorizationResult::Unavailable(error) => {
                         // A network/control-plane outage must not revoke a grant
@@ -2303,20 +2618,11 @@ mod imp {
                         .await
                     {
                         Ok(remote) => {
-                            info!(
-                                "enterprise sync: device auto-configured from {} (org={})",
-                                url,
-                                remote.org_name.as_deref().unwrap_or("?")
-                            );
-                            if let Err(e) = crate::commands::persist_enterprise_device_config(
-                                Some(&remote.license_key),
-                                remote.ingest_url.as_deref(),
-                            ) {
-                                warn!("enterprise sync: failed to persist device config: {e}");
+                            if crate::commands::get_cloud_token().as_deref()
+                                != Some(token.as_str())
+                            {
+                                continue;
                             }
-                            // Loop around immediately: the file (or the
-                            // in-memory values on persist failure) now
-                            // satisfies from_env_with_fallback.
                             if let Some(cfg) = EnterpriseSyncConfig::from_env_with_fallback(
                                 app_data_dir.clone(),
                                 device_id.clone(),
@@ -2324,7 +2630,26 @@ mod imp {
                                 Some(remote.license_key.clone()),
                                 remote.ingest_url.clone(),
                             ) {
-                                break cfg;
+                                // Record the boundary before persisting enrollment credentials.
+                                // Personal capture may already exist on a device switching modes.
+                                let cursor = ee_sync::Cursor::for_account_enrollment(chrono::Utc::now());
+                                match cursor.save(&cfg.cursor_path) {
+                                    Ok(()) => {
+                                        if let Err(error) = crate::commands::persist_sign_in_enrollment(
+                                            &remote.license_key,
+                                            remote.ingest_url.as_deref(),
+                                        ) {
+                                            warn!("enterprise sync: failed to persist device config: {error}");
+                                            tokio::time::sleep(std::time::Duration::from_secs(CONFIG_POLL_SECS)).await;
+                                            continue;
+                                        }
+                                        info!("enterprise sync: device auto-configured from verified workspace sign-in");
+                                        break cfg;
+                                    }
+                                    Err(error) => {
+                                        warn!("enterprise sync: could not persist the workspace upload boundary: {error}");
+                                    }
+                                }
                             }
                         }
                         Err(e) => {
@@ -2362,6 +2687,7 @@ mod imp {
             // recovers rejected credentials before its first local data read.
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 
+            let recovery_app = auth_gate_app.clone();
             let on_auth_rejected: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
                 if let Err(error) =
                     crate::window::ShowRewindWindow::PermissionRecovery.show(&auth_gate_app)
@@ -2373,7 +2699,14 @@ mod imp {
                 }
             });
 
+            let recovery = tauri::async_runtime::spawn(crate::enterprise::recovery::run(
+                cfg.clone(),
+                ee_sync::enterprise_http_client_with_timeout(std::time::Duration::from_secs(60)),
+                recovery_app,
+                rx.clone(),
+            ));
             ee_sync::run(cfg, local, rx, Some(on_auth_rejected)).await;
+            recovery.abort();
         });
 
         Some(tx)
@@ -2429,7 +2762,7 @@ mod imp {
     }
 
     #[cfg(test)]
-    mod device_id_tests {
+    pub(crate) mod device_id_tests {
         use super::{
             choose_device_id, classify_failed_enterprise_response, credential_authorizes_policy,
             enterprise_license_hash, exact_frame_url, explicitly_rejects_authorization,
@@ -2440,6 +2773,7 @@ mod imp {
             NATIVE_POLICY_STARTUP_DELAY, RECORDING_DISABLED_BY_ADMIN_CODE,
         };
         use std::collections::HashMap;
+        use tauri::Manager;
 
         async fn native_health_fixture(
             status: axum::http::StatusCode,
@@ -2753,12 +3087,24 @@ mod imp {
                 .await
                 .unwrap();
                 db.execute_raw_sql_write(
-                    "INSERT INTO frames(id,timestamp,full_text) VALUES(1,'2026-10-16','safe')",
+                    "INSERT INTO frames(id,timestamp,full_text) VALUES(1,'2026-10-16','safe'),(2,'2026-10-16','survivor')",
                 )
                 .await
                 .unwrap();
-                let job = db.release_pending("frames", 1).await.unwrap().remove(0);
-                assert!(db.publish_release(&job, &job.values).await.unwrap());
+                for job in db.release_pending("frames", 10).await.unwrap() {
+                    assert!(db.publish_release(&job, &job.values).await.unwrap());
+                }
+                let protected = db.protected_reads().await.unwrap();
+                let reused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                {
+                    let mut conn = protected.pool.acquire().await.unwrap();
+                    let mut handle = conn.lock_handle().await.unwrap();
+                    let observed = reused.clone();
+                    handle.set_progress_handler(1, move || {
+                        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        true
+                    });
+                }
                 let export = StorageExport::begin_storage(db.clone()).await.unwrap();
                 let mut frames = vec![FrameRow {
                     frame_id: 1,
@@ -2769,6 +3115,10 @@ mod imp {
                     browser_url: None,
                     accessibility_tree: None,
                 }];
+                let mut survivor = frames[0].clone();
+                survivor.frame_id = 2;
+                survivor.text = Some("survivor".into());
+                frames.push(survivor);
                 let mut rows = ExportRows {
                     frames: &mut frames,
                     audio: &mut vec![],
@@ -2782,16 +3132,631 @@ mod imp {
                 };
                 export.filter(&mut rows, &Protected).await.unwrap();
                 assert_eq!(rows.frames[0].text.as_deref(), Some("safe"));
-                db.execute_raw_sql_write("INSERT INTO frames(id,timestamp,full_text) VALUES(2,'2026-10-16','new capture')").await.unwrap();
+                db.execute_raw_sql_write("INSERT INTO frames(id,timestamp,full_text) VALUES(3,'2026-10-16','new capture')").await.unwrap();
                 export.filter(&mut rows, &Protected).await.unwrap();
                 db.execute_raw_sql_write("UPDATE frames SET full_text='PRIVATE edit' WHERE id=1")
                     .await
                     .unwrap();
+                // A revoked record waits for a new completion; the certified
+                // survivor continues without reading any raw source API.
+                export.filter(&mut rows, &Protected).await.unwrap();
+                assert!(reused.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                    "refresh must reuse the existing protected reader, not allocate a pool per chunk");
+                assert_eq!(rows.frames.len(), 1);
+                assert_eq!(rows.frames[0].frame_id, 2);
+                assert_eq!(rows.frames[0].text.as_deref(), Some("survivor"));
+                drop(export.admit().await.unwrap());
+                assert!(!db.release_pending("frames", 10).await.unwrap().is_empty());
+                db.execute_raw_sql_write("DELETE FROM frames WHERE id=2")
+                    .await
+                    .unwrap();
+                export.filter(&mut rows, &Protected).await.unwrap();
+                assert!(rows.frames.is_empty());
+                drop(export.admit().await.unwrap());
+                // Policy changes still revoke the entire prepared selection,
+                // even after all selected rows have been removed.
+                db.configure_release(&screenpipe_db::privacy_release::ReleasePolicy {
+                    identity: "v2".into(),
+                    text: true,
+                    images: false,
+                })
+                .await
+                .unwrap();
                 assert!(export.filter(&mut rows, &Protected).await.is_err());
+                db.configure_release(&screenpipe_db::privacy_release::ReleasePolicy {
+                    identity: "v1".into(),
+                    text: true,
+                    images: false,
+                })
+                .await
+                .unwrap();
+                assert!(
+                    export.filter(&mut rows, &Protected).await.is_err(),
+                    "a policy cycle must not revive an old export"
+                );
                 db.close().await;
             }
         }
 
+        #[tokio::test(flavor = "current_thread")]
+        async fn protected_upload_filters_revoked_rows_and_recovers_after_restart() {
+            let logs = tempfile::tempdir().unwrap();
+            check_protected_upload_revocations(logs.path()).await;
+        }
+
+        pub(crate) async fn check_protected_upload_revocations(logs: &std::path::Path) {
+            use super::{AudioRow, EnterpriseSyncError, FrameRow, LocalApiClient, StorageExport};
+            use crate::enterprise::sync::{self, ExportFilter};
+            use screenpipe_db::privacy_release::{ReleasePage, ReleasePolicy};
+            use std::sync::{
+                atomic::{AtomicU8, Ordering},
+                Arc,
+            };
+            let _streams = crate::enterprise_policy::sync_streams_test_lock();
+            let _restore = sync::tests::RestoreDefaultSyncStreams;
+            crate::enterprise_policy::set_sync_streams(
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                "off".into(),
+                "off".into(),
+            );
+            let file = std::fs::File::create(logs.join("screenpipe-app.2026-10-23.log")).unwrap();
+            let _subscriber = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(file))
+                    .finish(),
+            );
+            struct Local {
+                db: Arc<screenpipe_db::DatabaseManager>,
+                protected: Arc<screenpipe_db::DatabaseManager>,
+                mutation: AtomicU8,
+            }
+            #[async_trait::async_trait]
+            impl LocalApiClient for Local {
+                async fn privacy_release_required(&self) -> Result<bool, EnterpriseSyncError> {
+                    Ok(true)
+                }
+                async fn begin_export(
+                    &self,
+                ) -> Result<Option<Box<dyn ExportFilter>>, EnterpriseSyncError> {
+                    Ok(Some(Box::new(
+                        StorageExport::begin_storage(self.db.clone()).await?,
+                    )))
+                }
+                async fn fetch_release_page(
+                    &self,
+                    kind: &str,
+                    after: i64,
+                    cutoff: &str,
+                    end: Option<&str>,
+                    limit: u32,
+                ) -> Result<ReleasePage, EnterpriseSyncError> {
+                    let page = self
+                        .protected
+                        .release_export_range_page(kind, after, cutoff, end, limit)
+                        .await
+                        .unwrap();
+                    if kind == "frames" && !page.rows.as_array().unwrap().is_empty() {
+                        let mutation = self.mutation.swap(0, Ordering::SeqCst);
+                        let sql = match mutation {
+                            1 => Some("DELETE FROM frames WHERE id=1"),
+                            2 | 4 => Some(
+                                "UPDATE frames SET full_text='UNPROCESSED_PRIVATE_EDIT' WHERE id=1",
+                            ),
+                            3 => Some("DELETE FROM frames WHERE id IN (1,2)"),
+                            5 => Some(
+                                "UPDATE frames SET timestamp='2026-10-21T01:00:00Z' WHERE id=1",
+                            ),
+                            _ => None,
+                        };
+                        if let Some(sql) = sql {
+                            self.db.execute_raw_sql_write(sql).await.unwrap();
+                        }
+                        if matches!(mutation, 4 | 5) {
+                            let job = self
+                                .db
+                                .release_pending("frames", 10)
+                                .await
+                                .unwrap()
+                                .into_iter()
+                                .find(|j| j.id == "1")
+                                .unwrap();
+                            let mut safe = job.values.clone();
+                            safe.insert("full_text".into(), Some("new certified edit".into()));
+                            assert!(self.db.publish_release(&job, &safe).await.unwrap());
+                        }
+                        if mutation != 0 {
+                            self.db.execute_raw_sql_write("INSERT INTO frames(id,timestamp,full_text) VALUES(3,'2026-10-23T01:00:00Z','durable new capture')").await.unwrap();
+                        }
+                    }
+                    Ok(page)
+                }
+                async fn fetch_frames_since(
+                    &self,
+                    _: Option<&str>,
+                    _: u32,
+                    _: u32,
+                ) -> Result<Vec<FrameRow>, EnterpriseSyncError> {
+                    panic!("protected upload must not use raw capture APIs")
+                }
+                async fn fetch_audio_since(
+                    &self,
+                    _: Option<&str>,
+                    _: u32,
+                    _: u32,
+                ) -> Result<Vec<AudioRow>, EnterpriseSyncError> {
+                    Ok(vec![])
+                }
+            }
+            for hybrid in [false, true] {
+                for mutation in 1..=5 {
+                    let dir = tempfile::tempdir().unwrap();
+                    let db = Arc::new(if hybrid {
+                        let mut options = screenpipe_db::storage::MigrationOptions::default();
+                        options.budget.disk_reserve_bytes = 0;
+                        screenpipe_db::DatabaseManager::new_hybrid(
+                            dir.path(),
+                            Default::default(),
+                            options,
+                        )
+                        .await
+                        .unwrap()
+                    } else {
+                        screenpipe_db::DatabaseManager::new(
+                            dir.path().join("db.sqlite").to_str().unwrap(),
+                            Default::default(),
+                        )
+                        .await
+                        .unwrap()
+                    });
+                    db.configure_release(&ReleasePolicy {
+                        identity: "fixture-v1".into(),
+                        text: true,
+                        images: false,
+                    })
+                    .await
+                    .unwrap();
+                    db.execute_raw_sql_write("INSERT INTO frames(id,timestamp,full_text) VALUES(1,'2026-10-23T01:00:00Z','PRIVATE_ORIGINAL'),(2,'2026-10-23T01:00:00Z','certified survivor')").await.unwrap();
+                    for job in db.release_pending("frames", 10).await.unwrap() {
+                        let mut safe = job.values.clone();
+                        if job.id == "1" {
+                            safe.insert("full_text".into(), Some("certified original".into()));
+                        }
+                        assert!(db.publish_release(&job, &safe).await.unwrap());
+                    }
+                    let server = wiremock::MockServer::start().await;
+                    let fail = Arc::new(std::sync::atomic::AtomicBool::new(mutation == 2));
+                    let response = fail.clone();
+                    wiremock::Mock::given(wiremock::matchers::path("/ingest"))
+                        .respond_with(move |_: &wiremock::Request| {
+                            wiremock::ResponseTemplate::new(if response.load(Ordering::SeqCst) {
+                                503
+                            } else {
+                                200
+                            })
+                        })
+                        .mount(&server)
+                        .await;
+                    let cfg = sync::tests::test_cfg(&dir, format!("{}/ingest", server.uri()));
+                    let mut cursor = sync::Cursor::default();
+                    cursor.privacy.insert(
+                        "frames".into(),
+                        sync::PrivacyCursor {
+                            sequence: 0,
+                            cutoff: "2026-10-22T00:00:00Z".into(),
+                        },
+                    );
+                    let local = Local {
+                        protected: db.protected_reads().await.unwrap(),
+                        db: db.clone(),
+                        mutation: AtomicU8::new(mutation),
+                    };
+                    let http = reqwest::Client::new();
+                    let result = sync::run_one_sync(&cfg, &mut cursor, &local, &http).await;
+                    if mutation == 2 {
+                        assert!(result.is_err(), "real transport failure remains retryable");
+                        assert_eq!(
+                            sync::Cursor::load(&cfg.cursor_path).privacy["frames"].sequence,
+                            0
+                        );
+                        fail.store(false, Ordering::SeqCst);
+                        cursor = sync::Cursor::load(&cfg.cursor_path);
+                        assert_eq!(
+                            sync::run_one_sync(&cfg, &mut cursor, &local, &http)
+                                .await
+                                .unwrap()
+                                .frames,
+                            1
+                        );
+                    } else {
+                        assert_eq!(
+                            result.unwrap().frames,
+                            if mutation == 3 {
+                                0
+                            } else if mutation == 4 {
+                                2
+                            } else {
+                                1
+                            }
+                        );
+                    }
+                    assert!(sync::Cursor::load(&cfg.cursor_path).privacy["frames"].sequence > 0);
+                    let requests = server.received_requests().await.unwrap();
+                    if mutation == 3 {
+                        assert!(requests.is_empty());
+                    }
+                    for request in &requests {
+                        let body = String::from_utf8_lossy(&request.body);
+                        assert!(!body.contains("PRIVATE_ORIGINAL"));
+                        assert!(!body.contains("UNPROCESSED_PRIVATE_EDIT"));
+                        assert!(
+                            !body.contains("durable new capture"),
+                            "new captures stay outside the selected page"
+                        );
+                        assert!(body.contains("certified survivor"));
+                        assert!(!body.contains("2026-10-21"), "a corrected time outside the cutoff is not authorized by the old selection");
+                    }
+                    // Source edits remain pending after the surviving page was
+                    // acknowledged. Close/reopen both the DB and checkpoint,
+                    // then release the pending work and prove later delivery.
+                    drop(local);
+                    db.close().await;
+                    drop(db);
+                    // Reopen an existing logical root through the normal
+                    // startup path; new_hybrid initializes an empty root.
+                    let db = Arc::new(
+                        screenpipe_db::DatabaseManager::new(
+                            dir.path().join("db.sqlite").to_str().unwrap(),
+                            Default::default(),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                    let capture = db
+                        .frame_payloads(&[3], screenpipe_db::storage::Projection::All)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        capture[&3].full_text.as_deref(),
+                        Some("durable new capture")
+                    );
+                    for job in db.release_pending("frames", 10).await.unwrap() {
+                        let mut safe = job.values.clone();
+                        if job.id == "1" {
+                            safe.insert("full_text".into(), Some("new certified edit".into()));
+                        }
+                        assert!(db.publish_release(&job, &safe).await.unwrap());
+                    }
+                    let local = Local {
+                        protected: db.protected_reads().await.unwrap(),
+                        db: db.clone(),
+                        mutation: AtomicU8::new(0),
+                    };
+                    let mut cursor = sync::Cursor::load(&cfg.cursor_path);
+                    let report = sync::run_one_sync(&cfg, &mut cursor, &local, &http)
+                        .await
+                        .unwrap();
+                    assert_eq!(report.frames, if matches!(mutation, 2 | 4) { 2 } else { 1 });
+                    let requests = server.received_requests().await.unwrap();
+                    let body = String::from_utf8_lossy(&requests.last().unwrap().body);
+                    assert!(body.contains("durable new capture"));
+                    if matches!(mutation, 2 | 4) {
+                        assert!(body.contains("new certified edit"));
+                    }
+                    db.close().await;
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn protected_upload_refreshes_every_remaining_http_chunk_after_revocation() {
+            use super::{AudioRow, EnterpriseSyncError, FrameRow, LocalApiClient, StorageExport};
+            use crate::enterprise::sync::{self, ExportFilter, ExportFilterReport, ExportRows};
+            use std::sync::{
+                atomic::{AtomicBool, AtomicUsize, Ordering},
+                Arc,
+            };
+            let _streams = crate::enterprise_policy::sync_streams_test_lock();
+            let _restore = sync::tests::RestoreDefaultSyncStreams;
+            crate::enterprise_policy::set_sync_streams(
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                "off".into(),
+                "off".into(),
+            );
+            struct ChangingExport {
+                inner: StorageExport,
+                db: Arc<screenpipe_db::DatabaseManager>,
+                calls: AtomicUsize,
+                mutate: Arc<AtomicBool>,
+            }
+            #[async_trait::async_trait]
+            impl ExportFilter for ChangingExport {
+                async fn admit(&self) -> Result<Option<Box<dyn Send>>, EnterpriseSyncError> {
+                    self.inner.admit().await
+                }
+                async fn filter(
+                    &self,
+                    rows: &mut ExportRows<'_>,
+                    local: &dyn LocalApiClient,
+                ) -> Result<ExportFilterReport, EnterpriseSyncError> {
+                    if self.calls.fetch_add(1, Ordering::SeqCst) == 1
+                        && self.mutate.swap(false, Ordering::SeqCst)
+                    {
+                        // The preceding HTTP request has completed. Change two
+                        // later chunks before either reaches the real filter.
+                        self.db
+                            .execute_raw_sql_write("DELETE FROM frames WHERE id=2")
+                            .await
+                            .unwrap();
+                        self.db
+                            .execute_raw_sql_write(
+                                "UPDATE frames SET full_text='PRIVATE_CHANGED' WHERE id=3",
+                            )
+                            .await
+                            .unwrap();
+                        self.db.execute_raw_sql_write("INSERT INTO frames(id,timestamp,full_text) VALUES(4,'2026-10-23T03:00:00Z','new durable capture')").await.unwrap();
+                    }
+                    self.inner.filter(rows, local).await
+                }
+            }
+            struct Local {
+                db: Arc<screenpipe_db::DatabaseManager>,
+                protected: Arc<screenpipe_db::DatabaseManager>,
+                mutate: Arc<AtomicBool>,
+                finished: Arc<AtomicBool>,
+            }
+            #[async_trait::async_trait]
+            impl LocalApiClient for Local {
+                async fn privacy_release_required(&self) -> Result<bool, EnterpriseSyncError> {
+                    Ok(true)
+                }
+                async fn prepare_release_replay(
+                    &self,
+                    id: &str,
+                    streams: &[String],
+                    start: &str,
+                    end: &str,
+                    limit: u32,
+                ) -> Result<bool, EnterpriseSyncError> {
+                    self.db
+                        .prepare_release_replay(id, streams, start, end, limit)
+                        .await
+                        .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))
+                }
+                async fn release_replay_pending(
+                    &self,
+                    id: &str,
+                    streams: &[String],
+                    start: &str,
+                    end: &str,
+                    after: &std::collections::BTreeMap<String, i64>,
+                ) -> Result<bool, EnterpriseSyncError> {
+                    self.db
+                        .release_replay_pending(id, streams, start, end, Some(after))
+                        .await
+                        .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))
+                }
+                async fn finish_release_replay(&self, id: &str) -> Result<(), EnterpriseSyncError> {
+                    self.db
+                        .finish_release_replay(id)
+                        .await
+                        .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))?;
+                    self.finished.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+                async fn begin_export(
+                    &self,
+                ) -> Result<Option<Box<dyn ExportFilter>>, EnterpriseSyncError> {
+                    Ok(Some(Box::new(ChangingExport {
+                        inner: StorageExport::begin_storage(self.db.clone()).await?,
+                        db: self.db.clone(),
+                        calls: AtomicUsize::new(0),
+                        mutate: self.mutate.clone(),
+                    })))
+                }
+                async fn fetch_release_page(
+                    &self,
+                    kind: &str,
+                    after: i64,
+                    cutoff: &str,
+                    end: Option<&str>,
+                    limit: u32,
+                ) -> Result<screenpipe_db::privacy_release::ReleasePage, EnterpriseSyncError>
+                {
+                    Ok(self
+                        .protected
+                        .release_export_range_page(kind, after, cutoff, end, limit)
+                        .await
+                        .unwrap())
+                }
+                async fn fetch_frames_since(
+                    &self,
+                    _: Option<&str>,
+                    _: u32,
+                    _: u32,
+                ) -> Result<Vec<FrameRow>, EnterpriseSyncError> {
+                    panic!("raw frame refresh is forbidden")
+                }
+                async fn fetch_audio_since(
+                    &self,
+                    _: Option<&str>,
+                    _: u32,
+                    _: u32,
+                ) -> Result<Vec<AudioRow>, EnterpriseSyncError> {
+                    Ok(vec![])
+                }
+            }
+            for (hybrid, replay) in [false, true]
+                .into_iter()
+                .flat_map(|hybrid| [(hybrid, false), (hybrid, true)])
+            {
+                let dir = tempfile::tempdir().unwrap();
+                let db = Arc::new(if hybrid {
+                    let mut options = screenpipe_db::storage::MigrationOptions::default();
+                    options.budget.disk_reserve_bytes = 0;
+                    screenpipe_db::DatabaseManager::new_hybrid(
+                        dir.path(),
+                        Default::default(),
+                        options,
+                    )
+                    .await
+                    .unwrap()
+                } else {
+                    screenpipe_db::DatabaseManager::new(
+                        dir.path().join("db.sqlite").to_str().unwrap(),
+                        Default::default(),
+                    )
+                    .await
+                    .unwrap()
+                });
+                db.configure_release(&screenpipe_db::privacy_release::ReleasePolicy {
+                    identity: "chunks-v1".into(),
+                    text: true,
+                    images: false,
+                })
+                .await
+                .unwrap();
+                // Match the actual HTTP transport target; each pair of records
+                // exceeds it, so every original record occupies its own chunk.
+                let text = "x".repeat(sync::HOSTED_INGEST_REQUEST_BYTES / 2);
+                for id in 1..=3 {
+                    db.execute_raw_sql_write(&format!("INSERT INTO frames(id,timestamp,full_text) VALUES({id},'2026-10-23T01:00:00Z','{text}')")).await.unwrap();
+                }
+                let mut jobs = db.release_pending("frames", 10).await.unwrap();
+                jobs.sort_by_key(|job| job.id.parse::<i64>().unwrap());
+                for job in jobs {
+                    assert!(db.publish_release(&job, &job.values).await.unwrap());
+                }
+                let server = wiremock::MockServer::start().await;
+                wiremock::Mock::given(wiremock::matchers::path("/ingest"))
+                    .respond_with(wiremock::ResponseTemplate::new(200))
+                    .mount(&server)
+                    .await;
+                let cfg = sync::tests::test_cfg(&dir, format!("{}/ingest", server.uri()));
+                let mut cursor = sync::Cursor::default();
+                cursor.privacy.insert(
+                    "frames".into(),
+                    sync::PrivacyCursor {
+                        sequence: 0,
+                        cutoff: "2026-10-22T00:00:00Z".into(),
+                    },
+                );
+                let request = serde_json::json!({
+                    "id": uuid::Uuid::new_v4().to_string(), "license_id": uuid::Uuid::new_v4().to_string(),
+                    "device_id": cfg.device_id, "start_at": "2026-10-22T00:00:00Z", "end_at": "2026-10-23T02:00:00Z",
+                    "streams": ["frames"], "images_only": false, "recover_images": false
+                });
+                let finished = Arc::new(AtomicBool::new(false));
+                let local = Local {
+                    db: db.clone(),
+                    protected: db.protected_reads().await.unwrap(),
+                    mutate: Arc::new(AtomicBool::new(true)),
+                    finished: finished.clone(),
+                };
+                let http = reqwest::Client::new();
+                let report = if replay {
+                    let (page, more) = sync::tests::requested_replay_page(
+                        &cfg,
+                        &mut cursor,
+                        &local,
+                        &http,
+                        request.clone(),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(
+                        more,
+                        "revoked pending records must keep the accepted replay active"
+                    );
+                    assert!(!finished.load(Ordering::SeqCst));
+                    page
+                } else {
+                    sync::run_one_sync(&cfg, &mut cursor, &local, &http)
+                        .await
+                        .unwrap()
+                };
+                assert_eq!(report.frames, 1);
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(
+                    requests.len(),
+                    1,
+                    "revoked later chunks must never reach HTTP"
+                );
+                let record: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+                assert_eq!(record["frame_id"], 1);
+                drop(local);
+                db.close().await;
+                drop(db);
+                let db = Arc::new(
+                    screenpipe_db::DatabaseManager::new(
+                        dir.path().join("db.sqlite").to_str().unwrap(),
+                        Default::default(),
+                    )
+                    .await
+                    .unwrap(),
+                );
+                assert_eq!(
+                    db.frame_payloads(&[4], screenpipe_db::storage::Projection::All)
+                        .await
+                        .unwrap()[&4]
+                        .full_text
+                        .as_deref(),
+                    Some("new durable capture")
+                );
+                let local = Local {
+                    db: db.clone(),
+                    protected: db.protected_reads().await.unwrap(),
+                    mutate: Arc::new(AtomicBool::new(false)),
+                    finished: finished.clone(),
+                };
+                for job in db.release_pending("frames", 10).await.unwrap() {
+                    let mut safe = job.values.clone();
+                    if job.id == "3" {
+                        safe.insert("full_text".into(), Some("certified changed record".into()));
+                    }
+                    assert!(db.publish_release(&job, &safe).await.unwrap());
+                }
+                let mut restarted = sync::Cursor::load(&cfg.cursor_path);
+                let report = if replay {
+                    let (page, more) = sync::tests::requested_replay_page(
+                        &cfg,
+                        &mut restarted,
+                        &local,
+                        &http,
+                        request,
+                    )
+                    .await
+                    .unwrap();
+                    assert!(
+                        !more,
+                        "unrelated captures outside the request must not strand replay"
+                    );
+                    assert!(finished.load(Ordering::SeqCst));
+                    page
+                } else {
+                    sync::run_one_sync(&cfg, &mut restarted, &local, &http)
+                        .await
+                        .unwrap()
+                };
+                assert_eq!(report.frames, if replay { 1 } else { 2 });
+                let requests = server.received_requests().await.unwrap();
+                let body = String::from_utf8_lossy(&requests.last().unwrap().body);
+                assert!(body.contains("certified changed record"));
+                assert_eq!(body.contains("new durable capture"), !replay);
+                assert!(!body.contains("PRIVATE_CHANGED"));
+                db.close().await;
+            }
+        }
         #[tokio::test]
         async fn export_upload_filters_deleted_rows_and_refreshes_redactions() {
             use super::{AudioRow, EnterpriseSyncError, FrameRow, LocalApiClient, StorageExport};
@@ -2799,11 +3764,51 @@ mod imp {
             use std::sync::Arc;
             struct CapturingLocal {
                 db: Arc<screenpipe_db::DatabaseManager>,
+                protected: Option<Arc<screenpipe_db::DatabaseManager>>,
                 change: u8,
                 reads: std::sync::atomic::AtomicUsize,
             }
             #[async_trait::async_trait]
             impl LocalApiClient for CapturingLocal {
+                async fn privacy_release_required(&self) -> Result<bool, EnterpriseSyncError> {
+                    Ok(self.change == 5)
+                }
+
+                async fn fetch_release_page(
+                    &self,
+                    kind: &str,
+                    after: i64,
+                    cutoff: &str,
+                    end: Option<&str>,
+                    limit: u32,
+                ) -> Result<screenpipe_db::privacy_release::ReleasePage, EnterpriseSyncError>
+                {
+                    let page = self
+                        .protected
+                        .as_ref()
+                        .unwrap()
+                        .release_export_range_page(kind, after, cutoff, end, limit)
+                        .await
+                        .unwrap();
+                    if kind == "frames" && !page.rows.as_array().unwrap().is_empty() {
+                        assert_eq!(
+                            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                            0
+                        );
+                        self.db.execute_raw_sql_write("INSERT INTO frames(id,timestamp,full_text) VALUES(3,'2026-10-09','new capture')").await.unwrap();
+                        let chunk = self
+                            .db
+                            .insert_video_chunk_with_fps("compacted.mp4", "test", 1.0)
+                            .await
+                            .unwrap();
+                        self.db
+                            .compact_snapshots_queued(chunk, vec![(1, 0)])
+                            .await
+                            .unwrap();
+                    }
+                    Ok(page)
+                }
+
                 async fn begin_export(
                     &self,
                 ) -> Result<Option<Box<dyn ExportFilter>>, EnterpriseSyncError> {
@@ -2817,6 +3822,7 @@ mod imp {
                     _: u32,
                     _: u32,
                 ) -> Result<Vec<FrameRow>, EnterpriseSyncError> {
+                    assert_ne!(self.change, 5, "protected exports must use certified pages");
                     let first = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
                     let ids = if first { vec![1, 2] } else { vec![1, 2, 3] };
                     let payloads = self
@@ -2881,7 +3887,7 @@ mod imp {
                     Ok(Vec::new())
                 }
             }
-            for (change, hybrid) in (0..5).flat_map(|change| [(change, false), (change, true)]) {
+            for (change, hybrid) in (0..6).flat_map(|change| [(change, false), (change, true)]) {
                 let dir = tempfile::tempdir().unwrap();
                 let db = Arc::new(if hybrid {
                     // Synthetic export fixture; disk admission is covered by
@@ -2904,8 +3910,27 @@ mod imp {
                     .unwrap()
                 });
                 db.execute_raw_sql_write("INSERT INTO frames(id,timestamp,full_text) VALUES(1,'2026-10-09','pending upload'),(2,'2026-10-09','surviving record')").await.unwrap();
-                if change == 4 {
+                if change >= 4 {
                     db.execute_raw_sql_write("UPDATE frames SET snapshot_path='redacted.jpg',full_text_redacted_at=1,image_redacted_at=1 WHERE id=1").await.unwrap();
+                }
+                if change == 5 {
+                    db.configure_release(&screenpipe_db::privacy_release::ReleasePolicy {
+                        identity: "compaction-image-v1".into(),
+                        text: true,
+                        images: true,
+                    })
+                    .await
+                    .unwrap();
+                    for job in db.release_pending("frames", 10).await.unwrap() {
+                        assert!(db.publish_release(&job, &job.values).await.unwrap());
+                    }
+                    let images = db.release_pending("image", 10).await.unwrap();
+                    let mut ids: Vec<_> = images.iter().map(|image| image.id.as_str()).collect();
+                    ids.sort_unstable();
+                    assert_eq!(ids, ["1", "2"]);
+                    for image in images {
+                        assert!(db.publish_image_release(&image).await.unwrap());
+                    }
                 }
                 let server = wiremock::MockServer::start().await;
                 wiremock::Mock::given(wiremock::matchers::path("/ingest"))
@@ -2915,8 +3940,22 @@ mod imp {
                     .await;
                 let cfg = sync::tests::test_cfg(&dir, format!("{}/ingest", server.uri()));
                 let mut cursor = sync::Cursor::default();
+                if change == 5 {
+                    cursor.privacy.insert(
+                        "frames".into(),
+                        sync::PrivacyCursor {
+                            sequence: 0,
+                            cutoff: "2026-10-09T00:00:00Z".into(),
+                        },
+                    );
+                }
                 let local = CapturingLocal {
                     db: db.clone(),
+                    protected: if change == 5 {
+                        Some(db.protected_reads().await.unwrap())
+                    } else {
+                        None
+                    },
                     change,
                     reads: std::sync::atomic::AtomicUsize::new(0),
                 };
@@ -2928,12 +3967,12 @@ mod imp {
                     _ => 2,
                 };
                 assert_eq!(result.unwrap().frames, expected);
-                assert_eq!(
-                    sync::Cursor::load(&cfg.cursor_path)
-                        .last_frame_ts
-                        .as_deref(),
-                    Some("2026-10-09T00:00:00Z")
-                );
+                let saved = sync::Cursor::load(&cfg.cursor_path);
+                if change == 5 {
+                    assert!(saved.privacy["frames"].sequence > 0);
+                } else {
+                    assert_eq!(saved.last_frame_ts.as_deref(), Some("2026-10-09T00:00:00Z"));
+                }
                 let requests = server.received_requests().await.unwrap();
                 if change != 3 {
                     let body = String::from_utf8_lossy(&requests[0].body);
@@ -2942,10 +3981,10 @@ mod imp {
                         !body.contains("new capture"),
                         "new rows belong to the next page"
                     );
-                    assert_eq!(body.contains("pending upload"), matches!(change, 0 | 4));
+                    assert_eq!(body.contains("pending upload"), matches!(change, 0 | 4 | 5));
                     assert_eq!(body.contains("[REDACTED]"), change == 2);
                 }
-                if hybrid && change == 4 {
+                if (hybrid && change == 4) || change == 5 {
                     assert_eq!(
                         local.reads.load(std::sync::atomic::Ordering::SeqCst),
                         1,
@@ -3058,6 +4097,8 @@ mod imp {
         fn hidden_ui_policy_matches_frontend_section_normalization() {
             let response = NativePolicyResponse {
                 license_id: None,
+                app_update_policy: None,
+                extra: serde_json::Map::new(),
                 hidden_sections: vec!["app_ui".to_string(), "app_ui".to_string()],
                 locked_settings: HashMap::from([
                     ("recording".to_string(), serde_json::Value::Bool(true)),
@@ -3104,6 +4145,121 @@ mod imp {
         }
 
         #[tokio::test]
+        async fn update_policy_is_delivered_before_paused_recording_or_enrollment() {
+            use wiremock::{
+                matchers::{method, path},
+                Mock, MockServer, ResponseTemplate,
+            };
+            let server = MockServer::start().await;
+            let http = reqwest::Client::new();
+            let updates = serde_json::json!({"mode":"screenpipe","default_auto_update":true,"allow_employee_override":false});
+            for top_level in [false, true] {
+                server.reset().await;
+                let mut response = serde_json::json!({"hiddenSections":["app_ui"],"recordingAllowed":false,"lockedSettings":{}});
+                if top_level {
+                    response["appUpdatePolicy"] = updates.clone();
+                } else {
+                    response["lockedSettings"]["app_update_policy"] = updates.clone();
+                }
+                Mock::given(method("GET"))
+                    .and(path("/policy"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                    .mount(&server)
+                    .await;
+                let mut applied = None;
+                let policy = super::fetch_and_apply_native_policy(
+                    &http,
+                    &format!("{}/policy", server.uri()),
+                    "fixture-device",
+                    &super::EnterprisePolicyCredential::LicenseKey("fixture-key".into()),
+                    |policy| {
+                        applied = Some(policy.app_update_policy.clone());
+                        true
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(!policy.recording_allowed);
+                assert_eq!(applied, Some(updates.clone()));
+            }
+        }
+
+        #[tokio::test]
+        async fn paused_policy_delivers_all_device_state_to_native_storage_without_windows() {
+            use wiremock::{matchers::path, Mock, MockServer, ResponseTemplate};
+            let server = MockServer::start().await;
+            let root = tempfile::tempdir().unwrap();
+            let app = tauri::test::mock_builder()
+                .plugin(tauri_plugin_store::Builder::default().build())
+                .build(tauri::test::mock_context(tauri::test::noop_assets()))
+                .unwrap();
+            assert!(app.webview_windows().is_empty());
+            let file = root.path().join("store.bin");
+            let store = tauri_plugin_store::StoreBuilder::new(app.handle(), &file)
+                .disable_auto_save()
+                .build()
+                .unwrap();
+            store.set(
+                "settings",
+                serde_json::json!(crate::store::SettingsStore::default()),
+            );
+            let response = serde_json::json!({
+                "recordingAllowed": false, "hiddenSections": [],
+                "lockedSettings": {"disableAudio":"true","analyticsEnabled":"false","experimentalMeetingPiggyback":"false"},
+                "appUpdatePolicy": {"mode":"manual","default_auto_update":false,"allow_employee_override":false},
+                "aiPresetPolicy": {"version":2,"allow_screenpipe_cloud":false,"allow_employee_custom_presets":false},
+                "syncStreams": {"frames":false,"audio":false,"frame_images":"off"},
+                "managedPipes":[], "managedSkills":[], "isAdmin":true,"gatewayUrl":null
+            });
+            Mock::given(path("/policy"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                .mount(&server)
+                .await;
+            let fetched = super::fetch_and_apply_native_policy(
+                &reqwest::Client::new(),
+                &format!("{}/policy", server.uri()),
+                "native-fixture",
+                &super::EnterprisePolicyCredential::LicenseKey("fixture-key".into()),
+                |policy| {
+                    crate::enterprise::managed_settings::persist_snapshot_store(
+                        store.as_ref(),
+                        &policy.locked_settings,
+                        &policy.app_update_policy,
+                        &policy.extra,
+                        root.path(),
+                        || store.save().map_err(|e| e.to_string()),
+                    )
+                    .unwrap();
+                    true
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!fetched.recording_allowed);
+            assert!(fetched
+                .hidden_sections
+                .iter()
+                .all(|section| section != "app_ui"));
+            assert!(!fetched.sync_streams.frames);
+            assert!(!fetched.sync_streams.audio);
+            assert!(fetched.extra.contains_key("isAdmin"));
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+            assert_eq!(
+                saved["settings"]["enterpriseAppUpdatePolicy"]["mode"],
+                "manual"
+            );
+            assert_eq!(saved["settings"]["aiPresets"], serde_json::json!([]));
+            assert_eq!(saved["settings"]["disableAudio"], true);
+            assert_eq!(saved["settings"]["analyticsEnabled"], false);
+            assert_eq!(
+                saved["settings"]["enterpriseRuntimePolicy"],
+                serde_json::json!({"managedPipes":[],"managedSkills":[]})
+            );
+            assert!(app.webview_windows().is_empty());
+        }
+
+        #[tokio::test]
         async fn ai_tool_policy_applies_on_fetch_even_when_recording_is_paused() {
             use wiremock::{
                 matchers::{header, method, path},
@@ -3137,7 +4293,10 @@ mod imp {
                     &format!("{}/policy", server.uri()),
                     "fixture-device",
                     &super::EnterprisePolicyCredential::LicenseKey("fixture-key".into()),
-                    |enabled| applied = Some(enabled),
+                    |policy| {
+                        applied = Some(policy.auto_connect_ai_tools);
+                        true
+                    },
                 )
                 .await
                 .unwrap();
@@ -3190,8 +4349,9 @@ mod imp {
                         &older_url,
                         "fixture-device",
                         &credential,
-                        |enabled| {
-                            assert!(!policy.update(older, enabled));
+                        |fetched| {
+                            assert!(!policy.update(older, fetched.auto_connect_ai_tools));
+                            true
                         }
                     ),
                     super::fetch_and_apply_native_policy(
@@ -3199,9 +4359,10 @@ mod imp {
                         &newer_url,
                         "fixture-device",
                         &credential,
-                        |enabled| {
-                            assert!(policy.update(newer, enabled));
+                        |fetched| {
+                            assert!(policy.update(newer, fetched.auto_connect_ai_tools));
                             release_older.notify_one();
+                            true
                         }
                     ),
                 )
@@ -3212,6 +4373,32 @@ mod imp {
             assert!(old_result.is_ok());
             assert!(new_result.is_ok());
             assert!(!policy.snapshot().allowed);
+        }
+
+        #[tokio::test]
+        async fn superseded_policy_response_requests_an_authorization_retry() {
+            use wiremock::{matchers::path, Mock, MockServer, ResponseTemplate};
+            let server = MockServer::start().await;
+            Mock::given(path("/policy"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .mount(&server)
+                .await;
+            let refresh = crate::enterprise::managed_settings::PolicyRefresh::default();
+            let older = refresh.begin();
+            refresh.begin();
+            let result = super::fetch_and_apply_native_policy(
+                &reqwest::Client::new(),
+                &format!("{}/policy", server.uri()),
+                "fixture-device",
+                &super::EnterprisePolicyCredential::LicenseKey("fixture-key".into()),
+                |_| refresh.apply(older, || panic!("stale policy applied")).is_some(),
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(NativePolicyFetchError::Unavailable(code))
+                    if code == super::POLICY_REFRESH_SUPERSEDED
+            ));
         }
 
         #[tokio::test]
@@ -3244,7 +4431,10 @@ mod imp {
                     &format!("{}/policy", server.uri()),
                     "fixture-device",
                     &super::EnterprisePolicyCredential::LicenseKey("fixture-key".into()),
-                    |_| called = true,
+                    |_| {
+                        called = true;
+                        true
+                    },
                 )
                 .await;
                 assert!(result.is_err());
@@ -3279,7 +4469,10 @@ mod imp {
                     &url,
                     "fixture-device",
                     &credential,
-                    |_| called = true,
+                    |_| {
+                        called = true;
+                        true
+                    },
                 ),
             )
             .await;
@@ -3341,9 +4534,85 @@ mod imp {
             .unwrap();
 
             assert_eq!(response.sync_streams, NativeSyncStreams::default());
+            assert!(response.sync_streams.parsed);
             assert!(response.sync_streams.starred);
             assert_eq!(response.sync_streams.frame_images_mode(), "off");
             assert_eq!(response.sync_streams.feedback_mode(), "off");
+        }
+
+        #[tokio::test]
+        async fn native_policy_parsed_rows_upload_by_default_and_respect_explicit_opt_out() {
+            use tracing::instrument::WithSubscriber;
+            use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+            let _guard = crate::enterprise_policy::sync_streams_test_lock();
+            let server = MockServer::start().await;
+            let http = reqwest::Client::new();
+            for (body, expected, omitted) in [
+                (serde_json::json!({}), true, true),
+                (serde_json::json!({"syncStreams": {}}), true, true),
+                (
+                    serde_json::json!({"syncStreams": {"parsed": true}}),
+                    true,
+                    false,
+                ),
+                (
+                    serde_json::json!({"syncStreams": {"parsed": false}}),
+                    false,
+                    false,
+                ),
+            ] {
+                server.reset().await;
+                Mock::given(method("GET"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .mount(&server)
+                    .await;
+                let logs = tempfile::tempdir().unwrap();
+                let file = std::fs::File::create(logs.path().join("screenpipe-app.log")).unwrap();
+                let subscriber = tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(file))
+                    .finish();
+                async {
+                    // Refresh twice, as the hidden watcher does without a Home
+                    // webview. Each fresh response must preserve the same choice.
+                    for _ in 0..2 {
+                        let policy = super::fetch_and_apply_native_policy(
+                            &http,
+                            &format!("{}/policy", server.uri()),
+                            "fixture-device",
+                            &super::EnterprisePolicyCredential::LicenseKey("fixture-key".into()),
+                            |_| true,
+                        )
+                        .await
+                        .unwrap();
+                        policy.sync_streams.apply();
+                        assert_eq!(
+                            crate::enterprise_policy::current_sync_streams().parsed,
+                            expected
+                        );
+                    }
+                }
+                .with_subscriber(subscriber)
+                .await;
+                // Support receives the actual native decision after collection
+                // and redaction, without the policy credential or record content.
+                let report =
+                    crate::diagnostic_logs::collect_redacted_from_dirs(&[logs.path().into()])
+                        .await
+                        .unwrap();
+                if omitted {
+                    assert!(report.contains("parsed sync policy omitted"), "{report}");
+                    assert!(
+                        report.contains("applying shared default parsed=true"),
+                        "{report}"
+                    );
+                } else {
+                    assert!(!report.contains("parsed sync policy omitted"), "{report}");
+                }
+                assert!(!report.contains("fixture-key"));
+            }
+            NativeSyncStreams::default().apply();
         }
 
         #[test]
@@ -3490,8 +4759,11 @@ mod imp {
 #[cfg(feature = "enterprise-support")]
 pub use imp::{configure_telemetry_context, spawn};
 
+#[cfg(all(test, feature = "enterprise-support"))]
+pub(crate) use imp::device_id_tests::check_protected_upload_revocations;
+
 #[cfg(feature = "enterprise-support")]
-pub(crate) use imp::{authorize_startup, verify_recording_authorization};
+pub(crate) use imp::{authorize_startup, recording_stream_endpoint, verify_recording_authorization};
 
 #[cfg(not(feature = "enterprise-support"))]
 pub fn configure_telemetry_context(_app: &tauri::AppHandle) {}

@@ -148,6 +148,11 @@ pub enum ProxyAuth {
     Bearer { credential_key: &'static str },
     /// Send as `Authorization: Token <token>`.
     Token { credential_key: &'static str },
+    /// Unsigned OAuth key/token header, as supported by Trello. Not signed OAuth 1.0.
+    OAuth1Token {
+        consumer_key: &'static str,
+        token_key: &'static str,
+    },
     /// Send as a custom header (e.g. `X-API-Key: <value>`).
     Header {
         name: &'static str,
@@ -162,6 +167,21 @@ pub enum ProxyAuth {
     BasicAuthEmptyPassword { username_key: &'static str },
     /// No auth needed (e.g. webhook-based integrations where the URL is the secret).
     None,
+}
+
+/// Encode OAuth header values per RFC 5849, keeping credentials out of URLs.
+pub fn oauth1_token_header(consumer_key: &str, token: &str) -> String {
+    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+    const OAUTH_ENCODE: &percent_encoding::AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    format!(
+        "OAuth oauth_consumer_key=\"{}\", oauth_token=\"{}\"",
+        utf8_percent_encode(consumer_key, OAUTH_ENCODE),
+        utf8_percent_encode(token, OAUTH_ENCODE),
+    )
 }
 
 /// How the background OAuth refresher should treat this integration.
@@ -689,13 +709,21 @@ impl ConnectionManager {
         id: &str,
         instance: Option<&str>,
     ) -> Result<Option<Map<String, Value>>> {
+        Ok(self
+            .get_saved_instance(id, instance)
+            .await?
+            .map(|connection| connection.credentials))
+    }
+
+    /// Load the exact instance together with its enabled state.
+    pub async fn get_saved_instance(
+        &self,
+        id: &str,
+        instance: Option<&str>,
+    ) -> Result<Option<SavedConnection>> {
         self.find(id)?;
         let key = make_key(id, instance);
-        Ok(
-            load_connection(self.secret_store.as_deref(), &self.screenpipe_dir, &key)
-                .await
-                .map(|c| c.credentials),
-        )
+        Ok(load_connection(self.secret_store.as_deref(), &self.screenpipe_dir, &key).await)
     }
 
     /// Look up the proxy config for a connection by ID.

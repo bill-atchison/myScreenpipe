@@ -6,6 +6,7 @@ import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { render } from "@/lib/i18n/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import type { PostHog } from "posthog-js";
+import { syncPostHogIdentity } from "@/lib/posthog-identity";
 
 const mocks = vi.hoisted(() => ({
   enterprisePolicy: {
@@ -268,44 +269,24 @@ describe("enterprise onboarding authentication", () => {
     mocks.isSettingsLoaded = true;
   });
 
-  it("resumes the first-task choice and saves a workflow goal without duplicating a prior save", async () => {
+  it("resumes the first-task choice and opens Workflows without writing priorities", async () => {
     mocks.enterprisePolicy.isManagedDeployment = false;
     onboardingData.currentStep = "first-task";
-    mocks.loadWorkProfile.mockResolvedValueOnce({
-      priorities: "Customer follow-ups", summary: "Customer support",
-    });
     render(<OnboardingPage />);
     fireEvent.click(await screen.findByRole("button", { name: /Understand a workflow/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Customer follow-ups" }));
-    fireEvent.click(screen.getByRole("button", { name: "Open Workflows" }));
     await waitFor(() => expect(mocks.completeOnboarding).toHaveBeenCalledWith({ method: "setup_finished" }));
     expect(mocks.saveProductMode).toHaveBeenCalledWith("workflows");
-    expect(mocks.saveWorkProfile).toHaveBeenCalledWith(expect.objectContaining({
-      priorities: "Customer follow-ups", summary: "Customer support",
-    }));
+    expect(mocks.loadWorkProfile).not.toHaveBeenCalled();
+    expect(mocks.saveWorkProfile).not.toHaveBeenCalled();
     expect(screen.queryByText("regular sign in")).not.toBeInTheDocument();
   });
 
-  it("offers regular sign-in and Enterprise Key on the login step", () => {
+  it.each(["choice", "license_key"])("shows regular sign-in for managed state %s", (state) => {
+    mocks.enterprisePolicy.authenticationState = state;
     render(<OnboardingPage />);
-
     expect(screen.getByText("regular sign in")).toBeInTheDocument();
-    fireEvent.click(
-      screen.getByRole("button", { name: /use enterprise key/i }),
-    );
-    expect(mocks.selectAuthenticationMethod).toHaveBeenCalledWith(
-      "license_key",
-    );
-  });
-
-  it("renders Enterprise Key entry on the onboarding login step", () => {
-    mocks.enterprisePolicy.authenticationState = "license_key";
-    render(<OnboardingPage />);
-
-    expect(screen.getByText("enterprise key form")).toBeInTheDocument();
-    expect(screen.queryByText("regular sign in")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /sign in instead/i }));
-    expect(mocks.selectAuthenticationMethod).toHaveBeenCalledWith("account");
+    expect(screen.queryByRole("button", { name: /use enterprise key/i })).not.toBeInTheDocument();
+    expect(screen.queryByText("enterprise key form")).not.toBeInTheDocument();
   });
 
   it("keeps non-enterprise onboarding on regular sign-in", () => {
@@ -1286,7 +1267,7 @@ describe("enterprise onboarding authentication", () => {
     );
   });
 
-  it("keeps a rejected enterprise account on login with the key alternative", () => {
+  it("keeps a rejected enterprise account on the account sign-in screen", () => {
     mocks.enterprisePolicy.authenticationState = "account";
     mocks.enterprisePolicy.authenticationError =
       "this account is not associated with the enterprise organization";
@@ -1298,8 +1279,8 @@ describe("enterprise onboarding authentication", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("regular sign in")).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /use enterprise key/i }),
-    ).toBeInTheDocument();
+      screen.queryByRole("button", { name: /use enterprise key/i }),
+    ).not.toBeInTheDocument();
   });
 
   it("completes onboarding after permissions when enterprise app UI is hidden", async () => {
@@ -1428,6 +1409,7 @@ describe("enterprise onboarding authentication", () => {
     });
 
     afterEach(() => {
+      mocks.sdk?.persistence?.clear();
       mocks.sdk = null;
       vi.restoreAllMocks();
       vi.useRealTimers();
@@ -1552,6 +1534,33 @@ describe("enterprise onboarding authentication", () => {
       expect(mocks.capture).toHaveBeenCalledWith("trial_activation_assignment_failed", expect.objectContaining({
         reason: "timeout", stage: "waiting_for_response", response_count: 0, elapsed_ms: 5_000, outcome: "continue_setup",
       }), { send_instantly: true });
+    });
+
+    it("settles after machine-to-clerk identity sync without waiting_for_identity timeout", async () => {
+      syncPostHogIdentity(mocks.sdk!, {
+        analyticsId: "machine-1",
+        properties: { machine_analytics_id: "machine-1" },
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(5));
+      await respond(0, "control");
+
+      syncPostHogIdentity(mocks.sdk!, {
+        analyticsId: "machine-1",
+        clerkId: "clerk-1",
+        properties: { clerk_id: "clerk-1", machine_analytics_id: "machine-1" },
+      });
+      expect(mocks.sdk!.get_distinct_id()).toBe("clerk-1");
+
+      render(<OnboardingPage />);
+      await act(async () => vi.advanceTimersByTimeAsync(5));
+      expect(requests[1].data.distinct_id).toBe("clerk-1");
+      await respond(1, "summary_first");
+      await act(async () => vi.advanceTimersByTimeAsync(5));
+      expect(requests[2].data.distinct_id).toBe("clerk-1");
+      await respond(2, "summary_first");
+      expect(screen.getByText("engine")).toBeInTheDocument();
+      expect(window.sessionStorage.getItem(TRIAL_ACTIVATION_ASSIGNMENT_SESSION_KEY)).toBe("summary_first");
+      expect(mocks.capture).not.toHaveBeenCalledWith("trial_activation_assignment_failed", expect.anything(), expect.anything());
     });
 
     it("does not identify an opted-out user or use their machine assignment", async () => {

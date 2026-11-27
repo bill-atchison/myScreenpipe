@@ -8,7 +8,6 @@ import React, { useEffect, useState, useRef, Suspense, useCallback } from "react
 import {
   TimerReset,
   Plus,
-  Brain,
   MonitorPlay,
   PanelLeftClose,
   PanelLeftOpen,
@@ -62,17 +61,17 @@ import { usePlatform } from "@/lib/hooks/use-platform";
 import { useIsFullscreen } from "@/lib/hooks/use-is-fullscreen";
 import { FeedbackSection } from "@/components/settings/feedback-section";
 import { PipeStoreView } from "@/components/pipe-store";
-import { BrainSection } from "@/components/settings/brain-section";
 import { ConnectionsSection } from "@/components/settings/connections-section";
 import { MeetingNotesSection } from "@/components/meeting-notes";
 import { StandaloneChat } from "@/components/standalone-chat";
+import { MemoryStatusNotice } from "@/components/memory-status-notice";
 import { ChatSidebar } from "@/components/chat-sidebar";
 import { ChatHistoryView } from "@/components/chat/chat-history-view";
 import { mountPiEventRouter } from "@/lib/stores/pi-event-router";
 import { mountPipeRunRecorder } from "@/lib/events/pipe-run-recorder";
 import { mountPipeWatchWriter } from "@/lib/events/pipe-watch-writer";
 import { useRecordingStorage } from "@/lib/hooks/use-recording-storage";
-import { RecordingStatus, type RecordingDevice } from "@/components/recording-status";
+import { RecordingStatus, type RecordingDevice, type RecordingAttention } from "@/components/recording-status";
 import { StarredTimeline } from "@/components/starred-sessions/starred-timeline";
 import Timeline from "@/components/rewind/timeline";
 import {
@@ -116,7 +115,6 @@ import {
 import { PlanExpirationNotice } from "@/components/plan-expiration-notice";
 import { getEnterpriseAccount, type AppUser } from "@/lib/app-entitlement";
 import { useTeamSummary } from "@/lib/hooks/use-team-summary";
-import { ONBOARDING_BRAIN_HANDOFF_EVENT } from "@/lib/live-views/onboarding-activation";
 import { ActivityLedger } from "@/components/activity-ledger";
 import { ShortcutKeycap } from "@/components/shortcut-keycap";
 import { ExperimentalShortcutGuide } from "@/components/shortcut-guide";
@@ -139,13 +137,14 @@ import { SidebarFooter } from "@/components/sidebar-footer";
 import { WorkflowsHelpDialog } from "@/components/workflows/workflows-help-dialog";
 import { navigationProductMode } from "@/lib/workflows/navigation";
 import { IntegratedWorkflows } from "@/components/workflows/integrated-workflows";
+import { EnterpriseProductCard } from "@/components/workflows/enterprise-product-card";
 import { useWorkflowsRolloutEnabled } from "@/lib/workflows/rollout";
 import { readProductMode, saveProductMode } from "@/lib/workflows/entry-preference";
 import { useGT } from "gt-react";
 import { useUiLocale as useLocale } from "@/lib/i18n/provider";
 
 
-type MainSection = "home" | "timeline" | "activity" | "brain" | "pipes" | "connections" | "meetings" | "help";
+type MainSection = "home" | "timeline" | "activity" | "pipes" | "connections" | "meetings" | "help";
 const TRIAL_ACTIVATION_ALLOWED_SECTIONS = new Set<MainSection>([
   "home",
   "timeline",
@@ -160,10 +159,8 @@ type ConnectionFocusRequest = {
 
 // All valid URL sections for the home page
 const ALL_SECTIONS = [
-  "home", "timeline", "activity", "pipes", "help", "brain", "connections", "meetings", "history",
+  "home", "timeline", "activity", "pipes", "help", "connections", "meetings", "history",
   "feedback", // backwards compat → maps to "help"
-  "memories", // backwards compat → maps to "brain"
-  "artifacts", // backwards compat → maps to "brain"
 ];
 
 // Settings sections that should redirect to /settings. Sourced from
@@ -222,8 +219,6 @@ function HomeContent() {
     history: "push",
     parse: (value) => {
       if (value === "feedback") return "help"; // backwards compat
-      if (value === "memories") return "brain"; // backwards compat — renamed to brain
-      if (value === "artifacts") return "brain"; // backwards compat — artifacts merged into brain
       // Settings sections redirect to /settings page
       if (isSettingsRoute(value)) return value; // handled by redirect effect below
       return ALL_SECTIONS.includes(value) ? value : "home";
@@ -331,7 +326,7 @@ function HomeContent() {
   // recovery and the first-run guide must never compete (#5407). The guide
   // isn't lost: `firstRunGuidePending` is React state, so it appears once
   // health recovers.
-  const { health, isServerDown } = useHealthCheck();
+  const { health, isServerDown, fetchHealth } = useHealthCheck();
   const captureUnhealthy =
     isServerDown || health?.status === "unhealthy" || health?.status === "error";
   const showFirstRunGuide = shouldShowFirstRunGuide({
@@ -1113,7 +1108,9 @@ function HomeContent() {
             <StarredTimeline showStrip />
             <div className="min-h-0 flex-1">
               <NativeTimeline
-                fallback={<Timeline embedded />}
+                fallback={
+                  <Timeline embedded onDismiss={() => { void setActiveSection("home"); }} />
+                }
                 showActivityReturn={activityReturnVisible}
               />
             </div>
@@ -1129,11 +1126,10 @@ function HomeContent() {
       case "activity":
         return (
           <ActivityLedger
+            recorderConnected={Boolean(health) && !isServerDown && health?.status !== "error" && health?.status !== "degraded"}
             onOpenArtifact={() => setActivityReturnVisible(true)}
           />
         );
-      case "brain":
-        return <BrainSection />;
       case "pipes":
         return <PipeStoreView />;
       case "connections":
@@ -1190,14 +1186,13 @@ function HomeContent() {
     meetings: { label: ui("Meetings"), icon: <CalendarClock className="h-3.5 w-3.5" /> },
     timeline: { label: ui("Timeline"), icon: <MonitorPlay className="h-3.5 w-3.5" /> },
     activity: { label: ui("Activity"), icon: <ListTree className="h-3.5 w-3.5" /> },
-    brain: { label: ui("Library"), icon: <Brain className="h-3.5 w-3.5" /> },
     pipes: { label: ui("Automations"), icon: <TimerReset className="h-3.5 w-3.5" /> },
     connections: { label: ui("Connections"), icon: <Plug className="h-3.5 w-3.5" /> },
   };
 
   const sidebarLayout = normalizeSidebarNavLayout(settings.sidebarNavLayout);
   const availableSidebarIds = (Object.keys(SIDEBAR_SECTION_DEFS) as SidebarNavId[])
-    .filter((id) => !isSectionHidden(id) && !(id === "brain" && isSectionHidden("memories")))
+    .filter((id) => !isSectionHidden(id))
     // Timeline can be turned off in Display settings — when it is, drop it from
     // the sidebar entirely (the "Timeline Disabled" placeholder was poor UX).
     .filter((id) => !(id === "timeline" && (settings.disableTimeline ?? false)));
@@ -1213,22 +1208,56 @@ function HomeContent() {
 
   // Chat and Workflows share the same recorder state, events and controls.
   const recordingStorage = useRecordingStorage(isCapturePaused);
+  let recordingAttention: RecordingAttention | undefined;
+  if (isServerDown) recordingAttention = "disconnected";
+  else if (!health || health.status === "error") recordingAttention = "connecting";
+  else if (health.status === "degraded") recordingAttention = "unavailable";
+  else if (health.vision_reason === "permission_denied") recordingAttention = "screen-permission";
+  else if (health.vision_reason === "capture_stalled") recordingAttention = "screen-stalled";
+  else if (health.capture_status?.status === "audio_stalled") recordingAttention = "audio-stalled";
+  const allCaptureDisabled = !!(settings.disableAudio && settings.disableVision);
+  const checkRecorder = async () => {
+    await Promise.all([fetchHealth(), refreshRecordingDevices()]);
+  };
+  const openScreenPermission = () => {
+    void commands.openPermissionSettings("screenRecording").catch(() =>
+      toast({ title: ui("Could not open System Settings"), variant: "destructive" })
+    );
+  };
+  const openRecordingSettings = () => openSettings("recording");
+  const openStorageSettings = () => openSettings("storage");
   const recordingStatusProps = {
+    attention: recordingAttention,
     storageWarning: recordingStorage.warning,
     storageChecking: recordingStorage.checking,
     storageError: recordingStorage.error,
     onRefreshStorage: recordingStorage.refresh,
-    onOpenStorageSettings: () => openSettings("storage"),
+    onOpenStorageSettings: openStorageSettings,
     devices: recordingDevices,
     onDevicesChange: setRecordingDevices,
     meetingActive: meetingState.active ?? false,
     onPauseRecording: pauseRecording,
     onResumeRecording: resumeRecording,
     isGloballyPaused: isCapturePaused,
-    onRefreshDevices: refreshRecordingDevices,
-    allCaptureDisabled: !!(settings.disableAudio && settings.disableVision),
-    onOpenRecordingSettings: () => openSettings("recording"),
+    onRefreshDevices: checkRecorder,
+    allCaptureDisabled,
+    onOpenScreenPermission: openScreenPermission,
+    onOpenRecordingSettings: openRecordingSettings,
   };
+  const captureFault = recordingAttention === "screen-permission" ||
+    recordingAttention === "screen-stalled" || recordingAttention === "audio-stalled";
+  const memoryNoticeState = recordingStorage.warning && !allCaptureDisabled
+    ? "low-storage"
+    : captureFault && (isCapturePaused || allCaptureDisabled) ? undefined : recordingAttention;
+  const memoryStatusNotice = !workflowsActive && isSettingsLoaded && !trialActivationLocked && (
+    <MemoryStatusNotice
+      state={memoryNoticeState}
+      onCheck={checkRecorder}
+      onOpenRecording={openRecordingSettings}
+      onOpenPermission={openScreenPermission}
+      onOpenStorage={openStorageSettings}
+    />
+  );
 
   const persistSidebarLayout = (next: ReturnType<typeof normalizeSidebarNavLayout>) => {
     void updateSettings({ sidebarNavLayout: next });
@@ -1312,9 +1341,6 @@ function HomeContent() {
       const mapped = section === "feedback" ? "help" : section;
       if (ALL_SECTIONS.includes(mapped)) {
         setActiveSection(mapped);
-        if (mapped === "brain") {
-          window.dispatchEvent(new Event(ONBOARDING_BRAIN_HANDOFF_EVENT));
-        }
       }
     }
   });
@@ -1324,8 +1350,7 @@ function HomeContent() {
     activeSection === "timeline" ||
     activeSection === "activity" ||
     activeSection === "meetings" ||
-    activeSection === "history" ||
-    activeSection === "brain";
+    activeSection === "history";
 
   const trialActivationContent = (() => {
     if (!trialActivationLocked || activeSection !== "home") return null;
@@ -1674,8 +1699,8 @@ function HomeContent() {
 
                 <UpdateBanner variant="sidebar" className="mb-2" />
 
-                {/* Remote surveys use this quiet, non-blocking slot when their
-                    signed payload selects surface=sidebar. */}
+                {/* Remote announcements and surveys use this non-blocking slot
+                    when their payload selects surface=sidebar. */}
                 <div id="announcement-sidebar-slot" />
               </div>
 
@@ -1721,11 +1746,13 @@ function HomeContent() {
                   chatShortcutsEnabled={!workflowsActive && activeSection === "home"}
                   sidebarCollapsed={sidebarCollapsed}
                   firstRunLearningEnabled={!workflowsActive && activeSection === "home"}
+                  statusNotice={activeSection === "home" ? memoryStatusNotice : undefined}
                 />
               </div>
             )}
 
             {/* Non-chat sections render on top when active. */}
+            {activeSection !== "home" && memoryStatusNotice}
             {activeSection !== "home" && (
               isFullHeight ? (
                 <div className="flex-1 min-h-0 overflow-hidden">
@@ -1761,9 +1788,12 @@ function HomeContent() {
           </div>
 
           {workflowsAvailable && (workflowsActive || workflowsVisited) && <div className={cn("flex-1 min-w-0 h-full", !workflowsActive && "hidden")}><IntegratedWorkflows active={workflowsActive} fullscreen={isFullscreen} onModeChange={changeMode} recordingStatus={<RecordingStatus {...recordingStatusProps} />}
-            navigationFooter={({ openKeyboardShortcuts }) => <SidebarFooter teamToken={settings.user?.token} teamEntry={teamEntry} onTeam={openTeam} onSettings={() => openSettings()}
-              onHelp={() => { void setActiveSection("help"); }} onKeyboardShortcuts={openKeyboardShortcuts}
-              hideHelp={isSectionHidden("help")} trialActivationLocked={trialActivationLocked} />} /></div>}
+            navigationFooter={({ openKeyboardShortcuts }) => <>
+              {!isManagedDeployment && <EnterpriseProductCard isTranslucent={isTranslucent} />}
+              <SidebarFooter isTranslucent={isTranslucent} teamToken={settings.user?.token} teamEntry={teamEntry} onTeam={openTeam} onSettings={() => openSettings()}
+                onHelp={() => { void setActiveSection("help"); }} onKeyboardShortcuts={openKeyboardShortcuts}
+                hideHelp={isSectionHidden("help")} trialActivationLocked={trialActivationLocked} />
+            </>} /></div>}
           <WorkflowsHelpDialog open={workflowsActive && (activeSection === "help" || activeSection === "feedback") && !isSectionHidden("help")}
             onOpenChange={open => { if (!open) void setActiveSection("home"); }} />
           {!workflowsActive && showFirstRunGuide && (

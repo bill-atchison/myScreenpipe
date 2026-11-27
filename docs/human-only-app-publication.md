@@ -6,14 +6,40 @@ The app release pipeline deliberately separates artifact preparation from public
 
 ## AI and automation may release artifacts
 
-`Release App` and `Release Enterprise` may build, sign, notarize, and upload immutable versioned objects. Their only R2 capability is the `screenpipe-release-artifact-uploader` service. That service accepts these key shapes:
+`Release App` may build, sign, notarize, and upload immutable versioned objects. Its only R2 capability is the `screenpipe-release-artifact-uploader` service. That service accepts these key shapes:
 
 - `releases/<version>/<target>/<artifact>`
 - `enterprise/releases/<version>/<target>/<artifact>`
 
 It has no route for updater pointers, enterprise publication state, GitHub tags, or GitHub releases. The service validates the version, target, filename, and scope before writing to R2.
 
-`Release App` builds consumer artifacts first, then dispatches `Release Enterprise` with the same validated commit and version. Before dispatch, it adds a pending `Enterprise artifacts` status to that release commit; enterprise completion changes it to success or failure. Consumer readiness remains independent, while a failed dispatch or missing/failed enterprise build cannot silently look complete. Dry runs use a separate status and preserve the no-upload setting. Manual `Release Enterprise` dispatch is retained for recovery, not as a separate step in a normal release.
+One `Release App` dispatch validates the commit and version, builds the frontend
+snapshot and links one executable per platform target. The default Screenpipe
+installer is uploaded to `releases/<version>/<target>/`. Legacy Enterprise
+packages reuse the linked executable and keep their installed package identity.
+The versioned `unified-installer.json` marker lets the dashboard distinguish the new layout
+from historical builds. Deploy the release-artifact-uploader change before
+the first non-dry run with that marker.
+
+The public download page and workspace download page use the same signed
+installer after stable publication. Workspace sign-in and deployment
+configuration select managed policy at runtime. Employees who also have a
+personal plan can choose **Use workspace on this device** in account settings.
+Organization policy and authorization still govern recording, ingestion, and
+automatic updates.
+
+Existing managed installations keep their legacy bundle identifiers,
+deployment packages, and updater URL. The stable manifest advertises the same
+release to the legacy updater once signed Enterprise-compatible artifacts exist.
+Workspace update policy still applies. Check sign-in, enrollment, local history,
+platform permissions, updater policy, and a fresh successful upload in Workspace
+→ Devices on a test device before rolling out to a fleet. Enterprise-only
+recovery inputs still apply to historical revisions.
+
+Test a signed dry run before uploading the first unified version. Verify an
+upgrade from the current standard app and a clean install with workspace
+sign-in on the same installer. Use the internal dashboard to inspect staged
+files. The unified artifacts are not offered by the legacy pre-release updater.
 
 ## Only a human may publish
 
@@ -26,7 +52,7 @@ Public publication includes any of the following:
 
 The human gate is the click. The authenticated releases control in the website admin UI is the only publication path: it requires an internal `releases:write` permission plus Clerk reverification, and it is the single action that writes updater pointers, creates the GitHub release, and dispatches the changelog. Before clicking, the human verifies the exact bump commit, required CI, all signed platform artifacts, and the intended channel.
 
-Automation cannot reach that path because the release workflows hold no publication credentials at all: `076735b17` removed them, leaving `Release App` and `Release Enterprise` with only the artifact-uploader service described above. Credential scoping, not tag protection, is what keeps publication human-only.
+Automation cannot reach that path because `Release App` holds only the artifact-uploader capability described above. Credential scoping, not tag protection, is what keeps publication human-only.
 
 GitHub ruleset `Human-only app publication tags` protects `app-v*` and `app-beta-v*` against creation, update, and deletion, and bypasses the repository `admin` role so the dashboard's own publish can create its tag. It is a guard against stray write-scoped tokens, not the human gate. Do not remove the bypass: doing so blocks the dashboard itself, which is exactly what silently stopped every GitHub release between `app-v2.5.176` and `2.6.0` while `latest.json` kept shipping. Environment `app-publication` requires Louis as reviewer, prevents self-review, and does not allow administrator bypass.
 

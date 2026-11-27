@@ -90,6 +90,7 @@ vi.mock("@tauri-apps/api/window", () => ({
 }));
 
 import { AppEntitlementGate } from "./app-entitlement-gate";
+import { normalizeAppUser } from "@/lib/app-entitlement";
 
 // Build timestamps relative to the real clock so freshness checks are stable
 // without fake timers.
@@ -166,6 +167,33 @@ describe("AppEntitlementGate", () => {
     vi.unstubAllEnvs();
   });
 
+  it("shows the branded loader until local settings are ready", () => {
+    mocks.state.isSettingsLoaded = false;
+
+    const { rerender } = render(
+      <AppEntitlementGate authenticationStatus="not_required">
+        {protectedApp}
+      </AppEntitlementGate>,
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("Starting Screenpipe…");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Turn what people know into what computers can scale",
+    );
+    expect(screen.queryByTestId("protected-app")).not.toBeInTheDocument();
+    expect(screen.queryByText(/checking local settings/i)).not.toBeInTheDocument();
+
+    mocks.state.isSettingsLoaded = true;
+    rerender(
+      <AppEntitlementGate authenticationStatus="not_required">
+        {protectedApp}
+      </AppEntitlementGate>,
+    );
+
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByTestId("protected-app")).toBeInTheDocument();
+  });
+
   it("starts the application without an account when authentication is not required", () => {
     render(
       <AppEntitlementGate authenticationStatus="not_required">
@@ -205,7 +233,7 @@ describe("AppEntitlementGate", () => {
 
     expect(screen.getByTestId("protected-app")).toBeInTheDocument();
     expect(
-      screen.queryByText(/enterprise app required/i),
+      screen.queryByText(/workspace access required/i),
     ).not.toBeInTheDocument();
   });
 
@@ -245,7 +273,7 @@ describe("AppEntitlementGate", () => {
       </AppEntitlementGate>,
     );
 
-    expect(screen.getByText(/enterprise app required/i)).toBeInTheDocument();
+    expect(screen.getByText(/workspace access required/i)).toBeInTheDocument();
     expect(screen.queryByTestId("protected-app")).not.toBeInTheDocument();
   });
 
@@ -269,7 +297,7 @@ describe("AppEntitlementGate", () => {
 
     expect(screen.getByTestId("protected-app")).toBeInTheDocument();
     expect(
-      screen.queryByText(/enterprise app required/i),
+      screen.queryByText(/workspace access required/i),
     ).not.toBeInTheDocument();
 
     mocks.enterprise = {
@@ -287,7 +315,7 @@ describe("AppEntitlementGate", () => {
 
     expect(screen.getByTestId("protected-app")).toBeInTheDocument();
     expect(
-      screen.queryByText(/enterprise app required/i),
+      screen.queryByText(/workspace access required/i),
     ).not.toBeInTheDocument();
   });
 
@@ -298,7 +326,11 @@ describe("AppEntitlementGate", () => {
       <AppEntitlementGate>{protectedApp}</AppEntitlementGate>,
     );
 
-    expect(screen.getByText(/checking access/i)).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Starting Screenpipe…");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Turn what people know into what computers can scale",
+    );
+    expect(screen.queryByText(/checking access/i)).not.toBeInTheDocument();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
 
@@ -346,7 +378,11 @@ describe("AppEntitlementGate", () => {
       <AppEntitlementGate>{protectedApp}</AppEntitlementGate>,
     );
 
-    expect(screen.getByText(/checking enterprise access/i)).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Starting Screenpipe…");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Turn what people know into what computers can scale",
+    );
+    expect(screen.queryByText(/checking enterprise access/i)).not.toBeInTheDocument();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
     expect(mocks.capture).not.toHaveBeenCalledWith(
@@ -399,6 +435,7 @@ describe("AppEntitlementGate", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
 
+    mocks.state.user = baseUser();
     mocks.enterprise.authenticationState = "authenticated";
     mocks.enterprise.isManagedAuthenticated = true;
     rerender(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
@@ -444,7 +481,7 @@ describe("AppEntitlementGate", () => {
     },
   );
 
-  it("offers account and enterprise-key routes in the fallback gate", () => {
+  it("offers browser sign-in in the managed fallback gate", () => {
     mocks.enterprise = {
       isManagedDeployment: true,
       isManagedDeploymentResolved: true,
@@ -455,11 +492,10 @@ describe("AppEntitlementGate", () => {
 
     render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
 
-    fireEvent.click(screen.getByRole("button", { name: /use enterprise key/i }));
-    expect(mocks.selectAuthenticationMethod).toHaveBeenCalledWith("license_key");
+    expect(screen.queryByRole("button", { name: /use enterprise key/i })).not.toBeInTheDocument();
 
     fireEvent.click(
-      screen.getByRole("button", { name: /sign in with enterprise account/i })
+      screen.getByRole("button", { name: /^sign in$/i })
     );
     expect(mocks.selectAuthenticationMethod).toHaveBeenCalledWith("account");
     expect(mocks.openLoginWindow).toHaveBeenCalled();
@@ -487,8 +523,7 @@ describe("AppEntitlementGate", () => {
     expect(mocks.openLoginWindow).toHaveBeenCalled();
   });
 
-  it("does not force enterprise sign-in after key authentication", () => {
-    vi.stubEnv("TAURI_ENV_DEBUG", "true");
+  it("locks the app after account logout even when the enterprise key is still valid", () => {
     mocks.enterprise = {
       isManagedDeployment: true,
       isManagedDeploymentResolved: true,
@@ -496,12 +531,23 @@ describe("AppEntitlementGate", () => {
       authenticationError: null,
       isManagedAuthenticated: true,
     };
-    mocks.state.user = null;
+    mocks.state.user = baseUser();
 
-    render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
-
+    const { rerender } = render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
     expect(screen.getByTestId("protected-app")).toBeInTheDocument();
+
+    mocks.state.user = null;
+    rerender(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
+    expect(screen.queryByTestId("protected-app")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Sign in required" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Use enterprise key" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    expect(mocks.openLoginWindow).toHaveBeenCalledWith(null, null);
     expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
+
+    mocks.state.user = baseUser();
+    rerender(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
+    expect(screen.getByTestId("protected-app")).toBeInTheDocument();
   });
 
   it("opens the app for a signed-in free account", () => {
@@ -544,6 +590,32 @@ describe("AppEntitlementGate", () => {
 
     expect(screen.getByTestId("protected-app")).toBeInTheDocument();
     expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
+  });
+
+  it("opens automatically after verifying access with a device clock that is behind", async () => {
+    const rawUser = baseUser({
+      app_entitled: true,
+      subscription_plan: "standard",
+      entitlement: {
+        active: true,
+        plan: "standard",
+        source: "subscription",
+        status: "trialing",
+        checked_at: new Date(Date.now() + 321_000).toISOString(),
+        current_period_end: daysAhead(7),
+        features: { app: true },
+      },
+    });
+    mocks.state.user = rawUser;
+    mocks.loadUser.mockImplementationOnce(async (token) => {
+      mocks.state.user = normalizeAppUser(rawUser, token, Date.now());
+    });
+    const gate = () => <AppEntitlementGate>{protectedApp}</AppEntitlementGate>;
+    const { rerender } = render(gate());
+    expect(screen.queryByTestId("protected-app")).not.toBeInTheDocument();
+    await waitFor(() => expect(mocks.loadUser).toHaveBeenCalledWith("tok", true));
+    rerender(gate());
+    expect(screen.getByTestId("protected-app")).toBeInTheDocument();
   });
 
   it("gates and stops when paid freshness expires without an API response", async () => {
@@ -834,6 +906,13 @@ describe("AppEntitlementGate", () => {
     }
   });
 
+  it("lets a signed-out user explicitly choose another browser account", async () => {
+    mocks.state.user = null;
+    render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
+    fireEvent.click(await screen.findByRole("button", { name: "Use a different account" }));
+    expect(mocks.openLoginWindow).toHaveBeenCalledWith(true, null);
+  });
+
   it("uses enterprise authentication instead of consumer subscription gating", () => {
     mocks.enterprise = {
       isManagedDeployment: true,
@@ -870,7 +949,7 @@ describe("AppEntitlementGate", () => {
     }
   });
 
-  it("routes enterprise accounts away from the consumer app", async () => {
+  it("retries workspace verification from the installed app", async () => {
     mocks.state.user = baseUser({
       app_entitled: true,
       cloud_subscribed: true,
@@ -891,19 +970,13 @@ describe("AppEntitlementGate", () => {
 
     render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
 
-    expect(screen.getByText(/enterprise app required/i)).toBeInTheDocument();
+    expect(screen.getByText(/workspace access required/i)).toBeInTheDocument();
     expect(screen.getByText(/belongs to Bungalow/i)).toBeInTheDocument();
     expect(screen.queryByTestId("protected-app")).not.toBeInTheDocument();
 
-    fireEvent.click(
-      screen.getByRole("button", { name: /download enterprise app/i }),
-    );
-
-    const downloadUrl = String(mocks.open.mock.calls.at(-1)?.[0] ?? "");
-    expect(downloadUrl).toContain("/api/download");
-    expect(downloadUrl).toContain("token=verified");
-    expect(downloadUrl).toContain("channel=enterprise");
-    expect(downloadUrl).toContain("platform=windows");
+    fireEvent.click(screen.getByRole("button", { name: /refresh workspace access/i }));
+    await waitFor(() => expect(mocks.loadUser).toHaveBeenCalled());
+    expect(mocks.open).not.toHaveBeenCalled();
   });
 
   it("clears app auth and opens a fresh browser session when switching accounts", async () => {
@@ -939,7 +1012,7 @@ describe("AppEntitlementGate", () => {
     expect(mocks.openLoginWindow).toHaveBeenCalledWith(true, null);
   });
 
-  it("does not route enterprise members away when they also have a consumer app subscription", () => {
+  it("waits for workspace policy when the member also has a personal subscription", () => {
     mocks.state.user = baseUser({
       app_entitled: true,
       cloud_subscribed: true,
@@ -961,10 +1034,9 @@ describe("AppEntitlementGate", () => {
     render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
 
     expect(
-      screen.queryByText(/enterprise app required/i),
-    ).not.toBeInTheDocument();
-    expect(screen.getByTestId("protected-app")).toBeInTheDocument();
-    expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
+      screen.queryByText(/workspace access required/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("protected-app")).not.toBeInTheDocument();
   });
 
   it("routes restricted enterprise members away even with a consumer subscription", () => {
@@ -989,12 +1061,12 @@ describe("AppEntitlementGate", () => {
 
     render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
 
-    expect(screen.getByText(/enterprise app required/i)).toBeInTheDocument();
+    expect(screen.getByText(/workspace access required/i)).toBeInTheDocument();
     expect(screen.queryByTestId("protected-app")).not.toBeInTheDocument();
   });
 
   it.each(["pro_max", "pro_ultra"] as const)(
-    "does not route an enterprise workspace admin with a %s consumer plan away",
+    "waits for workspace authorization even with a %s personal plan",
     (plan) => {
       mocks.state.user = baseUser({
         app_entitled: true,
@@ -1017,10 +1089,9 @@ describe("AppEntitlementGate", () => {
       render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
 
       expect(
-        screen.queryByText(/enterprise app required/i),
-      ).not.toBeInTheDocument();
-      expect(screen.getByTestId("protected-app")).toBeInTheDocument();
-      expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
+        screen.queryByText(/workspace access required/i),
+      ).toBeInTheDocument();
+      expect(screen.queryByTestId("protected-app")).not.toBeInTheDocument();
     },
   );
 
@@ -1047,7 +1118,7 @@ describe("AppEntitlementGate", () => {
     render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
 
     expect(
-      screen.queryByText(/enterprise app required/i),
+      screen.queryByText(/workspace access required/i),
     ).not.toBeInTheDocument();
     expect(screen.getByTestId("protected-app")).toBeInTheDocument();
   });
@@ -1066,5 +1137,160 @@ describe("AppEntitlementGate", () => {
       expect(mocks.spawnScreenpipe).toHaveBeenCalledWith(null),
     );
     expect(screen.getByTestId("protected-app")).toBeInTheDocument();
+  });
+
+  it("prompts free users whose corporate domain matches a paid org to request a seat and calls /api/team/seat-request", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            status: "pending",
+            already_requested: false,
+            org_name: "Acme Corp",
+            domain: "acme.io",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+
+    mocks.state.user = baseUser({
+      email: "shadow@acme.io",
+      org_seat_available: {
+        team_id: "team_acme",
+        license_id: null,
+        org_name: "Acme Corp",
+        domain: "acme.io",
+        request_status: "none",
+        requested_at: null,
+      },
+    });
+
+    render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
+
+    expect(
+      screen.getByText(/your team is already on screenpipe/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("protected-app")).not.toBeInTheDocument();
+    await waitFor(() => expect(mocks.stopScreenpipe).toHaveBeenCalled());
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /request a seat from your admin/i }),
+    );
+
+    await waitFor(() =>
+      expect(screen.getByText(/seat request sent/i)).toBeInTheDocument(),
+    );
+    expect(fetchSpy).toHaveBeenCalledWith(
+      expect.stringContaining("/api/team/seat-request"),
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ Authorization: "Bearer tok" }),
+      }),
+    );
+    fetchSpy.mockRestore();
+  });
+
+  it("does not show the shadow-seat prompt for a verified paid user", () => {
+    mocks.state.user = baseUser({
+      email: "paid@acme.io",
+      cloud_subscribed: true,
+      app_entitled: true,
+      subscription_plan: "pro",
+      entitlement: {
+        active: true,
+        plan: "pro",
+        source: "subscription",
+        checked_at: minsAgo(1),
+        features: { app: true, cloud: true },
+      },
+      org_seat_available: {
+        team_id: "team_acme",
+        license_id: null,
+        org_name: "Acme Corp",
+        domain: "acme.io",
+        request_status: "none",
+        requested_at: null,
+      },
+    });
+
+    render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
+
+    expect(
+      screen.queryByText(/your team is already on screenpipe/i),
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId("protected-app")).toBeInTheDocument();
+    expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
+  });
+
+  it("pauses capture when device_limit_status reports device_limit_exceeded and lets user reclaim this device", async () => {
+    mocks.state.user = baseUser({
+      subscription_plan: "standard",
+      app_entitled: true,
+      entitlement: {
+        active: true,
+        plan: "standard",
+        source: "subscription",
+        checked_at: minsAgo(1),
+        features: { app: true, cloud: false },
+      },
+      device_limit_status: {
+        allowed: false,
+        reason: "device_limit_exceeded",
+        limit: 2,
+        active_count: 2,
+      },
+    });
+
+    const { rerender } = render(
+      <AppEntitlementGate>{protectedApp}</AppEntitlementGate>,
+    );
+
+    expect(screen.getByText(/device limit reached/i)).toBeInTheDocument();
+    expect(screen.getByText(/2 active devices/i)).toBeInTheDocument();
+    expect(screen.queryByTestId("protected-app")).not.toBeInTheDocument();
+    await waitFor(() => expect(mocks.stopScreenpipe).toHaveBeenCalled());
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /use this device instead/i }),
+    );
+    await waitFor(() =>
+      expect(mocks.loadUser).toHaveBeenCalledWith("tok", false, {
+        claimDevice: true,
+      }),
+    );
+
+    // Once server confirms this device is active, gate clears and resumes recording
+    mocks.state.user = {
+      ...mocks.state.user,
+      device_limit_status: {
+        allowed: true,
+        reason: null,
+        limit: 2,
+        active_count: 2,
+      },
+    };
+    rerender(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
+    await waitFor(() =>
+      expect(mocks.spawnScreenpipe).toHaveBeenCalledWith(null),
+    );
+    expect(screen.getByTestId("protected-app")).toBeInTheDocument();
+  });
+
+  it("does not pause capture when device_limit_status is allowed or absent", () => {
+    mocks.state.user = baseUser({
+      device_limit_status: {
+        allowed: true,
+        reason: null,
+        limit: 1,
+        active_count: 1,
+      },
+    });
+
+    render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
+
+    expect(screen.queryByText(/device limit reached/i)).not.toBeInTheDocument();
+    expect(screen.getByTestId("protected-app")).toBeInTheDocument();
+    expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
   });
 });

@@ -21,8 +21,8 @@ use screenpipe_a11y::tree::TreeWalkerConfig;
 use screenpipe_a11y::ActivityFeed;
 use screenpipe_capture::ocr_gate::OcrGate;
 use screenpipe_capture::paired_capture::{
-    detach_tree_from_pixels, paired_capture, paired_capture_deferred, CaptureContext,
-    PairedCaptureResult,
+    detach_tree_from_pixels, paired_capture_with_optional_db, OptionalDbCaptureContext,
+    PairedCaptureOutcome, PairedCaptureResult,
 };
 use screenpipe_capture::{TreeWalkerWorker, TreeWalkerWorkerOutcome};
 use screenpipe_core::window_pattern::{self, WindowPattern};
@@ -30,8 +30,8 @@ use screenpipe_db::DatabaseManager;
 use screenpipe_screen::capture_screenshot_by_window::WindowFilters;
 use screenpipe_screen::frame_comparison::{FrameComparer, FrameComparisonConfig};
 use screenpipe_screen::monitor::{list_monitors, SafeMonitor};
+use screenpipe_screen::screenshot_privacy::capture_monitor_frame_for_snapshot;
 use screenpipe_screen::snapshot_writer::SnapshotWriter;
-use screenpipe_screen::utils::capture_monitor_image_with_freshness;
 use std::collections::HashMap;
 #[cfg(debug_assertions)]
 use std::sync::atomic::AtomicU8;
@@ -311,7 +311,7 @@ async fn wait_for_warm_focus_or_timeout(
 /// Groups parameters that don't change between captures on the same monitor,
 /// keeping `do_capture`'s argument list manageable.
 pub(crate) struct CaptureParams<'a> {
-    pub db: &'a DatabaseManager,
+    pub db: Option<&'a DatabaseManager>,
     pub monitor: &'a SafeMonitor,
     pub monitor_id: u32,
     pub device_name: &'a str,
@@ -319,9 +319,11 @@ pub(crate) struct CaptureParams<'a> {
     pub tree_walker_config: &'a TreeWalkerConfig,
     pub tree_walker: &'a TreeWalkerWorker,
     pub window_filters: WindowFilters,
+    ledger_window_filters: WindowFilters,
     pub ignored_patterns: Vec<WindowPattern>,
     pub use_pii_removal: bool,
     pub pause_on_drm_content: bool,
+    pub focused_window_screenshots: bool,
     pub languages: &'a [screenpipe_core::Language],
     /// Opt-in background semantic parser. None preserves historical capture.
     pub semantic_tx: Option<&'a SemanticProjectionSender>,
@@ -579,6 +581,8 @@ pub struct EventDrivenCaptureConfig {
     /// When true, visual checks, full screenshot capture, JPEG writes, and OCR
     /// fallback are skipped.
     pub disable_screenshots: bool,
+    pub focused_window_screenshots: bool,
+    pub streaming_mode: bool,
     /// User-pinned guaranteed-capture floor (ms). When `Some`, this is an
     /// explicit "always capture at least every N ms" choice and it must
     /// survive PowerProfile transitions — a battery-saver switch (whose
@@ -600,6 +604,8 @@ impl Default for EventDrivenCaptureConfig {
             visual_check_interval_ms: 3_000, // check every 3 seconds
             visual_change_threshold: 0.05,   // ~5% difference triggers capture
             disable_screenshots: false,
+            focused_window_screenshots: false,
+            streaming_mode: false,
             idle_capture_interval_override_ms: None, // follow PowerProfile unless pinned
         }
     }
@@ -1012,7 +1018,7 @@ fn record_capture_skip(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn event_driven_capture_loop(
-    db: Arc<DatabaseManager>,
+    db: Option<Arc<DatabaseManager>>,
     monitor: Arc<SafeMonitor>,
     monitor_id: u32,
     device_name: String,
@@ -1037,20 +1043,34 @@ pub(crate) async fn event_driven_capture_loop(
     high_fps_controller: Option<Arc<crate::high_fps_controller::HighFpsController>>,
     semantic_tx: Option<SemanticProjectionSender>,
     recording_detail: Arc<crate::recording_detail::RecordingDetailController>,
+    stream_endpoint: Option<Arc<crate::recording_stream::StreamEndpoint>>,
 ) -> Result<()> {
     info!(
         "event-driven capture started for monitor {} (device: {})",
         monitor_id, device_name
     );
 
+    // The producer outlives individual events, but never its monitor's task.
+    // This also runs on cancellation, early return, and task panic.
+    #[cfg(target_os = "macos")]
+    let _screenshot_source = screenpipe_screen::screenshot_privacy::own_cached_source(monitor_id);
+
     let screenshots_disabled_by_config = config.disable_screenshots;
-    let mut screenshot_disabled = screenshots_disabled_by_config;
+    let focused_window_screenshots = config.focused_window_screenshots;
+    let streaming_requested = config.streaming_mode;
+    let initially_power_pixel_paused = power_profile_rx
+        .as_ref()
+        .is_some_and(|rx| rx.borrow().screenshot_disabled);
+    let mut screenshot_disabled = screenshots_disabled_by_config || initially_power_pixel_paused;
     // Publish the effective state so /health can name an intentional pixel
     // pause instead of blaming Screen Recording permission for it (#5808).
     record_screenshot_capture_state(
         &vision_metrics,
         &monitor_liveness,
-        screenpipe_screen::ScreenshotCaptureState::resolve(screenshots_disabled_by_config, false),
+        screenpipe_screen::ScreenshotCaptureState::resolve(
+            screenshots_disabled_by_config,
+            initially_power_pixel_paused,
+        ),
     );
     let mut visual_check_enabled = config.visual_check_interval_ms > 0 && !screenshot_disabled;
     let mut visual_check_interval = Duration::from_millis(config.visual_check_interval_ms);
@@ -1133,9 +1153,9 @@ pub(crate) async fn event_driven_capture_loop(
     // Track content hash for dedup across captures
     let mut last_content_hash: Option<i64> = None;
     let mut last_screenshot_focus_pid: Option<i32> = None;
-    // Last frame_id that was successfully written to the DB. Used to link
-    // events to a frame even when content-dedup skips the capture — the
-    // screen looks the same, so reusing the last frame is semantically correct.
+    // Last confirmed focused frame available to anchor UI events when a
+    // capture is deduped or debounced. Screenshot-only captures clear this
+    // reference so their pixels cannot inherit focused-event text.
     let mut last_frame_id: Option<i64> = None;
     // Track last successful DB write time — dedup is bypassed after 30s
     // to guarantee the timeline always has periodic entries
@@ -1163,38 +1183,62 @@ pub(crate) async fn event_driven_capture_loop(
     let tree_walker =
         TreeWalkerWorker::spawn(format!("monitor-{monitor_id}"), tree_walker_config.clone())?;
 
+    let window_filters = WindowFilters::with_url_rules(
+        &tree_walker_config.ignored_windows,
+        &tree_walker_config.included_windows,
+        &tree_walker_config.ignored_urls,
+        &tree_walker_config.included_urls,
+    );
+    let ledger_window_filters = ledger_window_filters(
+        &window_filters,
+        focused_window_screenshots,
+        pause_on_drm_content,
+    );
     let capture_params = CaptureParams {
-        db: &db,
+        db: db.as_deref(),
         monitor: &monitor,
         monitor_id,
         device_name: &device_name,
         snapshot_writer: &snapshot_writer,
         tree_walker_config: &tree_walker_config,
         tree_walker: &tree_walker,
-        window_filters: WindowFilters::with_url_rules(
-            &tree_walker_config.ignored_windows,
-            &tree_walker_config.included_windows,
-            &tree_walker_config.ignored_urls,
-            &tree_walker_config.included_urls,
+        window_filters: window_filters.with_streaming_mode(
+            streaming_requested && !focused_window_screenshots && !pause_on_drm_content,
         ),
+        ledger_window_filters,
         ignored_patterns: WindowPattern::parse_list(&tree_walker_config.ignored_windows),
         use_pii_removal,
         pause_on_drm_content,
+        focused_window_screenshots,
         languages: &languages,
         semantic_tx: semantic_tx.as_ref(),
     };
+
+    if streaming_requested && !capture_params.window_filters.streaming_mode() {
+        tracing::info!(
+            monitor_id,
+            focused_window_screenshots,
+            pause_on_drm_content,
+            screenshot_outcome = "standard_privacy_path",
+            "streaming mode constrained by platform support or strict capture policy"
+        );
+    }
 
     // Capture immediately on startup so the timeline has a frame right away.
     // Also seeds the frame comparer so subsequent visual-change checks work.
     // Skip if screen is locked — avoids storing black frames from sleep/lock.
     // Pre-capture DRM gate: skip if DRM content is focused (AX-only, no SCK).
     // Skip if outside work-hours schedule.
+    // Let the monitor settle before checking gates so a pause that starts
+    // during startup takes effect before the first capture.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     if !crate::sleep_monitor::screen_is_locked()
+        && !power_profile_rx
+            .as_ref()
+            .is_some_and(|rx| rx.borrow().capture_paused)
         && !crate::drm_detector::pre_capture_drm_check(pause_on_drm_content, None)
         && !crate::schedule_monitor::schedule_paused()
     {
-        // Small delay to let the monitor settle after startup
-        tokio::time::sleep(Duration::from_millis(500)).await;
         // Let the capture proceed immediately after the settle delay.
         state.last_capture = Instant::now()
             .checked_sub(Duration::from_millis(500))
@@ -1212,10 +1256,12 @@ pub(crate) async fn event_driven_capture_loop(
                 None, // first capture — no elements ref
                 &mut walk_budget,
                 &mut ocr_gate,
-                screenshot_disabled,
+                screenshots_disabled_by_config
+                    || power_profile_rx
+                        .as_ref()
+                        .is_some_and(|rx| rx.borrow().screenshot_disabled),
                 false, // hd not active at startup (Manual is dedup-exempt anyway)
                 false, // not in a meeting at startup
-                true,  // focus unknown at startup — controller defaults to Active
                 &mut last_screenshot_focus_pid,
                 true, // startup capture: never relabel with VM guest context
             ),
@@ -1224,12 +1270,18 @@ pub(crate) async fn event_driven_capture_loop(
         {
             Ok(Ok(output)) => {
                 state.mark_captured();
-                if let Some(ref mut comparer) = frame_comparer {
-                    let _ = comparer.compare(&output.image);
+                if capture_can_seed_visual_comparer(
+                    &capture_params.window_filters,
+                    capture_params.focused_window_screenshots,
+                ) {
+                    if let Some(ref mut comparer) = frame_comparer {
+                        let _ = comparer.compare(&output.image);
+                    }
                 }
-                if let Some(ref result) = output.result {
+                if let Some(PairedCaptureOutcome::Indexed(ref result)) = output.result {
                     last_content_hash = result.content_hash;
-                    last_frame_id = Some(result.frame_id);
+                    // Only confirmed focused frames may anchor UI-event text.
+                    last_frame_id = result.focused.then_some(result.frame_id);
                     last_db_write = Instant::now();
                     // Update elements cache for this device (first frame = anchor)
                     if let Some(hash) = result.content_hash {
@@ -1248,6 +1300,13 @@ pub(crate) async fn event_driven_capture_loop(
                     info!(
                         "startup capture for monitor {}: frame_id={}, dur={}ms",
                         monitor_id, result.frame_id, result.duration_ms
+                    );
+                } else if let Some(PairedCaptureOutcome::Raw { duration_ms }) = output.result {
+                    last_db_write = Instant::now();
+                    record_persisted_capture(
+                        &vision_metrics,
+                        &monitor_liveness,
+                        Duration::from_millis(duration_ms),
                     );
                 } else if let Some(kind) = output.corrupt {
                     // Frame rejected as corrupt (black / green band) — distinct
@@ -1277,7 +1336,7 @@ pub(crate) async fn event_driven_capture_loop(
         }
     } else {
         info!(
-            "screen is locked on startup, skipping initial capture for monitor {}",
+            "capture is paused on startup, skipping initial capture for monitor {}",
             monitor_id
         );
     }
@@ -1315,6 +1374,59 @@ pub(crate) async fn event_driven_capture_loop(
     } else {
         false
     };
+
+    // Consume the existing redacted/resized native cache at acquisition cadence,
+    // independently of screenshot persistence, metadata resolution, and OCR.
+    let _recording_stream = stream_endpoint
+        .filter(|_| {
+            capture_params.window_filters.streaming_mode() && !screenshots_disabled_by_config
+        })
+        .map(|endpoint| {
+            let power = power_profile_rx.clone();
+            let stop = stop_signal.clone();
+            let focus = focus_controller.clone();
+            let focus_monitor = monitor.clone();
+            let paused = Arc::new(move || {
+                stop.load(Ordering::Relaxed)
+                    || crate::sleep_monitor::screen_is_locked()
+                    || crate::drm_detector::drm_content_paused()
+                    || crate::schedule_monitor::schedule_paused()
+                    || !matches!(
+                        focus.state_for_monitor(&focus_monitor),
+                        crate::focus_aware_controller::CaptureState::Active
+                    )
+                    || power.as_ref().is_some_and(|rx| {
+                        let profile = rx.borrow();
+                        profile.capture_paused || profile.screenshot_disabled
+                    })
+            });
+            let worker_paused = paused.clone();
+            let monitor = monitor.clone();
+            let filters = capture_params.window_filters.clone();
+            let sources = exclusion_sources(&tree_walker_config);
+            let writer = snapshot_writer.clone();
+            tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                let sender = crate::recording_stream::RecordingStream::start(endpoint, move || {
+                    worker_paused()
+                });
+                sender
+                    .capture_at_rate(
+                        &*paused,
+                        screenpipe_screen::screenshot_rate::current,
+                        || {
+                            capture_monitor_frame_for_snapshot(
+                                &monitor,
+                                &filters,
+                                sources,
+                                &[],
+                                false,
+                                writer.max_width(),
+                            )
+                        },
+                    )
+                    .await;
+            }))
+        });
 
     loop {
         if stop_signal.load(Ordering::Relaxed) {
@@ -1448,6 +1560,8 @@ pub(crate) async fn event_driven_capture_loop(
             was_cold = is_cold;
             let accessibility_is_active = matches!(capture_state, CaptureState::Active);
             if should_suspend_on_focus_away(accessibility_was_active, accessibility_is_active) {
+                #[cfg(target_os = "macos")]
+                screenpipe_screen::stream_invalidation::release_screenshot_stream(monitor_id);
                 if let Err(error) = tree_walker
                     .suspend_with_timeout(Duration::from_millis(250))
                     .await
@@ -1496,8 +1610,16 @@ pub(crate) async fn event_driven_capture_loop(
                     // soon-to-be-excluded transient windows.
                     // Bounded: an unbounded await here froze the whole loop
                     // when ScreenCaptureKit wedged (see VISUAL_PROBE_TIMEOUT).
-                    let snap =
-                        bounded_visual_probe(&monitor, &cached_excluded_ids, monitor_id).await;
+                    let snap = bounded_visual_probe(
+                        &monitor,
+                        &cached_excluded_ids,
+                        monitor_id,
+                        #[cfg(target_os = "windows")]
+                        &capture_params.window_filters,
+                        #[cfg(target_os = "windows")]
+                        exclusion_sources(capture_params.tree_walker_config),
+                    )
+                    .await;
                     match snap {
                         Ok(None) => {
                             // Probe timed out — treat like a failed check and
@@ -1939,7 +2061,17 @@ pub(crate) async fn event_driven_capture_loop(
                     &monitor_liveness,
                     screenpipe_screen::CaptureLoopStage::VisualProbe,
                 );
-                match bounded_visual_probe(&monitor, &cached_excluded_ids, monitor_id).await {
+                match bounded_visual_probe(
+                    &monitor,
+                    &cached_excluded_ids,
+                    monitor_id,
+                    #[cfg(target_os = "windows")]
+                    &capture_params.window_filters,
+                    #[cfg(target_os = "windows")]
+                    exclusion_sources(capture_params.tree_walker_config),
+                )
+                .await
+                {
                     Ok(Some((image, _dur))) => {
                         let diff = comparer.compare(&image);
                         if diff > visual_change_threshold {
@@ -2112,10 +2244,6 @@ pub(crate) async fn event_driven_capture_loop(
                         screenshot_disabled,
                         hd_active,
                         in_meeting,
-                        // AX pairing requires confirmed focus ownership.
-                        // CaptureState::Active is broader: it also covers
-                        // hysteresis and unknown/stale focus fallbacks.
-                        focus_controller.hosts_focus_for_monitor(&monitor),
                         &mut last_screenshot_focus_pid,
                         false,
                     ),
@@ -2139,11 +2267,17 @@ pub(crate) async fn event_driven_capture_loop(
                             consecutive_capture_errors = 0;
                         }
 
-                        // Feed the captured frame to comparer so we don't
-                        // re-trigger on the same visual state (reuses capture
-                        // image — no extra screenshot needed)
-                        if let Some(ref mut comparer) = frame_comparer {
-                            let _ = comparer.compare(&output.image);
+                        // The visual probe observes the display stream. A
+                        // redacted capture is a different image of a static
+                        // desktop; seeding it here would retrigger capture on
+                        // every probe. Let probes maintain their own reference.
+                        if capture_can_seed_visual_comparer(
+                            &capture_params.window_filters,
+                            capture_params.focused_window_screenshots,
+                        ) {
+                            if let Some(ref mut comparer) = frame_comparer {
+                                let _ = comparer.compare(&output.image);
+                            }
                         }
 
                         // Frozen-stream detection: a live persistent stream
@@ -2167,13 +2301,16 @@ pub(crate) async fn event_driven_capture_loop(
                             monitor.release_capture_stream();
                         }
 
-                        if let Some(ref result) = output.result {
+                        if let Some(PairedCaptureOutcome::Indexed(ref result)) = output.result {
                             if focus_controller.hosts_focus_for_monitor(&monitor) {
                                 recording_detail.observe_capture(capture_started.elapsed());
                             }
                             // Full capture — update hash, metrics, cache
                             last_content_hash = result.content_hash;
-                            last_frame_id = Some(result.frame_id);
+                            // Clear the event anchor when ownership is lost so
+                            // debounce/dedup paths cannot attach event text to a
+                            // screenshot-only background frame.
+                            last_frame_id = result.focused.then_some(result.frame_id);
                             last_db_write = Instant::now();
 
                             // Update elements cache: only when we inserted new elements
@@ -2216,7 +2353,7 @@ pub(crate) async fn event_driven_capture_loop(
                             // correlation ids attached — internal-only
                             // triggers (Idle, VisualChange, startup Manual)
                             // have nothing to pair.
-                            if !correlation_ids.is_empty() {
+                            if result.focused && !correlation_ids.is_empty() {
                                 if let Some(ref linker) = linker_tx {
                                     let _ = linker.try_send(
                                         crate::frame_linker_actor::LinkerMessage::FrameCaptured(
@@ -2239,6 +2376,16 @@ pub(crate) async fn event_driven_capture_loop(
                                 result.duration_ms,
                                 output.elements_deduped,
                                 monitor_id
+                            );
+                        } else if let Some(PairedCaptureOutcome::Raw { duration_ms }) =
+                            output.result
+                        {
+                            last_db_write = Instant::now();
+                            correlation_ids.clear();
+                            record_persisted_capture(
+                                &vision_metrics,
+                                &monitor_liveness,
+                                Duration::from_millis(duration_ms),
                             );
                         } else {
                             // Capture skipped — content dedup, window filter, or
@@ -2285,7 +2432,8 @@ pub(crate) async fn event_driven_capture_loop(
                                         ),
                                     );
                                 } else {
-                                    // No frame ever captured yet — just drop the ids.
+                                    // No focused anchor here; another monitor may
+                                    // still match these shared correlation IDs.
                                     correlation_ids.clear();
                                 }
                             }
@@ -2378,8 +2526,8 @@ pub(crate) async fn event_driven_capture_loop(
                 );
                 // Debounce within min_capture_interval_ms. The events
                 // belong to the previous frame visually (screen is the
-                // same), so link them to `last_frame_id` if we have one;
-                // otherwise tell the linker to release them.
+                // same), so link them to the last focused frame if available.
+                // Without one, leave shared IDs for the owning monitor.
                 if !correlation_ids.is_empty() {
                     if let (Some(ref linker), Some(fid)) = (&linker_tx, last_frame_id) {
                         let _ = linker.try_send(
@@ -2391,11 +2539,7 @@ pub(crate) async fn event_driven_capture_loop(
                             ),
                         );
                     } else {
-                        report_triggers_dropped(
-                            linker_tx.as_ref(),
-                            std::mem::take(&mut correlation_ids),
-                            crate::frame_linker::DropReason::Other,
-                        );
+                        correlation_ids.clear();
                     }
                 }
             }
@@ -2466,7 +2610,7 @@ async fn push_to_hot_cache(
 /// Result of do_capture: paired capture result + the screenshot image for comparer reuse.
 struct CaptureOutput {
     /// None when content dedup skipped the capture (identical accessibility text).
-    result: Option<PairedCaptureResult>,
+    result: Option<PairedCaptureOutcome>,
     /// The captured image — reused for frame comparer update to avoid taking
     /// a redundant extra screenshot after each capture.
     image: image::DynamicImage,
@@ -2482,6 +2626,10 @@ struct CaptureOutput {
 struct LightweightFocusedMetadata {
     app_name: Option<String>,
     window_name: Option<String>,
+}
+
+fn capture_can_seed_visual_comparer(filters: &WindowFilters, focused_only: bool) -> bool {
+    !focused_only && !filters.has_window_patterns() && !filters.has_url_allowlist()
 }
 
 fn mask_image_to_focused_window(
@@ -2506,6 +2654,23 @@ fn mask_image_to_focused_window(
         image::RgbaImage::from_pixel(frame_width, frame_height, image::Rgba([0, 0, 0, 255]));
     image::imageops::replace(&mut masked, &cropped, i64::from(x), i64::from(y));
     Some(image::DynamicImage::ImageRgba8(masked))
+}
+
+/// Reuse monitor coordinates for both pixels and accessibility/OCR overlays.
+/// An unavailable focused window must never silently widen a scoped image.
+fn apply_screenshot_scope(
+    image: image::DynamicImage,
+    bounds: Option<screenpipe_capture::paired_capture::FocusedWindowBounds>,
+    focused_only: bool,
+    screenshots_disabled: bool,
+) -> (image::DynamicImage, bool) {
+    if !focused_only || screenshots_disabled {
+        return (image, false);
+    }
+    match bounds.and_then(|bounds| mask_image_to_focused_window(&image, bounds)) {
+        Some(masked) => (masked, false),
+        None => (image::DynamicImage::new_rgba8(1, 1), true),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -3064,6 +3229,217 @@ fn bypasses_capture_throttles(trigger: &CaptureTrigger) -> bool {
     )
 }
 
+/// Preserve the redacted desktop when only the focused window is filtered.
+/// URL, incognito, built-in exclusions and DRM retain their existing gates.
+fn permits_redacted_desktop_without_focus(
+    filters: &WindowFilters,
+    config: &screenpipe_a11y::tree::TreeWalkerConfig,
+    pixels_verified: bool,
+    pause_on_drm: bool,
+) -> bool {
+    pixels_verified
+        && filters.has_window_patterns()
+        && config.ignored_urls.is_empty()
+        && config.included_urls.is_empty()
+        && !pause_on_drm
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RedactedFocusDecision {
+    Continue,
+    PixelsOnly,
+    Withhold,
+}
+
+fn redacted_focus_decision(
+    filters: &WindowFilters,
+    focus: Option<screenpipe_a11y::tree::FocusedWindowFilterResult>,
+    pixels_only_permitted: bool,
+) -> RedactedFocusDecision {
+    use screenpipe_a11y::tree::FocusedWindowFilterResult;
+    match focus {
+        Some(FocusedWindowFilterResult::Allowed {
+            app_name,
+            window_name,
+        }) if !app_name.is_empty() => {
+            if filters.is_valid(&app_name, &window_name) {
+                RedactedFocusDecision::Continue
+            } else if pixels_only_permitted {
+                RedactedFocusDecision::PixelsOnly
+            } else {
+                RedactedFocusDecision::Withhold
+            }
+        }
+        // A rejected or unavailable focus check must not fall through to the
+        // unknown-monitor OCR path, which has no focused metadata to gate.
+        _ => RedactedFocusDecision::Withhold,
+    }
+}
+
+async fn redacted_focus_check(
+    filters: &WindowFilters,
+    mut config: screenpipe_a11y::tree::TreeWalkerConfig,
+    pixels_only_permitted: bool,
+) -> RedactedFocusDecision {
+    // Retain a permit inside the blocking call even after timeout, so a stuck
+    // native metadata query cannot accumulate unbounded background workers.
+    static QUERY: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let Ok(permit) = QUERY
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+        .try_acquire_owned()
+    else {
+        if filters.streaming_mode() && pixels_only_permitted {
+            return RedactedFocusDecision::PixelsOnly;
+        }
+        return RedactedFocusDecision::Withhold;
+    };
+    config.ignored_windows.clear();
+    config.included_windows.clear();
+    let query = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        screenpipe_a11y::tree::check_focused_window_filters(config)
+    });
+    let focus = match tokio::time::timeout(Duration::from_millis(250), query).await {
+        Ok(Ok(Ok(focus))) => Some(focus),
+        _ => None,
+    };
+    if filters.streaming_mode()
+        && pixels_only_permitted
+        && matches!(
+            focus,
+            None | Some(screenpipe_a11y::tree::FocusedWindowFilterResult::NotFound)
+        )
+    {
+        // An unavailable geometry observation must not discard the already
+        // masked screenshot or authorize text and URL extraction.
+        return RedactedFocusDecision::PixelsOnly;
+    }
+    redacted_focus_decision(filters, focus, pixels_only_permitted)
+}
+
+#[cfg(any(not(target_os = "windows"), test))]
+fn focused_window_is_on_monitor(
+    window: Option<screenpipe_a11y::ElementBounds>,
+    monitor: &TreeWalkerConfig,
+) -> bool {
+    let Some(window) = window else { return false };
+    if ![window.x, window.y, window.width, window.height]
+        .iter()
+        .all(|value| value.is_finite())
+        || window.width <= 0.0
+        || window.height <= 0.0
+        || monitor.monitor_width <= 0.0
+        || monitor.monitor_height <= 0.0
+    {
+        return false;
+    }
+    // One owning display, even when a window spans displays. Use the same
+    // center convention as the foreground-window scheduling tracker, with
+    // half-open display edges. Never substitute the cursor's position.
+    let x = window.x + window.width / 2.0;
+    let y = window.y + window.height / 2.0;
+    x >= monitor.monitor_x
+        && x < monitor.monitor_x + monitor.monitor_width
+        && y >= monitor.monitor_y
+        && y < monitor.monitor_y + monitor.monitor_height
+}
+
+async fn monitor_hosts_focused_window(params: &CaptureParams<'_>) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        tokio::task::spawn_blocking(
+            screenpipe_a11y::platform::windows::get_focused_window_monitor_fresh,
+        )
+        .await
+        .ok()
+        .flatten()
+            == Some(params.monitor_id)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let bounds = tokio::task::spawn_blocking(|| {
+            #[cfg(target_os = "macos")]
+            {
+                screenpipe_a11y::platform::macos::get_focused_window_bounds_fresh()
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                None
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        focused_window_is_on_monitor(bounds, params.tree_walker_config)
+    }
+}
+
+async fn persist_masked_screenshot(
+    params: &CaptureParams<'_>,
+    trigger: &CaptureTrigger,
+    image: image::DynamicImage,
+    captured_at: chrono::DateTime<Utc>,
+    in_meeting: bool,
+    snapshot_image: Option<&image::DynamicImage>,
+) -> Result<CaptureOutput> {
+    if crate::sleep_monitor::screen_is_locked() {
+        return Ok(CaptureOutput {
+            result: None,
+            image,
+            elements_deduped: false,
+            corrupt: None,
+        });
+    }
+    let _ = params
+        .tree_walker
+        .suspend_with_timeout(Duration::from_millis(250))
+        .await;
+    let ctx = OptionalDbCaptureContext {
+        db: params.db,
+        snapshot_writer: params.snapshot_writer,
+        image: Arc::new(image),
+        captured_at,
+        monitor_id: params.monitor_id,
+        device_name: params.device_name,
+        app_name: None,
+        window_name: None,
+        browser_url: None,
+        document_path: None,
+        focused: false,
+        capture_trigger: trigger.as_str(),
+        use_pii_removal: params.use_pii_removal,
+        languages: params.languages.to_vec(),
+        elements_ref_frame_id: None,
+        screenshot_disabled: false,
+        in_meeting,
+        monitor_hosts_focus: false,
+        ax_screenshot_coherent: false,
+        focused_window_bounds: None,
+    };
+    let result = paired_capture_with_optional_db(&ctx, None, None, true, snapshot_image).await?;
+    if let (Some(sender), PairedCaptureOutcome::Indexed(result)) = (params.semantic_tx, &result) {
+        sender.record_capture_gap(result.frame_id, SemanticCaptureGap::TreeMissing);
+    }
+    let image = Arc::try_unwrap(ctx.image).unwrap_or_else(|arc| (*arc).clone());
+    Ok(CaptureOutput {
+        result: Some(result),
+        image,
+        elements_deduped: false,
+        corrupt: None,
+    })
+}
+
+fn ledger_window_filters(
+    filters: &WindowFilters,
+    focused_window_screenshots: bool,
+    pause_on_drm_content: bool,
+) -> WindowFilters {
+    filters
+        .clone()
+        .with_streaming_mode(!focused_window_screenshots && !pause_on_drm_content)
+}
+
 /// Perform a single event-driven capture.
 ///
 /// When `previous_content_hash` is `Some` and matches the current accessibility
@@ -3085,10 +3461,31 @@ async fn do_capture(
     screenshot_disabled: bool,
     hd_active: bool,
     in_meeting: bool,
-    monitor_hosts_focus: bool,
     #[allow(unused_variables)] last_screenshot_focus_pid: &mut Option<i32>,
     is_startup: bool,
 ) -> Result<CaptureOutput> {
+    // Select once per capture, so enabling the ledger does not require
+    // restarting an already running monitor or changing preview settings.
+    let window_filters = if screenpipe_core::raw_capture_ledger::is_enabled() {
+        &params.ledger_window_filters
+    } else {
+        &params.window_filters
+    };
+    // Scheduling can use hysteresis, cached notifications, and cursor fallback.
+    // Text admission instead requires fresh focused-window geometry, including
+    // at startup. Unknown ownership permits no text extraction.
+    let mut monitor_hosts_focus = monitor_hosts_focused_window(params).await;
+    // Only the monitor hosting focus can provide an image in this mode.
+    // Avoid taking and then discarding screenshots of the other monitors.
+    if params.focused_window_screenshots && !monitor_hosts_focus {
+        return Ok(CaptureOutput {
+            result: None,
+            image: image::DynamicImage::new_rgba8(1, 1),
+            elements_deduped: false,
+            corrupt: None,
+        });
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let captured_at = Utc::now();
     let bypass_capture_throttles = bypasses_capture_throttles(trigger);
     #[cfg(target_os = "windows")]
@@ -3096,6 +3493,9 @@ async fn do_capture(
         .then(get_foreground_window_identity_fresh)
         .flatten();
 
+    // Positive-selection sources resolve exclusions in their producer and
+    // retain the policy with each prepared frame. Do not gate cached pixels on
+    // a fresh event-time exclusion observation. Legacy sources still resolve here.
     // Resolve ignored windows to SCK window IDs so ScreenCaptureKit excludes
     // them from the capture buffer (zero overhead, pixel-perfect). Sorted +
     // deduped so the persistent stream isn't needlessly recreated when
@@ -3107,16 +3507,18 @@ async fn do_capture(
     // frame's pixels (like `screenshot_disabled`; the a11y walk continues and
     // applies its own independent window filtering) rather than storing a
     // frame that may contain a window the user asked to hide.
-    let storage_exclusions = if screenshot_disabled {
+    let storage_exclusions = if screenshot_disabled
+        || screenpipe_screen::screenshot_privacy::uses_positive_selection(window_filters)
+    {
         Some(Vec::new())
     } else {
         storage_excluded_sck_window_ids(
-            &params.window_filters,
+            window_filters,
             exclusion_sources(params.tree_walker_config),
         )
         .await
     };
-    let skip_pixels_for_unknown_exclusions = storage_exclusions.is_none();
+    let mut skip_pixels_for_unknown_exclusions = storage_exclusions.is_none();
     if skip_pixels_for_unknown_exclusions {
         static LAST_SKIP_LOG: AtomicU64 = AtomicU64::new(0);
         let now_secs = std::time::SystemTime::now()
@@ -3155,6 +3557,9 @@ async fn do_capture(
     } else {
         None
     };
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let mut native_captured_at = None;
+    let mut snapshot_image = None;
     let image = if screenshot_disabled || skip_pixels_for_unknown_exclusions {
         debug!(
             "screenshot capture skipped for monitor {} (trigger={})",
@@ -3165,19 +3570,52 @@ async fn do_capture(
     } else {
         let excluded_ids = storage_exclusions.unwrap_or_default();
 
-        // Take screenshot (with ignored windows excluded at the OS level)
-        let (image, capture_dur) = capture_monitor_image_with_freshness(
+        // macOS selects a prepared stream frame with its own policy and scene.
+        // Other platforms retain their existing positive-selection boundary.
+        match capture_monitor_frame_for_snapshot(
             params.monitor,
+            window_filters,
+            exclusion_sources(params.tree_walker_config),
             &excluded_ids,
             capture_needs_fresh_pixels(trigger, context_changed),
+            params.snapshot_writer.max_width(),
         )
-        .await?;
-        debug!(
-            "screenshot captured in {:?} for monitor {}",
-            capture_dur, params.monitor_id
-        );
-        image
+        .await
+        {
+            Ok(frame) => {
+                debug!(
+                    "screenshot captured in {:?} for monitor {}",
+                    frame.duration, params.monitor_id
+                );
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                {
+                    native_captured_at = Some(frame.captured_at);
+                }
+                snapshot_image = frame.snapshot_image;
+                frame.image
+            }
+            Err(error)
+                if screenpipe_screen::screenshot_privacy::uses_positive_selection(
+                    window_filters,
+                ) =>
+            {
+                debug!("window-filtered screenshot withheld: {error}");
+                skip_pixels_for_unknown_exclusions = true;
+                image::DynamicImage::new_rgba8(1, 1)
+            }
+            Err(error) => return Err(error),
+        }
     };
+    // Preserve the source observation time. Idle samples with an older native
+    // PTS require a fresh screenshot rather than relabelling cached pixels.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let captured_at = native_captured_at.unwrap_or_else(Utc::now);
+    #[cfg(target_os = "macos")]
+    if !monitor_hosts_focus {
+        // A sparse background-display screenshot must not leave a continuous
+        // preview running throughout Warm state. HD has a separate owner.
+        screenpipe_screen::stream_invalidation::release_screenshot_stream(params.monitor_id);
+    }
     // This scalar is the screenshot's app identity. Read it immediately after
     // ScreenCaptureKit returns so no process object travels with the pixels.
     let screenshot_focus_pid = if monitor_hosts_focus && !screenshot_disabled {
@@ -3203,7 +3641,12 @@ async fn do_capture(
     // (prevents re-triggering on the same bad frame). The caller records the
     // matching telemetry counter from `corrupt`.
     if !screenshot_disabled && !skip_pixels_for_unknown_exclusions {
-        if let Some(kind) = frame_corruption(&image) {
+        if let Some(kind) =
+            frame_corruption_with_privacy_padding(&image, window_filters.has_window_patterns())
+                .filter(|kind| {
+                    !window_filters.streaming_mode() || !matches!(kind, CorruptKind::Black)
+                })
+        {
             match kind {
                 // Green is the notable, rarer signal — surface it at warn so it
                 // shows up in shared logs. Black is common (DRM / excluded window).
@@ -3224,6 +3667,54 @@ async fn do_capture(
             });
         }
     }
+
+    // The native compositor has already removed every excluded window. An
+    // excluded focused window must not discard the other allowed windows.
+    // Persist only verified pixels: no focused identity, AX, OCR, URL, document
+    // path or reused element reference can escape through this narrow path.
+    let verified_filtered_pixels = !screenshot_disabled
+        && !skip_pixels_for_unknown_exclusions
+        && window_filters.has_window_patterns();
+    let focus_decision = if verified_filtered_pixels {
+        redacted_focus_check(
+            window_filters,
+            params.tree_walker_config.clone(),
+            permits_redacted_desktop_without_focus(
+                window_filters,
+                params.tree_walker_config,
+                true,
+                params.pause_on_drm_content,
+            ),
+        )
+        .await
+    } else {
+        RedactedFocusDecision::Continue
+    };
+    if focus_decision == RedactedFocusDecision::Withhold
+        || (params.focused_window_screenshots
+            && focus_decision == RedactedFocusDecision::PixelsOnly)
+    {
+        return Ok(CaptureOutput {
+            result: None,
+            image,
+            elements_deduped: false,
+            corrupt: None,
+        });
+    }
+    if focus_decision == RedactedFocusDecision::PixelsOnly {
+        return persist_masked_screenshot(
+            params,
+            trigger,
+            image,
+            captured_at,
+            in_meeting,
+            snapshot_image.as_ref(),
+        )
+        .await;
+    }
+    let streaming_pixels = window_filters.streaming_mode()
+        && !screenshot_disabled
+        && !skip_pixels_for_unknown_exclusions;
 
     // Walk accessibility tree on blocking thread (AX APIs are synchronous).
     // Apply adaptive budget overrides: expensive apps (Electron/Discord) get
@@ -3258,6 +3749,11 @@ async fn do_capture(
     } else {
         None
     };
+    // Focus may have moved while pixels, privacy checks, or metadata were
+    // acquired. Recheck before text-work budgets as well as the AX walk, so a
+    // stale focused app cannot throttle an otherwise permitted pixel-only frame.
+    // Losing ownership cannot promote this capture again.
+    monitor_hosts_focus = monitor_hosts_focus && monitor_hosts_focused_window(params).await;
     let trigger_app = if monitor_hosts_focus {
         capture_gate_app_name(trigger, lightweight_focused_metadata.as_ref())
     } else {
@@ -3326,7 +3822,7 @@ async fn do_capture(
     // The AX walker returns the one globally focused window. Walking it for a
     // different monitor would both waste work and pair unrelated pixels with
     // that window's tree, identity, and dedup hash. Non-focused monitors use
-    // the screenshot/OCR path below instead.
+    // the screenshot-only path below instead.
     let tree_walk_result = if monitor_hosts_focus && defer_text_extraction {
         // The normal walk checks these filters before any provider request.
         // Preserve that gate when no walk is admitted. URL, ignored popup and
@@ -3369,6 +3865,10 @@ async fn do_capture(
             }
         }
     } else {
+        let _ = params
+            .tree_walker
+            .suspend_with_timeout(Duration::from_millis(250))
+            .await;
         None
     };
 
@@ -3461,6 +3961,19 @@ async fn do_capture(
 
     let mut tree_snapshot = match tree_walk_result {
         Some(TreeWalkResult::Found(snap)) => Some(snap),
+        Some(TreeWalkResult::Skipped(screenpipe_a11y::tree::SkipReason::UserIgnored))
+            if streaming_pixels =>
+        {
+            return persist_masked_screenshot(
+                params,
+                trigger,
+                image,
+                captured_at,
+                in_meeting,
+                snapshot_image.as_ref(),
+            )
+            .await;
+        }
         Some(TreeWalkResult::Skipped(reason)) => {
             if !matches!(reason, screenpipe_a11y::tree::SkipReason::UrlPending) {
                 let _ = params
@@ -3493,6 +4006,18 @@ async fn do_capture(
     } else {
         None
     };
+    // A walk can overlap a display transition (including the same process
+    // moving displays). Discard every text projection before dedup/persistence.
+    monitor_hosts_focus = monitor_hosts_focus && monitor_hosts_focused_window(params).await;
+    if !monitor_hosts_focus {
+        if tree_snapshot.is_some() {
+            let _ = params
+                .tree_walker
+                .suspend_with_timeout(Duration::from_millis(250))
+                .await;
+        }
+        tree_snapshot = None;
+    }
     #[allow(unused_mut)]
     let mut ax_screenshot_coherent = match (screenshot_focus_pid, ax_focus_pid) {
         (Some(screenshot_pid), Some(ax_pid)) => screenshot_pid == ax_pid,
@@ -3506,7 +4031,18 @@ async fn do_capture(
         ax_screenshot_coherent &= !monitor_hosts_focus
             || (foreground_identity_before.is_some()
                 && foreground_identity_before == foreground_identity_after);
-        if !ax_screenshot_coherent {
+        if monitor_hosts_focus && !ax_screenshot_coherent {
+            if streaming_pixels {
+                return persist_masked_screenshot(
+                    params,
+                    trigger,
+                    image,
+                    captured_at,
+                    in_meeting,
+                    snapshot_image.as_ref(),
+                )
+                .await;
+            }
             debug!(
                 before = ?foreground_identity_before,
                 after = ?foreground_identity_after,
@@ -3544,6 +4080,17 @@ async fn do_capture(
             // scoped `App::Title` patterns defer to the post-resolution gate
             // below where the full pair is known.
             if window_pattern::matches_any(&params.ignored_patterns, &app_lower, "") {
+                if streaming_pixels {
+                    return persist_masked_screenshot(
+                        params,
+                        trigger,
+                        image,
+                        captured_at,
+                        in_meeting,
+                        snapshot_image.as_ref(),
+                    )
+                    .await;
+                }
                 debug!(
                     "skipping capture: focused app '{}' matches ignored window on monitor {} (tree walk was NotFound)",
                     app, params.monitor_id
@@ -3668,6 +4215,25 @@ async fn do_capture(
         app_name_owned.as_deref(),
         window_name_owned.as_deref(),
     ) {
+        if streaming_pixels
+            && !resolved_window_matches_privacy_filters(
+                params.tree_walker_config.ignore_incognito_windows,
+                monitor_hosts_focus,
+                &[],
+                app_name_owned.as_deref(),
+                window_name_owned.as_deref(),
+            )
+        {
+            return persist_masked_screenshot(
+                params,
+                trigger,
+                image,
+                captured_at,
+                in_meeting,
+                snapshot_image.as_ref(),
+            )
+            .await;
+        }
         let check_app = app_name_owned.as_deref().unwrap_or_default().to_lowercase();
         let check_win = window_name_owned
             .as_deref()
@@ -3687,14 +4253,14 @@ async fn do_capture(
 
     // Final URL gate after metadata resolution. This protects the OCR fallback
     // and every other path that can continue after a missing tree. A non-empty
-    // URL policy requires a fresh, coherent HTTP(S) URL for browser content.
+    // URL policy requires a fresh, coherent hostname for browser content,
+    // independent of the URL scheme.
     // Native apps remain governed by app/window filters; unknown ownership,
-    // internal browser pages and missing browser URLs fail closed.
-    if !params.window_filters.is_valid(
+    // hostless browser pages and missing browser URLs fail closed.
+    if !window_filters.is_valid(
         app_name_owned.as_deref().unwrap_or_default(),
         window_name_owned.as_deref().unwrap_or_default(),
-    ) || !params
-        .window_filters
+    ) || !window_filters
         .should_capture_window_url(app_name_owned.as_deref(), browser_url_owned.as_deref())
     {
         debug!(
@@ -3769,6 +4335,14 @@ async fn do_capture(
                     .is_some_and(|app| app.eq_ignore_ascii_case(&snap.app_name))
             })
             .and_then(|snap| snap.window_bounds)
+            .filter(|b| {
+                b.x.is_finite()
+                    && b.y.is_finite()
+                    && b.width.is_finite()
+                    && b.height.is_finite()
+                    && b.width > 0.0
+                    && b.height > 0.0
+            })
             .map(
                 |b| screenpipe_capture::paired_capture::FocusedWindowBounds {
                     x: (b.x * frame_w as f64).round() as i32,
@@ -3779,27 +4353,20 @@ async fn do_capture(
             )
     };
 
-    // With a URL allowlist, an allowed native app must not expose a blocked
-    // browser elsewhere on the monitor. Black out pixels outside the
-    // positively identified focused window for both native apps and browsers.
+    // A URL allowlist and the opt-in focused-window mode both restrict pixels
+    // to a positively identified focused window. Preserve monitor dimensions
+    // so accessibility bounds, OCR boxes, and replay retain their coordinates.
     // If the platform cannot provide trustworthy bounds, keep the allowed snapshot but
     // suppress pixels and OCR for this frame rather than widening capture.
-    let mut allowlist_pixels_unverified = false;
-    let image = if params.window_filters.has_url_allowlist()
-        && !screenshot_disabled
-        && !skip_pixels_for_unknown_exclusions
-    {
-        match focused_window_bounds.and_then(|bounds| mask_image_to_focused_window(&image, bounds))
-        {
-            Some(masked) => masked,
-            None => {
-                allowlist_pixels_unverified = true;
-                image::DynamicImage::new_rgba8(1, 1)
-            }
-        }
-    } else {
-        image
-    };
+    let scope_to_focused_window =
+        params.focused_window_screenshots || window_filters.has_url_allowlist();
+    let snapshot_image = snapshot_image.as_ref().filter(|_| !scope_to_focused_window);
+    let (image, scoped_pixels_unverified) = apply_screenshot_scope(
+        image,
+        focused_window_bounds,
+        scope_to_focused_window,
+        screenshot_disabled || skip_pixels_for_unknown_exclusions,
+    );
 
     let elements_ref_frame_id = matching_elements_reference(
         trigger,
@@ -3811,7 +4378,7 @@ async fn do_capture(
         ax_screenshot_coherent,
     );
 
-    let ctx = CaptureContext {
+    let ctx = OptionalDbCaptureContext {
         db: params.db,
         snapshot_writer: params.snapshot_writer,
         image: Arc::new(image),
@@ -3832,7 +4399,7 @@ async fn do_capture(
         // only, no snapshot written for the 1x1 placeholder.
         screenshot_disabled: screenshot_disabled
             || skip_pixels_for_unknown_exclusions
-            || allowlist_pixels_unverified,
+            || scoped_pixels_unverified,
         in_meeting,
         monitor_hosts_focus,
         ax_screenshot_coherent,
@@ -3841,13 +4408,20 @@ async fn do_capture(
     };
 
     let result = if defer_text_extraction {
-        paired_capture_deferred(&ctx).await?
+        paired_capture_with_optional_db(&ctx, None, None, true, snapshot_image).await?
     } else {
-        paired_capture(&ctx, tree_snapshot.as_ref(), Some(ocr_gate)).await?
+        paired_capture_with_optional_db(
+            &ctx,
+            tree_snapshot.as_ref(),
+            Some(ocr_gate),
+            false,
+            snapshot_image,
+        )
+        .await?
     };
-    if let Some(sender) = params.semantic_tx {
+    if let (Some(sender), PairedCaptureOutcome::Indexed(result)) = (params.semantic_tx, &result) {
         match tree_snapshot {
-            Some(snapshot) if ax_screenshot_coherent => {
+            Some(snapshot) if monitor_hosts_focus && ax_screenshot_coherent => {
                 let _ = sender.submit(SemanticProjectionJob::from_capture(
                     result.frame_id,
                     result.captured_at,
@@ -4201,6 +4775,26 @@ fn frame_corruption(image: &image::DynamicImage) -> Option<CorruptKind> {
     }
 }
 
+/// Privacy composition intentionally paints excluded surfaces black. A small
+/// allowed foreground window must still be durably recorded even when it
+/// occupies less than the corruption sampler's five-percent threshold.
+fn frame_corruption_with_privacy_padding(
+    image: &image::DynamicImage,
+    isolated_windows: bool,
+) -> Option<CorruptKind> {
+    let kind = frame_corruption(image)?;
+    if isolated_windows && matches!(kind, CorruptKind::Black) {
+        use image::GenericImageView;
+        if image
+            .pixels()
+            .any(|(_, _, p)| u16::from(p[0]) + u16::from(p[1]) + u16::from(p[2]) >= 15)
+        {
+            return None;
+        }
+    }
+    Some(kind)
+}
+
 /// Convenience predicate used by tests.
 #[cfg(test)]
 fn is_frame_corrupt(image: &image::DynamicImage) -> bool {
@@ -4209,7 +4803,277 @@ fn is_frame_corrupt(image: &image::DynamicImage) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ledger_defaults_to_streaming_without_overriding_strict_capture_rules() {
+        let exclusions = WindowFilters::with_url_rules(&["Excluded".into()], &[], &[], &[]);
+        #[cfg(target_os = "macos")]
+        let supported = cidre::api::macos_available("14.0");
+        #[cfg(not(target_os = "macos"))]
+        let supported = cfg!(target_os = "windows");
+        assert_eq!(
+            ledger_window_filters(&exclusions, false, false).streaming_mode(),
+            supported
+        );
+        assert!(!exclusions.streaming_mode());
+        assert!(!ledger_window_filters(&exclusions, true, false).streaming_mode());
+        assert!(!ledger_window_filters(&exclusions, false, true).streaming_mode());
+        let window_allowlist = WindowFilters::with_url_rules(&[], &["Allowed".into()], &[], &[]);
+        assert!(!ledger_window_filters(&window_allowlist, false, false).streaming_mode());
+        let url_policy = WindowFilters::with_url_rules(
+            &[],
+            &[],
+            &[screenpipe_config::UrlRule::Legacy("example.com".into())],
+            &[],
+        );
+        assert!(!ledger_window_filters(&url_policy, false, false).streaming_mode());
+    }
+
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    #[ignore = "requires SCREENPIPE_ISOLATED_VM_TEST=1 in a disposable logged-in Windows VM"]
+    async fn isolated_vm_focused_monitor_matches_capture_backend_and_unknown_fails_closed() {
+        use windows::core::PCWSTR;
+        use windows::Win32::System::StationsAndDesktops::{
+            CloseDesktop, CreateDesktopW, GetThreadDesktop, SetThreadDesktop, DESKTOP_CONTROL_FLAGS,
+        };
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+
+        assert_eq!(
+            std::env::var("SCREENPIPE_ISOLATED_VM_TEST").as_deref(),
+            Ok("1"),
+            "requires SCREENPIPE_ISOLATED_VM_TEST=1 in a disposable logged-in Windows VM"
+        );
+
+        let focused_monitor =
+            screenpipe_a11y::platform::windows::get_focused_window_monitor_fresh()
+                .expect("the isolated VM console must have a real foreground window");
+        let monitors = list_monitors().await;
+        assert!(
+            !monitors.is_empty(),
+            "the capture backend found no displays"
+        );
+        println!(
+            "foreground_monitor_id={focused_monitor}; capture_monitors={:?}",
+            monitors
+                .iter()
+                .map(|monitor| (
+                    monitor.id(),
+                    monitor.x(),
+                    monitor.y(),
+                    monitor.width(),
+                    monitor.height()
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            monitors.iter().any(|monitor| monitor.id() == focused_monitor),
+            "foreground HMONITOR id {focused_monitor} must equal a SafeMonitor id; capture ids: {:?}",
+            monitors.iter().map(SafeMonitor::id).collect::<Vec<_>>()
+        );
+
+        let private_desktop_result = std::thread::spawn(|| unsafe {
+            let original_desktop = GetThreadDesktop(GetCurrentThreadId())?;
+            let name: Vec<u16> =
+                format!("screenpipe-focused-monitor-test-{}\0", std::process::id())
+                    .encode_utf16()
+                    .collect();
+            let desktop = CreateDesktopW(
+                PCWSTR(name.as_ptr()),
+                PCWSTR::null(),
+                None,
+                DESKTOP_CONTROL_FLAGS(0),
+                0x01ff,
+                None,
+            )?;
+            SetThreadDesktop(desktop)?;
+            let focused = screenpipe_a11y::platform::windows::get_focused_window_monitor_fresh();
+            SetThreadDesktop(original_desktop)?;
+            CloseDesktop(desktop)?;
+            Ok::<_, windows::core::Error>(focused)
+        })
+        .join()
+        .expect("private-desktop test thread panicked")
+        .expect("private desktop Win32 calls failed");
+        assert_eq!(
+            private_desktop_result, None,
+            "a private inactive desktop must fail closed without a foreground window"
+        );
+        println!("private_inactive_desktop_focused_monitor={private_desktop_result:?}");
+        assert_eq!(
+            screenpipe_a11y::platform::windows::get_focused_window_monitor_fresh(),
+            Some(focused_monitor),
+            "the original console foreground query must still work after the private desktop probe"
+        );
+    }
+
+    #[test]
+    fn text_ownership_requires_fresh_window_geometry_and_tracks_display_transitions() {
+        use screenpipe_a11y::ElementBounds;
+        let left = TreeWalkerConfig {
+            monitor_x: -1920.0,
+            monitor_y: 0.0,
+            monitor_width: 1920.0,
+            monitor_height: 1080.0,
+            ..Default::default()
+        };
+        let right = TreeWalkerConfig {
+            monitor_x: 0.0,
+            ..left.clone()
+        };
+        let window = |x| {
+            Some(ElementBounds {
+                x,
+                y: 50.0,
+                width: 800.0,
+                height: 600.0,
+            })
+        };
+        // Startup/unknown focus cannot use Active scheduling as ownership.
+        for monitor in [&left, &right] {
+            assert!(!focused_window_is_on_monitor(None, monitor));
+            assert!(!focused_window_is_on_monitor(window(f64::NAN), monitor));
+        }
+        assert!(focused_window_is_on_monitor(window(-1000.0), &left));
+        assert!(!focused_window_is_on_monitor(window(-1000.0), &right));
+        assert!(!focused_window_is_on_monitor(window(100.0), &left));
+        assert!(focused_window_is_on_monitor(window(100.0), &right));
+        // A straddling window's center lies exactly on the seam: one owner.
+        assert!(!focused_window_is_on_monitor(window(-400.0), &left));
+        assert!(focused_window_is_on_monitor(window(-400.0), &right));
+        assert!(!focused_window_is_on_monitor(window(3000.0), &right));
+        let invalid = Some(ElementBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 600.0,
+        });
+        assert!(!focused_window_is_on_monitor(invalid, &right));
+    }
+
+    #[test]
+    fn redacted_focus_rejections_cannot_fall_through_unknown_monitor_capture() {
+        use screenpipe_a11y::tree::{FocusedWindowFilterResult as Focus, SkipReason};
+        let filters = WindowFilters::new(&["PrivacyBlocked".into()], &[], &[]);
+        let allowed = |title: &str| {
+            Some(Focus::Allowed {
+                app_name: "Fixture".into(),
+                window_name: title.into(),
+            })
+        };
+        assert_eq!(
+            redacted_focus_decision(&filters, allowed("PrivacyAllowed"), true),
+            RedactedFocusDecision::Continue
+        );
+        assert_eq!(
+            redacted_focus_decision(&filters, allowed("PrivacyBlocked"), true),
+            RedactedFocusDecision::PixelsOnly
+        );
+        // URL/DRM policies cannot use the pixels-only exception.
+        assert_eq!(
+            redacted_focus_decision(&filters, allowed("PrivacyBlocked"), false),
+            RedactedFocusDecision::Withhold
+        );
+        for focus in [
+            None,
+            Some(Focus::NotFound),
+            Some(Focus::Skipped(SkipReason::Incognito)),
+            Some(Focus::Skipped(SkipReason::ExcludedApp)),
+        ] {
+            assert_eq!(
+                redacted_focus_decision(&filters, focus, true),
+                RedactedFocusDecision::Withhold
+            );
+        }
+    }
+
+    #[test]
+    fn redacted_desktop_requires_verified_pixels_and_window_only_policy() {
+        let filters = WindowFilters::new(&["PrivacyBlocked".into()], &[], &[]);
+        let empty = WindowFilters::new(&[], &[], &[]);
+        let mut config = screenpipe_a11y::tree::TreeWalkerConfig::default();
+        assert!(permits_redacted_desktop_without_focus(
+            &filters, &config, true, false
+        ));
+        assert!(!permits_redacted_desktop_without_focus(
+            &filters, &config, false, false
+        ));
+        assert!(!permits_redacted_desktop_without_focus(
+            &filters, &config, true, true
+        ));
+        assert!(!permits_redacted_desktop_without_focus(
+            &empty, &config, true, false
+        ));
+        config.ignored_urls = serde_json::from_str(r#"["private.example"]"#).unwrap();
+        assert!(!permits_redacted_desktop_without_focus(
+            &filters, &config, true, false
+        ));
+        config.ignored_urls.clear();
+        config.included_urls = serde_json::from_str(r#"[{"domain":"work.example"}]"#).unwrap();
+        assert!(!permits_redacted_desktop_without_focus(
+            &filters, &config, true, false
+        ));
+    }
+
+    #[test]
+    fn focused_window_screenshots_do_not_seed_visual_comparer() {
+        let desktop = WindowFilters::new(&[], &[], &[]);
+        assert!(capture_can_seed_visual_comparer(&desktop, false));
+        assert!(!capture_can_seed_visual_comparer(&desktop, true));
+        let filtered = WindowFilters::new(&["Private".into()], &[], &[]);
+        assert!(!capture_can_seed_visual_comparer(&filtered, false));
+        let urls: Vec<screenpipe_config::DomainRule> =
+            serde_json::from_str(r#"[{"domain":"work.example"}]"#).unwrap();
+        let allowlist = WindowFilters::with_url_rules(&[], &[], &[], &urls);
+        assert!(!capture_can_seed_visual_comparer(&allowlist, false));
+    }
+
+    #[test]
+    fn focused_window_screenshots_preserve_coordinates_and_hide_desktop() {
+        use image::GenericImageView;
+        let source = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            4,
+            3,
+            image::Rgba([10, 20, 30, 255]),
+        ));
+        let bounds = screenpipe_capture::paired_capture::FocusedWindowBounds {
+            x: -1,
+            y: 1,
+            width: 3,
+            height: 5,
+        };
+        let (desktop, suppressed) = apply_screenshot_scope(source.clone(), None, false, false);
+        assert!(!suppressed);
+        assert_eq!(desktop.as_bytes(), source.as_bytes());
+        let (focused, suppressed) =
+            apply_screenshot_scope(source.clone(), Some(bounds), true, false);
+        assert!(!suppressed);
+        assert_eq!(focused.dimensions(), source.dimensions());
+        for y in 0..3 {
+            for x in 0..4 {
+                let expected = if x < 2 && y >= 1 {
+                    [10, 20, 30, 255]
+                } else {
+                    [0, 0, 0, 255]
+                };
+                assert_eq!(focused.get_pixel(x, y).0, expected);
+            }
+        }
+        // Missing focus/bounds (including another monitor) cannot save a desktop image.
+        assert!(apply_screenshot_scope(source.clone(), None, true, false).1);
+        let invalid = screenpipe_capture::paired_capture::FocusedWindowBounds {
+            x: 9,
+            y: 9,
+            width: 1,
+            height: 1,
+        };
+        assert!(apply_screenshot_scope(source.clone(), Some(invalid), true, false).1);
+        // Image capture being off must not turn it back on or do masking work.
+        let (disabled, suppressed) = apply_screenshot_scope(source.clone(), None, true, true);
+        assert!(!suppressed);
+        assert_eq!(disabled.as_bytes(), source.as_bytes());
+    }
 
     #[test]
     fn url_allowlist_masks_everything_outside_focused_window() {
@@ -4260,6 +5124,7 @@ mod tests {
     ) -> PairedCaptureResult {
         PairedCaptureResult {
             frame_id: 1,
+            focused: true,
             snapshot_path: String::new(),
             accessibility_text: None,
             text_source: None,
@@ -5932,6 +6797,31 @@ mod tests {
         }
         let img = image::DynamicImage::ImageRgba8(buf);
         assert!(is_frame_corrupt(&img));
+    }
+
+    #[test]
+    fn privacy_redaction_preserves_small_allowed_foreground() {
+        let mut pixels = image::RgbaImage::from_pixel(1920, 1080, image::Rgba([0, 0, 0, 255]));
+        for y in 30..60 {
+            for x in 50..100 {
+                pixels.put_pixel(x, y, image::Rgba([200, 220, 230, 255]));
+            }
+        }
+        let image = image::DynamicImage::ImageRgba8(pixels);
+        assert_eq!(
+            frame_corruption_with_privacy_padding(&image, false),
+            Some(CorruptKind::Black)
+        );
+        assert_eq!(frame_corruption_with_privacy_padding(&image, true), None);
+        assert_eq!(
+            frame_corruption_with_privacy_padding(&solid(1920, 1080, [0, 0, 0]), true),
+            Some(CorruptKind::Black)
+        );
+        let green = frame_with_bottom_band(1920, 1080, 648, [120, 130, 140], [0, 150, 0]);
+        assert_eq!(
+            frame_corruption_with_privacy_padding(&green, true),
+            Some(CorruptKind::GreenBand)
+        );
     }
 
     #[test]

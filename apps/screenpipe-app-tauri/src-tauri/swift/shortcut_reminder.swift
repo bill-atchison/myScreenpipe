@@ -102,6 +102,7 @@ func starredMinutesLeft(until: Int64, now: TimeInterval) -> Int {
 // MARK: - Metrics data pushed from Rust
 
 final class OverlayMetrics: ObservableObject {
+    @Published var simplifiedUI: Bool = false
     @Published var starredActive: Bool = false
     @Published var starredMinutesRemaining: Int = 0
     @Published var audioActive: Bool = false
@@ -207,6 +208,7 @@ struct OverlayNotificationAction: Identifiable, Equatable {
     let label: String
     let primary: Bool
     let payload: String
+    let isMeetingJoin: Bool
     let meetingProvider: MeetingJoinProvider?
     let screenDetailBody: String?
 }
@@ -219,12 +221,15 @@ struct OverlayNotification: Equatable {
     let body: String
     let actions: [OverlayNotificationAction]
     let autoDismissMs: Int?
-    let isMeetingJoin: Bool
+    let isMeetingCard: Bool
+
+    static let meetingCardWidth: CGFloat = 460
+    static let meetingCardHeight: CGFloat = 124
 
     func size(scale: CGFloat) -> NSSize {
         NSSize(
-            width: (isMeetingJoin ? 460 : kBaseNotificationW) * scale,
-            height: (isMeetingJoin ? 124 : kBaseNotificationH) * scale
+            width: (isMeetingCard ? Self.meetingCardWidth : kBaseNotificationW) * scale,
+            height: (isMeetingCard ? Self.meetingCardHeight : kBaseNotificationH) * scale
         )
     }
 
@@ -232,18 +237,19 @@ struct OverlayNotification: Equatable {
         actions.first { $0.screenDetailBody != nil }
     }
 
-    /// Both visible meeting buttons join in one click. The screen-detail variant
-    /// replaces the standalone capture action while preserving its eligibility.
+    /// Meeting choices share one light surface. The optional screen-detail
+    /// variant replaces the standalone capture action while preserving eligibility.
     var displayActions: [OverlayNotificationAction] {
-        guard isMeetingJoin, let detailAction = screenDetailAction,
-              let join = actions.first(where: { $0.meetingProvider != nil })
+        guard actions.contains(where: { $0.isMeetingJoin }), let detailAction = screenDetailAction,
+              let join = actions.first(where: { $0.isMeetingJoin })
         else { return actions }
         let combined = joining(join, captureScreenDetail: true)
         return actions.map { action in
             guard action.id == detailAction.id else { return action }
             return OverlayNotificationAction(
                 id: action.id, label: uiText("join + HD"), primary: false,
-                payload: combined.payload, meetingProvider: combined.meetingProvider,
+                payload: combined.payload, isMeetingJoin: combined.isMeetingJoin,
+                meetingProvider: combined.meetingProvider,
                 screenDetailBody: nil
             )
         }
@@ -251,7 +257,7 @@ struct OverlayNotification: Equatable {
 
     /// Compose capture and joining into one dispatch, with capture starting first.
     func joining(_ action: OverlayNotificationAction, captureScreenDetail: Bool) -> OverlayNotificationAction {
-        guard captureScreenDetail, action.meetingProvider != nil,
+        guard captureScreenDetail, action.isMeetingJoin,
               let body = screenDetailAction?.screenDetailBody,
               let bodyData = body.data(using: .utf8),
               let detail = try? JSONSerialization.jsonObject(with: bodyData),
@@ -263,7 +269,8 @@ struct OverlayNotification: Equatable {
               let json = String(data: updated, encoding: .utf8) else { return action }
         return OverlayNotificationAction(
             id: action.id, label: action.label, primary: action.primary,
-            payload: json, meetingProvider: action.meetingProvider, screenDetailBody: nil
+            payload: json, isMeetingJoin: action.isMeetingJoin,
+            meetingProvider: action.meetingProvider, screenDetailBody: nil
         )
     }
 
@@ -298,6 +305,7 @@ struct OverlayNotification: Equatable {
                 label: label,
                 primary: (action["primary"] as? Bool) ?? false,
                 payload: payload,
+                isMeetingJoin: action["type"] as? String == "meeting_join",
                 meetingProvider: action["type"] as? String == "meeting_join"
                     ? MeetingJoinProvider.from(url: action["url"] as? String ?? "")
                     : nil,
@@ -319,7 +327,13 @@ struct OverlayNotification: Equatable {
             body: (root["body"] as? String) ?? "",
             actions: actions,
             autoDismissMs: autoDismiss,
-            isMeetingJoin: rawActions.contains { $0["type"] as? String == "meeting_join" }
+            isMeetingCard: rawActions.contains { action in
+                if action["type"] as? String == "meeting_join" { return true }
+                let actionID = (action["id"] as? String) ?? (action["action"] as? String)
+                return actionID == "open-live-notes"
+                    && action["type"] as? String == "deeplink"
+                    && (action["url"] as? String)?.hasPrefix("screenpipe://meeting") == true
+            }
         )
     }
 }
@@ -566,7 +580,10 @@ private let kBaseCollapsedW: CGFloat = 22
 private let kBaseCollapsedH: CGFloat = 16
 private let kBaseHealthH: CGFloat = 18
 private let kBaseCollapsedCornerRadius: CGFloat = 8
-private let kBaseExpandedW: CGFloat = 192
+func overlayExpandedWidth(simplified: Bool) -> CGFloat {
+    simplified ? 96 : 192
+}
+private var kBaseExpandedW: CGFloat { overlayExpandedWidth(simplified: gSimplifiedUI) }
 private let kBaseExpandedH: CGFloat = 62
 private let kBaseDockH: CGFloat = 30
 private let kBaseDisclosureH: CGFloat = 26
@@ -580,7 +597,8 @@ private let kBaseNotificationW: CGFloat = 340
 private let kBaseNotificationH: CGFloat = 34
 private let kRestingOpacity: Double = 0.50
 private let kAnimDur: Double = 0.2
-private let kDockControls = ["search", "chat", "star", "timeline", "audio", "brand"]
+private var gSimplifiedUI = false
+private var kDockControls: [String] { gSimplifiedUI ? ["star", "audio", "brand"] : ["search", "chat", "star", "timeline", "audio", "brand"] }
 
 /// Convert configured shortcuts to one stable, compact macOS glyph order.
 /// Settings historically stored both `Super+Control+…` and
@@ -881,10 +899,11 @@ func overlayHoverRect(
     expanded: Bool,
     disclosureDown: Bool,
     horizontal: OverlayHorizontal,
-    scale: CGFloat
+    scale: CGFloat,
+    simplified: Bool? = nil
 ) -> NSRect {
     let collapsedScale = 1 + (scale - 1) * 0.2
-    let width = expanded ? kBaseExpandedW * scale : kBaseCollapsedW * collapsedScale
+    let width = expanded ? overlayExpandedWidth(simplified: simplified ?? gSimplifiedUI) * scale : kBaseCollapsedW * collapsedScale
     let height = expanded ? kBaseDockH * scale : kBaseCollapsedH * collapsedScale
     let x: CGFloat
     switch horizontal {
@@ -1244,7 +1263,7 @@ struct ShortcutReminderView: View {
         ZStack(alignment: .topTrailing) {
             CollapsedAppIconButton(
                 scale: collapsedScale,
-                action: { onAction("open_timeline") }
+                action: { onAction(metrics.simplifiedUI ? "open_starred_sessions" : "open_timeline") }
             )
             .frame(width: kBaseCollapsedW * collapsedScale, height: kBaseCollapsedH * collapsedScale)
             .background(
@@ -1282,7 +1301,7 @@ struct ShortcutReminderView: View {
                 dockView
             }
         }
-        .frame(width: kBaseExpandedW * scale, height: kBaseExpandedH * scale)
+        .frame(width: overlayExpandedWidth(simplified: metrics.simplifiedUI) * scale, height: kBaseExpandedH * scale)
     }
 
     private var disclosureView: some View {
@@ -1291,20 +1310,24 @@ struct ShortcutReminderView: View {
 
     private var dockView: some View {
         HStack(spacing: 0) {
+            if !metrics.simplifiedUI {
             DockIconButton(icon: "magnifyingglass", active: metrics.hoveredControl == "search", scale: scale) {
                 onAction("open_search")
             }
             DockIconButton(icon: "bubble.left.fill", active: metrics.hoveredControl == "chat", scale: scale) {
                 onAction("open_chat")
             }
+            }
             DockIconButton(icon: metrics.starredActive ? "star.fill" : "star", active: metrics.hoveredControl == "star", scale: scale, caption: metrics.starredActive ? "\(metrics.starredMinutesRemaining)m" : nil) {
                 onAction("open_starred_sessions")
             }
             .accessibilityLabel(metrics.starredActive ? uiText("{minutes} min left · click to end", ["minutes": String(metrics.starredMinutesRemaining)]) : uiText("Star a work session"))
+            if !metrics.simplifiedUI {
             DockIconButton(icon: "rectangle.split.1x2", active: metrics.hoveredControl == "timeline", scale: scale) {
                 onAction("open_timeline")
             }
 
+            }
             Rectangle().fill(.white.opacity(0.28)).frame(width: 1).padding(.vertical, s(4))
 
             DockStatusCell(active: metrics.hoveredControl == "audio") {
@@ -1319,10 +1342,10 @@ struct ShortcutReminderView: View {
                 meetingActive: metrics.meetingActive,
                 scale: scale
             ) {
-                onAction("open_timeline")
+                onAction(metrics.simplifiedUI ? "open_starred_sessions" : "open_timeline")
             }
         }
-        .frame(width: kBaseExpandedW * scale, height: kBaseDockH * scale)
+        .frame(width: overlayExpandedWidth(simplified: metrics.simplifiedUI) * scale, height: kBaseDockH * scale)
         .background(Color.black)
         .clipShape(RoundedRectangle(cornerRadius: s(8)))
         .overlay(RoundedRectangle(cornerRadius: s(8)).stroke(.white.opacity(0.42), lineWidth: 1))
@@ -1670,6 +1693,8 @@ private struct DockStatusCell<Content: View>: View {
 @available(macOS 13.0, *)
 private struct OverlayNotificationView: View {
     @ObservedObject private var uiLocalization = UILocalization.shared
+    @State private var hoveredMeetingAction: String?
+    @State private var hoveringDismiss = false
     let notification: OverlayNotification
     let scale: CGFloat
     let onAction: (OverlayNotificationAction) -> Void
@@ -1685,8 +1710,8 @@ private struct OverlayNotificationView: View {
 
     var body: some View {
         Group {
-            if notification.isMeetingJoin {
-                meetingJoinContent
+            if notification.isMeetingCard {
+                meetingCardContent
             } else {
                 compactContent
             }
@@ -1697,13 +1722,14 @@ private struct OverlayNotificationView: View {
         .overlay(RoundedRectangle(cornerRadius: s(8)).stroke(Color.white.opacity(0.42), lineWidth: 1))
     }
 
-    private var meetingJoinContent: some View {
+    private var meetingCardContent: some View {
         VStack(alignment: .leading, spacing: s(8)) {
             HStack(alignment: .top, spacing: s(10)) {
                 Image(systemName: "video.fill")
-                    .font(.system(size: 16 * scale, weight: .medium))
+                    .font(.system(size: 20 * scale, weight: .medium))
                     .foregroundColor(.white.opacity(0.75))
-                    .frame(height: s(24))
+                    .frame(width: s(20), height: s(24))
+                    .padding(.top, s(3))
                 VStack(alignment: .leading, spacing: s(4)) {
                     Text(notification.title)
                         .font(Brand.swiftUIMonoFont(size: 14 * scale, weight: .semibold))
@@ -1722,28 +1748,28 @@ private struct OverlayNotificationView: View {
             }
             HStack(spacing: s(8)) {
                 Spacer(minLength: 0)
-                meetingJoinActions
+                meetingCardActions
             }
         }
         .padding(s(14))
     }
 
-    /// Two immediate actions share one light surface. HD remains one click,
-    /// and its label explicitly includes joining rather than a recording toggle.
+    /// Action choices share a light surface and keep each notification's label
+    /// and dispatch payload intact.
     @ViewBuilder
-    private var meetingJoinActions: some View {
-        if let join = notification.actions.first(where: { $0.meetingProvider != nil }),
-           let detailID = notification.screenDetailAction?.id,
-           let detail = notification.displayActions.first(where: { $0.id == detailID }) {
-            ForEach(orderedActions.filter { $0.id != join.id && $0.id != detailID }) { action in
-                Button(action.label) { onAction(action) }
-                    .buttonStyle(.plain)
-                    .foregroundColor(.white.opacity(0.88))
-            }
-            HStack(spacing: 0) {
-                Button(action: { onAction(join) }) {
+    private var meetingCardActions: some View {
+        let displayActions = orderedActions
+        HStack(spacing: 0) {
+            ForEach(Array(displayActions.enumerated()), id: \.element.id) { index, action in
+                if index > 0 {
+                    Rectangle()
+                        .fill(Color.black.opacity(0.15))
+                        .frame(width: 1, height: s(20))
+                        .accessibilityHidden(true)
+                }
+                Button(action: { onAction(action) }) {
                     HStack(spacing: s(7)) {
-                        if let provider = join.meetingProvider {
+                        if index == 0, let provider = action.meetingProvider {
                             if let image = provider.image {
                                 Image(nsImage: image)
                                     .resizable()
@@ -1753,39 +1779,36 @@ private struct OverlayNotificationView: View {
                                     .accessibilityHidden(true)
                             } else {
                                 Image(systemName: "video.fill")
-                                    .font(.system(size: 16 * scale))
+                                    .font(.system(size: 18 * scale))
                                     .frame(width: s(18), height: s(18))
                                     .accessibilityHidden(true)
                             }
+                        } else if index == 0 {
+                            Image(systemName: "video.fill")
+                                .font(.system(size: 18 * scale))
+                                .frame(width: s(18), height: s(18))
+                                .accessibilityHidden(true)
                         }
-                        Text(join.label)
+                        Text(action.label)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                     }
                     .padding(.horizontal, s(12))
                     .frame(height: s(36))
+                    .background(hoveredMeetingAction == action.id ? Color.black.opacity(0.08) : Color.clear)
                     .contentShape(Rectangle())
                 }
-                Rectangle()
-                    .fill(Color.black.opacity(0.15))
-                    .frame(width: 1, height: s(20))
-                    .accessibilityHidden(true)
-                Button(action: { onAction(detail) }) {
-                    Text(detail.label)
-                        .padding(.horizontal, s(12))
-                        .frame(height: s(36))
-                        .contentShape(Rectangle())
-                }
-                .help(uiText("Join and take notes with HD screen recording: more frequent screenshots for smoother replay. Uses more storage."))
-                .accessibilityLabel(uiText("Join and take notes with HD screen recording"))
+                .onHover { hovered in hoveredMeetingAction = hovered ? action.id : nil }
+                .help(action.isMeetingJoin && notification.screenDetailAction?.id == action.id
+                    ? uiText("Join and take notes with HD screen recording: more frequent screenshots for smoother replay. Uses more storage.")
+                    : action.label)
             }
-            .font(Brand.swiftUIMonoFont(size: 13 * scale, weight: .medium))
-            .foregroundColor(.black)
-            .buttonStyle(.plain)
-            .background(Color.white.opacity(0.92))
-            .clipShape(RoundedRectangle(cornerRadius: s(6)))
-            .fixedSize()
-        } else {
-            actionButtons
         }
+        .font(Brand.swiftUIMonoFont(size: 13 * scale, weight: .medium))
+        .foregroundColor(.black)
+        .buttonStyle(.plain)
+        .background(Color.white.opacity(0.92))
+        .clipShape(RoundedRectangle(cornerRadius: s(6)))
     }
 
     private var compactContent: some View {
@@ -1836,12 +1859,12 @@ private struct OverlayNotificationView: View {
                         }
                     }
                     Text(action.label)
-                        .font(Brand.swiftUIMonoFont(size: (notification.isMeetingJoin ? 12 : 9) * scale, weight: .medium))
+                        .font(Brand.swiftUIMonoFont(size: (notification.isMeetingCard ? 12 : 9) * scale, weight: .medium))
                         .lineLimit(1)
                 }
                     .foregroundColor(action.primary ? .black : .white.opacity(0.88))
-                    .padding(.horizontal, s(notification.isMeetingJoin ? 10 : 8))
-                    .frame(height: s(notification.isMeetingJoin ? 34 : 22))
+                    .padding(.horizontal, s(notification.isMeetingCard ? 10 : 8))
+                    .frame(height: s(notification.isMeetingCard ? 34 : 22))
                     .background(
                         action.primary
                             ? Color.white.opacity(0.92)
@@ -1851,7 +1874,7 @@ private struct OverlayNotificationView: View {
                     .contentShape(RoundedRectangle(cornerRadius: s(6)))
             }
             .buttonStyle(.plain)
-            .help(notification.isMeetingJoin && action.id == notification.screenDetailAction?.id
+            .help(notification.isMeetingCard && action.id == notification.screenDetailAction?.id
                 ? uiText("Join and take notes with more frequent screen capture for smoother replay. Uses more storage.")
                 : action.label)
             .fixedSize()
@@ -1861,12 +1884,15 @@ private struct OverlayNotificationView: View {
     private var dismissButton: some View {
         Button(action: onDismiss) {
             Image(systemName: "xmark")
-                .font(.system(size: (notification.isMeetingJoin ? 11 : 8) * scale, weight: .semibold))
+                .font(.system(size: (notification.isMeetingCard ? 11 : 8) * scale, weight: .semibold))
                 .foregroundColor(.white.opacity(0.55))
-                .frame(width: s(notification.isMeetingJoin ? 24 : 14), height: s(notification.isMeetingJoin ? 24 : 22))
+                .frame(width: s(notification.isMeetingCard ? 24 : 14), height: s(notification.isMeetingCard ? 24 : 22))
+                .background(hoveringDismiss && notification.isMeetingCard ? Color.white.opacity(0.10) : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: s(5)))
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .onHover { hoveringDismiss = $0 }
         .accessibilityLabel(uiText("dismiss notification"))
     }
 }
@@ -2029,10 +2055,11 @@ class ShortcutReminderController: NSObject, NSWindowDelegate {
         DispatchQueue.main.async { [self] in
             isVisible = true
             let prevScale = gOverlayScale
+            let prevSimplifiedUI = gSimplifiedUI
             if let shortcuts = shortcuts {
                 parseShortcuts(shortcuts)
             }
-            if panel == nil || prevScale != gOverlayScale {
+            if panel == nil || prevScale != gOverlayScale || prevSimplifiedUI != gSimplifiedUI {
                 dismissOverlayNotification()
                 hideDragStage()
                 isDraggingPill = false
@@ -2514,6 +2541,8 @@ class ShortcutReminderController: NSObject, NSWindowDelegate {
         // Expects shortcut labels, size, and optional authenticated API URLs from Rust.
         guard let data = json.data(using: .utf8),
               let dict = try? JSONDecoder().decode([String: String].self, from: data) else { return }
+        gSimplifiedUI = dict["simplifiedUI"] == "true"
+        metrics.simplifiedUI = gSimplifiedUI
         if let s = dict["overlay"] { overlayShortcut = prettifyShortcut(s) }
         if let s = dict["chat"] { chatShortcut = prettifyShortcut(s) }
         if let s = dict["search"] { searchShortcut = prettifyShortcut(s) }
@@ -3600,8 +3629,8 @@ class ShortcutReminderController: NSObject, NSWindowDelegate {
             keyEquivalent: ""
         )
         settings.target = self
-        settings.isEnabled = true
-        menu.addItem(settings)
+        settings.isEnabled = !gSimplifiedUI
+        if !gSimplifiedUI { menu.addItem(settings) }
 
         menu.popUp(
             positioning: nil,

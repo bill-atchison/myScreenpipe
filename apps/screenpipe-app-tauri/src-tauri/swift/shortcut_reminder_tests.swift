@@ -557,15 +557,19 @@ private func testMeetingJoinNotification() {
         expect(false, "valid join notification was rejected")
         return
     }
-    expect(meeting.isMeetingJoin, "localized join action needs the larger card")
+    expect(meeting.isMeetingCard, "localized join action needs the larger card")
     expect(meeting.autoDismissMs == 30000, "join timeout must be preserved")
     let action = try! JSONSerialization.jsonObject(with: Data(meeting.actions[0].payload.utf8)) as! [String: Any]
     expect(action["type"] as? String == "meeting_join", "join action type changed")
     expect(action["url"] as? String == "https://meet.google.com/example", "join URL changed")
     let ordinary = OverlayNotification.parse(json.replacingOccurrences(of: "meeting_join", with: "deeplink"))!
-    expect(!ordinary.isMeetingJoin, "non-join alert must remain compact")
+    let withoutHD = OverlayNotification.parse(json.replacingOccurrences(of: "/capture/hd/start", with: "/unrelated"))!
+    expect(!ordinary.isMeetingCard, "non-meeting alert must remain compact")
     for scale: CGFloat in [1, 1.5, 2] {
         let size = meeting.size(scale: scale)
+        expect(size.width == 460 * scale, "join card width must stay 460 logical points at scale \(scale)")
+        expect(size.height == 124 * scale, "join card height must stay 124 logical points at scale \(scale)")
+        expect(size == withoutHD.size(scale: scale), "join-only and join-plus-HD cards must share bounds")
         expect(size.width > ordinary.size(scale: scale).width, "join card needs more text width")
         expect(size.height >= 3 * ordinary.size(scale: scale).height, "join card needs room for separate actions")
         let y = overlayAttachmentY(pill: NSRect(x: 500, y: 1030, width: 22, height: 16), height: size.height, gap: 4, stacked: 150, disclosureDown: true, visible: visible, edgeInset: 4)
@@ -634,12 +638,23 @@ private func testJoinScreenDetailChoice() {
     expect(withoutHD.screenDetailAction == nil, "unrelated API action must not become a capture setting")
     expect(withoutHD.displayActions == withoutHD.actions, "ineligible notifications must keep their actions")
     expect(withoutHD.joining(withoutHD.actions[0], captureScreenDetail: true) == withoutHD.actions[0], "capture cannot be added without the offered HD action")
+    let unknownProvider = OverlayNotification.parse(json.replacingOccurrences(of: "meet.google.com", with: "meet.example.com"))!
+    expect(unknownProvider.actions[0].isMeetingJoin && unknownProvider.actions[0].meetingProvider == .other, "unknown destinations must retain their join action")
+    let unknownHD = unknownProvider.displayActions[1]
+    let unknownPayload = try! JSONSerialization.jsonObject(with: Data(unknownHD.payload.utf8)) as! [String: Any]
+    expect(unknownPayload["screen_detail"] != nil, "unknown meeting providers must keep the HD join choice")
     expect(notification.joining(notification.actions[1], captureScreenDetail: true) == notification.actions[1], "non-join actions must stay unchanged")
 }
 
 @main
 struct ShortcutReminderTests {
     static func main() {
+        expectClose(overlayExpandedWidth(simplified: false), 192, "full dock keeps its width")
+        expectClose(overlayExpandedWidth(simplified: true), 96, "simplified dock fits three controls")
+        for scale: CGFloat in [1, 1.5, 2] {
+            let hit = overlayHoverRect(in: NSRect(x: 0, y: 0, width: 400, height: 200), expanded: true, disclosureDown: true, horizontal: .center, scale: scale, simplified: true)
+            expectClose(hit.width, 96 * scale, "simplified hover width follows visible dock")
+        }
         expect(starredMinutesLeft(until: 3_600_000, now: 0) == 60, "new hour starts at 60 minutes")
         expect(starredMinutesLeft(until: 3_600_000, now: 59.9) == 60, "round up partial minute")
         expect(starredMinutesLeft(until: 3_600_000, now: 60) == 59, "minute boundary ticks down")

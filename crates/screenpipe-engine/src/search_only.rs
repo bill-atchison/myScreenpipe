@@ -26,7 +26,12 @@ fn history_request(method: &Method, path: &str) -> bool {
         // raw_sql already enforces read-only SQL and the history access policy.
         return matches!(
             path,
-            "/raw_sql" | "/tags/vision/batch" | "/export" | "/vault/lock" | "/vault/unlock"
+            "/raw_sql"
+                | "/chats/search"
+                | "/tags/vision/batch"
+                | "/export"
+                | "/vault/lock"
+                | "/vault/unlock"
         );
     }
     if method != Method::GET && method != Method::HEAD {
@@ -90,6 +95,7 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
+    #[serial_test::serial(background_work)]
     async fn quit_drains_admitted_mutations_and_rejects_late_starts() {
         struct Reset;
         impl Drop for Reset {
@@ -158,6 +164,8 @@ mod tests {
             (Method::GET, "/frames/42/thumbnail", true),
             (Method::GET, "/meetings/1/transcript", true),
             (Method::POST, "/raw_sql", true),
+            (Method::POST, "/chats/search", true),
+            (Method::POST, "/chats/send", false),
             (Method::POST, "/audio/start", false),
             (Method::POST, "/vision/device/start", false),
             (Method::POST, "/capture/hd/start", false),

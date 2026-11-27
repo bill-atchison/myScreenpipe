@@ -8,6 +8,8 @@ import {
   APP_ENTITLEMENT_MAX_STALE_MS,
   getLocalPlanPolicy,
   getBusinessCapacityUpgrade,
+  getDeviceLimitStatus,
+  getOrgSeatAvailable,
   getPaidPlanPolicyDeadlineMs,
   hasAppEntitlement,
   hasCloudEntitlement,
@@ -16,6 +18,7 @@ import {
   hasPersistedEntitlementEvidence,
   hasVerifiedPaidPlan,
   isAuthenticatedFreeUser,
+  isDeviceLimitExceeded,
   isFreeOrUnattributedUser,
   isDevLoginSkipEnabled,
   isSignedInCloudSubscriber,
@@ -929,5 +932,85 @@ describe("planDisplayName", () => {
   it("surfaces the real org label on the enterprise build", () => {
     expect(planDisplayName("team", true)).toBe("Team");
     expect(planDisplayName("enterprise", true)).toBe("Enterprise");
+  });
+});
+
+describe("getOrgSeatAvailable", () => {
+  it("parses valid shadow-seat org metadata and preserves it through normalizeAppUser", () => {
+    const normalized = normalizeAppUser(
+      {
+        id: "u_shadow",
+        email: "shadow@acme.io",
+        cloud_subscribed: false,
+        app_entitled: false,
+        subscription_plan: "none",
+        org_seat_available: {
+          team_id: "team_1",
+          license_id: null,
+          org_name: "Acme Corp",
+          domain: "acme.io",
+          request_status: "none",
+          requested_at: null,
+        },
+      },
+      "tok",
+    );
+    expect(getOrgSeatAvailable(normalized)).toEqual({
+      team_id: "team_1",
+      license_id: null,
+      org_name: "Acme Corp",
+      domain: "acme.io",
+      request_status: "none",
+      requested_at: null,
+    });
+  });
+
+  it("ignores missing or malformed org_seat_available payloads", () => {
+    expect(getOrgSeatAvailable(user({ org_seat_available: null }))).toBeNull();
+    expect(getOrgSeatAvailable(user({ org_seat_available: { org_name: "NoTarget" } }))).toBeNull();
+    expect(getOrgSeatAvailable(user({ org_seat_available: { team_id: "t1" } }))).toBeNull();
+  });
+});
+
+describe("isDeviceLimitExceeded", () => {
+  it("returns true only when server reports allowed:false with reason device_limit_exceeded", () => {
+    const normalized = normalizeAppUser(
+      {
+        id: "u_over",
+        cloud_subscribed: false,
+        app_entitled: false,
+        subscription_plan: "none",
+        device_limit_status: {
+          allowed: false,
+          reason: "device_limit_exceeded",
+          limit: 1,
+          active_count: 1,
+        },
+      },
+      "tok",
+    );
+    expect(getDeviceLimitStatus(normalized)).toMatchObject({
+      allowed: false,
+      reason: "device_limit_exceeded",
+      limit: 1,
+    });
+    expect(isDeviceLimitExceeded(normalized)).toBe(true);
+  });
+
+  it("fails open when device_limit_status is absent, null, or allowed", () => {
+    expect(isDeviceLimitExceeded(user({}))).toBe(false);
+    expect(isDeviceLimitExceeded(user({ device_limit_status: null }))).toBe(false);
+    expect(
+      isDeviceLimitExceeded(
+        user({
+          device_limit_status: {
+            allowed: true,
+            reason: null,
+            limit: 2,
+            active_count: 2,
+          },
+        }),
+      ),
+    ).toBe(false);
   });
 });
