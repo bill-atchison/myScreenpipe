@@ -36,6 +36,8 @@ Roll up today's hourly workstream summaries into **one daily summary per project
    Open: <what is still unfinished or blocked at end of day, or "none seen">
    ```
    Merge repeats; an "Open" item that a later hour shows as done is not open.
+   **Keep every meeting:** add a `Meetings:` line listing each one (title, time, and its decisions
+   and action items with owners). Meetings may take the content up to 350 words.
 
 # Rules
 
