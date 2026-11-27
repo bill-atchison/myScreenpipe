@@ -3,11 +3,24 @@
 
 import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
+import { execSync } from "node:child_process";
 import { localizationMode } from "./scripts/i18n/config.mjs";
 import { desktopCompiler } from "./scripts/i18n/compiler.mjs";
 
+// Personal builds (PERSONAL.md) show their git commit next to the version in Settings;
+// build.rs bakes the same commit into the tray label.
+function personalCommit() {
+  if (!/^(1|true|yes|on)$/i.test((process.env.NEXT_PUBLIC_SCREENPIPE_PERSONAL_BUILD ?? "").trim())) return "";
+  try {
+    return execSync("git rev-parse --short HEAD", { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+  } catch {
+    return "";
+  }
+}
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+    env: { NEXT_PUBLIC_SCREENPIPE_PERSONAL_COMMIT: personalCommit() },
     transpilePackages: ['@screenpipe/workflows-ui'],
   webpack: (config) => {
     const mode = localizationMode();

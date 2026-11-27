@@ -29,6 +29,25 @@ pub fn enabled() -> bool {
     )
 }
 
+/// Short git commit the personal build was made from (build.rs), if known.
+const BUILD_COMMIT: Option<&str> = option_env!("SCREENPIPE_PERSONAL_COMMIT");
+
+/// Suffix for version lines in the tray, e.g. "Personal · e95edb7", so it is
+/// clear which build is running. None for upstream builds.
+pub fn version_label() -> Option<String> {
+    label_for(enabled(), BUILD_COMMIT)
+}
+
+fn label_for(personal: bool, commit: Option<&str>) -> Option<String> {
+    if !personal {
+        return None;
+    }
+    Some(match commit.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(c) => format!("Personal · {c}"),
+        None => "Personal".to_string(),
+    })
+}
+
 /// Call at the top of `main()`, before anything reads the telemetry kill
 /// switch. Child processes (engine, Pi) inherit it.
 pub fn apply_process_env() {
@@ -104,6 +123,17 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    #[test]
+    fn version_label_names_personal_builds_and_their_commit() {
+        assert_eq!(label_for(false, Some("e95edb7")), None);
+        assert_eq!(
+            label_for(true, Some("e95edb7")).as_deref(),
+            Some("Personal · e95edb7")
+        );
+        assert_eq!(label_for(true, Some(" ")).as_deref(), Some("Personal"));
+        assert_eq!(label_for(true, None).as_deref(), Some("Personal"));
     }
 
     #[test]

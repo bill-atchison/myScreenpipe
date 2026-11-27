@@ -72,6 +72,9 @@ export default function GeneralSettings() {
   const isPersonalBuild = /^(1|true|yes|on)$/i.test(
     (process.env.NEXT_PUBLIC_SCREENPIPE_PERSONAL_BUILD ?? "").trim(),
   );
+  // Same wording as the tray (src-tauri/src/personal.rs version_label).
+  const personalCommit = (process.env.NEXT_PUBLIC_SCREENPIPE_PERSONAL_COMMIT ?? "").trim();
+  const personalLabel = personalCommit ? `Personal · ${personalCommit}` : "Personal";
   const autoUpdateForcedByRemote =
     enterpriseBuild.resolved &&
     !enterpriseBuild.isEnterprise &&
@@ -300,7 +303,8 @@ export default function GeneralSettings() {
                 </div>
                 <Switch
                   id="auto-update-toggle"
-                  checked={settings?.autoUpdate ?? true}
+                  // Personal builds never update (updates.rs), whatever the saved setting says.
+                  checked={!isPersonalBuild && (settings?.autoUpdate ?? true)}
                   disabled={autoUpdateForcedByRemote || isPersonalBuild}
                   onCheckedChange={(checked) =>
                     handleSettingsChange({ autoUpdate: checked })
@@ -429,6 +433,7 @@ export default function GeneralSettings() {
                 <div>
                   <h3 className="text-sm font-medium text-foreground">
                     Version{currentVersion ? ` ${currentVersion}` : ""}
+                    {isPersonalBuild ? ` (${personalLabel})` : ""}
                   </h3>
                   <p className="text-xs text-muted-foreground">
                     {isManagedDeployment

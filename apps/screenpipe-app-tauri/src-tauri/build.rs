@@ -598,7 +598,41 @@ fn validate_e2e_command_inventory() {
     );
 }
 
+/// Personal builds (personal.rs) name their git commit in the tray version line.
+fn emit_personal_commit() {
+    println!("cargo:rerun-if-env-changed=NEXT_PUBLIC_SCREENPIPE_PERSONAL_BUILD");
+    if std::env::var("NEXT_PUBLIC_SCREENPIPE_PERSONAL_BUILD").is_err() {
+        return;
+    }
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    // Rebuild the label after a pull or checkout: HEAD and the branch ref it names.
+    for path in ["HEAD", "packed-refs"]
+        .iter()
+        .map(|p| git(&["rev-parse", "--git-path", p]))
+    {
+        if let Some(path) = path {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    if let Some(r) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        if let Some(path) = git(&["rev-parse", "--git-path", &r]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    if let Some(commit) = git(&["rev-parse", "--short", "HEAD"]) {
+        println!("cargo:rustc-env=SCREENPIPE_PERSONAL_COMMIT={commit}");
+    }
+}
+
 fn main() {
+    emit_personal_commit();
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let hooks = std::fs::read_to_string("windows/hooks.nsh").expect("read Windows hooks");
         let prefix = "!define SCREENPIPE_USER_MAIN_BINARY \"";

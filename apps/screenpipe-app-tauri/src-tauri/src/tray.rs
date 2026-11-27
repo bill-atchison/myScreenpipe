@@ -1498,6 +1498,8 @@ fn create_dynamic_menu(
                     "version",
                     if crate::app_mode::is_enterprise_package() {
                         format!("version {} (Enterprise)", app.package_info().version)
+                    } else if let Some(label) = crate::personal::version_label() {
+                        format!("version {} ({label})", app.package_info().version)
                     } else {
                         format!("version {}", app.package_info().version)
                     },
@@ -1703,10 +1705,13 @@ fn create_dynamic_menu(
     // --- Version (below update item) ---
     let is_beta = app.config().identifier.contains("beta");
     let is_enterprise = crate::app_mode::is_enterprise_package();
-    let version_text = match (is_beta, is_enterprise) {
-        (_, true) => format!("screenpipe v{} (Enterprise)", app.package_info().version),
-        (true, false) => format!("screenpipe v{} (Beta)", app.package_info().version),
-        (false, false) => format!("screenpipe v{}", app.package_info().version),
+    let version_text = match (is_beta, is_enterprise, crate::personal::version_label()) {
+        (_, true, _) => format!("screenpipe v{} (Enterprise)", app.package_info().version),
+        (true, false, _) => format!("screenpipe v{} (Beta)", app.package_info().version),
+        (false, false, Some(label)) => {
+            format!("screenpipe v{} ({label})", app.package_info().version)
+        }
+        (false, false, None) => format!("screenpipe v{}", app.package_info().version),
     };
     menu_builder = menu_builder.item(
         &MenuItemBuilder::with_id("version", version_text)
