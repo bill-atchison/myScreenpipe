@@ -49,11 +49,12 @@ pub use db::{
     find_matching_a11y_positions, parse_all_text_positions, ActivityActionDraft,
     ActivityActionRecord, ActivityEvidenceDraft, ActivityEvidenceRecord, ActivityIntervalDraft,
     ActivityIntervalRecord, ActivityLedgerObservation, ActivityTaskDraft, DatabaseManager,
-    DeleteTimeRangeResult, EmbeddingChunk, EmbeddingSource, EmbeddingSourceType, ImmediateTx,
-    NewMeetingTranscriptSegment, SemanticActor, SemanticActorAlias, SemanticActorReference,
-    SemanticAttachResult, SemanticCleanupResult, SemanticContextQuery, SemanticFrameContext,
-    SemanticProjectionWriteResult, StarredSession, EMBEDDING_DIMS, MEETING_END_REASON_AUTO_END,
-    MEETING_END_REASON_EXPLICIT_STOP, MEETING_END_REASON_ROOM_CHANGED, MEETING_END_REASON_SHUTDOWN,
+    DeleteTimeRangeResult, EmbeddingChunk, EmbeddingRelease, EmbeddingSource, EmbeddingSourceType,
+    ImmediateTx, NewMeetingTranscriptSegment, SemanticActor, SemanticActorAlias,
+    SemanticActorReference, SemanticAttachResult, SemanticCleanupResult, SemanticContextQuery,
+    SemanticFrameContext, SemanticProjectionWriteResult, StarredSession, EMBEDDING_DIMS,
+    MEETING_END_REASON_AUTO_END, MEETING_END_REASON_EXPLICIT_STOP, MEETING_END_REASON_ROOM_CHANGED,
+    MEETING_END_REASON_SHUTDOWN,
 };
 pub use recovery::{
     inspect_database_health, probe_quarantined_generation_health, rebuild_recovered_fts5_indexes,

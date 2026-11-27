@@ -32,6 +32,15 @@ CREATE TABLE IF NOT EXISTS embedding_cursor (
     low_water INTEGER
 );
 
+-- The text privacy release the stored vectors were built under (receipt key,
+-- NULL while release is off) and the worker's position in the ready feed.
+-- A different release invalidates every vector.
+CREATE TABLE IF NOT EXISTS embedding_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    release_key INTEGER,
+    ready_after INTEGER NOT NULL DEFAULT 0
+);
+
 -- Keep derived vectors inside the source capture's deletion/privacy boundary
 -- (retention, user delete). A shared chunk goes only after its last source.
 CREATE TRIGGER IF NOT EXISTS embedding_frames_ad AFTER DELETE ON frames BEGIN
@@ -43,6 +52,13 @@ CREATE TRIGGER IF NOT EXISTS embedding_audio_ad AFTER DELETE ON audio_transcript
 END;
 
 CREATE TRIGGER IF NOT EXISTS embedding_sources_ad AFTER DELETE ON embedding_sources
+WHEN NOT EXISTS (SELECT 1 FROM embedding_sources WHERE text_hash = OLD.text_hash)
+BEGIN
+    DELETE FROM embedding_chunks WHERE text_hash = OLD.text_hash;
+END;
+
+-- A re-released row is remapped to its new text; its old text may now be orphaned.
+CREATE TRIGGER IF NOT EXISTS embedding_sources_au AFTER UPDATE OF text_hash ON embedding_sources
 WHEN NOT EXISTS (SELECT 1 FROM embedding_sources WHERE text_hash = OLD.text_hash)
 BEGIN
     DELETE FROM embedding_chunks WHERE text_hash = OLD.text_hash;
