@@ -288,6 +288,9 @@ cargo test -p screenpipe-engine --lib recall_eval -- --ignored --nocapture
   touch the vector table, and
   sqlite-vec is loaded only inside Screenpipe.
 - Only the first chunk (about 254 tokens) of the query is embedded.
+- Texts under 4 words (`MIN_EMBED_WORDS`, e.g. a "Every turn." transcript) get
+  no vectors, because a small model ranks them close to every query; they stay
+  findable by keyword only.
 - Any `receipt_key` bump deletes and rebuilds every vector, which takes a while
   on a long history.
 

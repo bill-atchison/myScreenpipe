@@ -127,7 +127,13 @@ pub fn spawn(db: Arc<DatabaseManager>) -> JoinHandle<()> {
         let embed: Arc<EmbedFn> = Arc::new(move |texts: &[&str]| {
             let chunks: Vec<Vec<String>> = texts
                 .iter()
-                .map(|t| chunk(t, embedder.tokenizer()))
+                .map(|t| {
+                    if worth_embedding(t) {
+                        chunk(t, embedder.tokenizer())
+                    } else {
+                        Vec::new()
+                    }
+                })
                 .collect();
             embed_chunks(&chunks, |run| embedder.embed(run))
         });
@@ -147,6 +153,15 @@ async fn load_model() -> Result<Arc<Embedder>> {
         })
         .await
         .cloned()
+}
+
+/// Fewest words a text needs to get vectors. A small model places very short
+/// texts ("Every turn.") close to every query, so they would crowd out real
+/// matches; with no chunks they are recorded as done and stay keyword-only.
+const MIN_EMBED_WORDS: usize = 4;
+
+fn worth_embedding(text: &str) -> bool {
+    text.split_whitespace().nth(MIN_EMBED_WORDS - 1).is_some()
 }
 
 /// Embed each text's chunks in bounded runs, checking every run returns one
@@ -882,6 +897,41 @@ mod tests {
         assert_eq!(texts(&calls), [vec!["words"]]);
         assert_eq!(count(&db, "embedding_sources").await, 2);
         assert_eq!(count(&db, "embedding_chunks").await, 1);
+        assert!(db
+            .unembedded_frames(None, None, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn short_texts_are_recorded_without_vectors() {
+        assert!(!worth_embedding("Every turn."));
+        assert!(!worth_embedding("  Seven layers left.  "));
+        assert!(worth_embedding("the bill is past due"));
+
+        // Same per-text rule as the production closure: short texts get no chunks.
+        let embed: Arc<EmbedFn> = Arc::new(|texts: &[&str]| {
+            let mut v = [0.0; EMBEDDING_DIMS];
+            v[0] = 1.0;
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    if worth_embedding(t) {
+                        vec![v]
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect())
+        });
+        let db = memory_db().await;
+        frames(&db, &[(1, "Every turn."), (2, "the bill is past due")]).await;
+        assert_eq!(scan(&db, 10, &embed).await, 2);
+        assert_eq!(count(&db, "embedding_sources").await, 2);
+        assert_eq!(count(&db, "embedding_chunks").await, 1);
+        // Recorded as done: the short row is not picked up again.
         assert!(db
             .unembedded_frames(None, None, 10)
             .await
