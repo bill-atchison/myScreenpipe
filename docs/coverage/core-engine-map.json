@@ -265,6 +265,7 @@
         "src/hd_recorder.rs",
         "src/high_fps_controller.rs",
         "src/hot_frame_cache.rs",
+        "src/recording_stream.rs",
         "src/snapshot_compaction.rs",
         "src/video_cache.rs",
         "src/video_utils.rs",
