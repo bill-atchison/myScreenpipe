@@ -489,7 +489,8 @@ pub use self::activity_ledger::{
     ActivityIntervalDraft, ActivityIntervalRecord, ActivityLedgerObservation, ActivityTaskDraft,
 };
 pub use self::embeddings::{
-    EmbeddingChunk, EmbeddingRelease, EmbeddingSource, EmbeddingSourceType, EMBEDDING_DIMS,
+    EmbeddingChunk, EmbeddingRelease, EmbeddingSource, EmbeddingSourceType, SemanticRow,
+    EMBEDDING_DIMS,
 };
 pub use self::semantic::{
     SemanticActor, SemanticActorAlias, SemanticActorReference, SemanticAttachResult,

@@ -52,9 +52,9 @@ pub use db::{
     DeleteTimeRangeResult, EmbeddingChunk, EmbeddingRelease, EmbeddingSource, EmbeddingSourceType,
     ImmediateTx, NewMeetingTranscriptSegment, SemanticActor, SemanticActorAlias,
     SemanticActorReference, SemanticAttachResult, SemanticCleanupResult, SemanticContextQuery,
-    SemanticFrameContext, SemanticProjectionWriteResult, StarredSession, EMBEDDING_DIMS,
-    MEETING_END_REASON_AUTO_END, MEETING_END_REASON_EXPLICIT_STOP, MEETING_END_REASON_ROOM_CHANGED,
-    MEETING_END_REASON_SHUTDOWN,
+    SemanticFrameContext, SemanticProjectionWriteResult, SemanticRow, StarredSession,
+    EMBEDDING_DIMS, MEETING_END_REASON_AUTO_END, MEETING_END_REASON_EXPLICIT_STOP,
+    MEETING_END_REASON_ROOM_CHANGED, MEETING_END_REASON_SHUTDOWN,
 };
 pub use recovery::{
     inspect_database_health, probe_quarantined_generation_health, rebuild_recovered_fts5_indexes,

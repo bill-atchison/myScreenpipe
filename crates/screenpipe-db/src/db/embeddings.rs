@@ -19,7 +19,7 @@ const SOURCES_PER_HIT: i64 = 20;
 
 // The correlated LIMIT walks idx_embedding_sources_text_hash backwards, so a
 // hit reads at most SOURCES_PER_HIT index entries however many frames share it.
-const KNN_SQL: &str = "SELECT s.source_type, s.source_id, c.chunk_index, h.distance \
+const KNN_SQL: &str = "SELECT s.source_type, s.source_id, c.chunk_index, h.distance, s.text_hash \
      FROM (SELECT rowid AS id, distance FROM text_embeddings_vec \
            WHERE embedding MATCH ?1 AND k = ?2) h \
      JOIN embedding_chunks c ON c.id = h.id \
@@ -74,6 +74,22 @@ pub struct EmbeddingSource {
     pub source_type: EmbeddingSourceType,
     pub source_id: i64,
     pub text_hash: i64,
+}
+
+/// A capture row as semantic search returns it.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct SemanticRow {
+    pub id: i64,
+    pub timestamp: DateTime<Utc>,
+    /// The text the embedding worker hashes and embeds (a frame's
+    /// `full_text`); compare its hash before trusting a vector hit.
+    pub embedded_text: Option<String>,
+    /// The text to show.
+    pub text: String,
+    pub app_name: Option<String>,
+    pub window_name: Option<String>,
+    pub device: Option<String>,
+    pub speaker: Option<String>,
 }
 
 /// One embedded chunk of a distinct text.
@@ -201,27 +217,31 @@ impl DatabaseManager {
     }
 
     /// Nearest `k` chunks, expanded to the capture rows that held their text.
-    /// Returns `(source_type, source_id, chunk_index, distance)`, nearest first.
+    /// Returns `(source_type, source_id, chunk_index, distance, text_hash)`,
+    /// nearest first; `text_hash` is that of the text the row was embedded from.
     pub async fn knn(
         &self,
         query: &[f32; EMBEDDING_DIMS],
         k: i64,
-    ) -> Result<Vec<(EmbeddingSourceType, i64, i64, f32)>, SqlxError> {
-        let rows: Vec<(String, i64, i64, f64)> = sqlx::query_as(KNN_SQL)
+    ) -> Result<Vec<(EmbeddingSourceType, i64, i64, f32, i64)>, SqlxError> {
+        let rows: Vec<(String, i64, i64, f64, i64)> = sqlx::query_as(KNN_SQL)
             .bind(query.as_bytes())
             .bind(k)
             .bind(SOURCES_PER_HIT)
             .fetch_all(&mut *self.acquire_read().await?)
             .await?;
         rows.into_iter()
-            .map(|(source_type, source_id, chunk_index, distance)| {
-                Ok((
-                    EmbeddingSourceType::parse(&source_type)?,
-                    source_id,
-                    chunk_index,
-                    distance as f32,
-                ))
-            })
+            .map(
+                |(source_type, source_id, chunk_index, distance, text_hash)| {
+                    Ok((
+                        EmbeddingSourceType::parse(&source_type)?,
+                        source_id,
+                        chunk_index,
+                        distance as f32,
+                        text_hash,
+                    ))
+                },
+            )
             .collect()
     }
 
@@ -317,6 +337,97 @@ impl DatabaseManager {
                 .await
             }
         }
+    }
+
+    /// The rows among `ids` (any order) timestamped within `[start, end]`
+    /// that are released under the current text policy; deleted rows are
+    /// left out.
+    pub async fn semantic_rows(
+        &self,
+        source_type: EmbeddingSourceType,
+        ids: &[i64],
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> Result<Vec<SemanticRow>, SqlxError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = serde_json::to_string(ids).map_err(|e| SqlxError::Protocol(e.to_string()))?;
+        // Frame text is filled in from storage below.
+        let sql = match source_type {
+            EmbeddingSourceType::Frame => format!(
+                "SELECT f.id, f.timestamp, NULL AS embedded_text, '' AS text, f.app_name, \
+                 f.window_name, NULL AS device, NULL AS speaker FROM frames f \
+                 WHERE f.id IN (SELECT value FROM json_each(?1)) AND {} \
+                 AND (?2 IS NULL OR f.timestamp >= ?2) AND (?3 IS NULL OR f.timestamp <= ?3)",
+                self.release_gate("frames", "f.id").await?
+            ),
+            EmbeddingSourceType::Audio => format!(
+                "SELECT a.id, a.timestamp, a.transcription AS embedded_text, \
+                 a.transcription AS text, NULL AS app_name, NULL AS window_name, \
+                 a.device, sp.name AS speaker \
+                 FROM audio_transcriptions a LEFT JOIN speakers sp ON sp.id = a.speaker_id \
+                 WHERE a.id IN (SELECT value FROM json_each(?1)) AND {} \
+                 AND (?2 IS NULL OR a.timestamp >= ?2) AND (?3 IS NULL OR a.timestamp <= ?3)",
+                self.release_gate("audio", "a.id").await?
+            ),
+        };
+        let rows: Vec<SemanticRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(ids)
+            .bind(start)
+            .bind(end)
+            .fetch_all(&mut *self.acquire_read().await?)
+            .await?;
+        if source_type == EmbeddingSourceType::Audio || rows.is_empty() {
+            return Ok(rows);
+        }
+        // Read like `released_texts` reads it, so a hash of `embedded_text`
+        // matches what the worker embedded. A frame deleted since is skipped.
+        let found: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        let mut payloads = self.frame_payloads(&found, Projection::Search).await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let payload = payloads.remove(&row.id)?;
+                Some(SemanticRow {
+                    text: payload.text().to_string(),
+                    embedded_text: payload.full_text,
+                    ..row
+                })
+            })
+            .collect())
+    }
+
+    /// Ids of `source_type` rows whose indexed text matches `query`, within
+    /// `[start, end]`, best match first.
+    pub async fn keyword_hits(
+        &self,
+        source_type: EmbeddingSourceType,
+        query: &str,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<i64>, SqlxError> {
+        let fts = crate::text_normalizer::sanitize_fts5_query(query);
+        if fts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (fts_table, table) = match source_type {
+            EmbeddingSourceType::Frame => ("frames_fts", "frames"),
+            EmbeddingSourceType::Audio => ("audio_transcriptions_fts", "audio_transcriptions"),
+        };
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT t.id FROM {fts_table} JOIN {table} t ON t.id = {fts_table}.rowid \
+             WHERE {fts_table} MATCH ?1 \
+             AND (?2 IS NULL OR t.timestamp >= ?2) AND (?3 IS NULL OR t.timestamp <= ?3) \
+             ORDER BY {fts_table}.rank LIMIT ?4"
+        )))
+        .bind(fts)
+        .bind(start)
+        .bind(end)
+        .bind(limit)
+        .fetch_all(&mut *self.acquire_search_read().await?)
+        .await
     }
 
     /// `(id, ready)` rows to `(id, text)`: ready frames read through storage.
@@ -640,6 +751,7 @@ mod tests {
         query[1] = 0.5;
         let hits = db.knn(&query, 2).await.unwrap();
         let ids: Vec<_> = hits.iter().map(|h| (h.0, h.1, h.2)).collect();
+        assert!(hits.iter().all(|h| h.4 == 10), "{hits:?}");
         assert_eq!(
             ids,
             vec![

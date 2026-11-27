@@ -1128,6 +1128,11 @@ impl SCServer {
                 "/context/external",
                 axum::routing::post(crate::routes::external_context::post_external_context),
             )
+            // Plain axum (not in OpenAPI): hybrid search over local embeddings.
+            .route(
+                "/search/semantic",
+                get(crate::routes::semantic_search::semantic_search),
+            )
             // Agent self-improvement lives behind one validated local API so
             // native Pi and ACP share profile safety, prompt rendering, skill
             // provenance, optimistic concurrency, and bundled protection.
