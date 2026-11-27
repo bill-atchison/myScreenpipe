@@ -53,6 +53,9 @@ impl EmbeddingSourceType {
     }
 }
 
+/// Keyword search scores at most this many (newest) FTS matches per table.
+const KEYWORD_SCAN: i64 = 5000;
+
 /// Sources deleted per transaction when a release change invalidates vectors.
 const INVALIDATE_SLICE: i64 = 500;
 
@@ -416,9 +419,15 @@ impl DatabaseManager {
             EmbeddingSourceType::Frame => ("frames_fts", "frames"),
             EmbeddingSourceType::Audio => ("audio_transcriptions_fts", "audio_transcriptions"),
         };
+        // ponytail: bm25 is computed only for the newest KEYWORD_SCAN matches,
+        // so a common term costs the same on any history. Older keyword matches
+        // (and ranges entirely before them) drop out; the vector side still
+        // finds them. Upgrade: push the time range into the bounded scan.
         sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT t.id FROM {fts_table} JOIN {table} t ON t.id = {fts_table}.rowid \
              WHERE {fts_table} MATCH ?1 \
+             AND t.id IN (SELECT rowid FROM {fts_table} WHERE {fts_table} MATCH ?1 \
+                          ORDER BY rowid DESC LIMIT ?5) \
              AND (?2 IS NULL OR t.timestamp >= ?2) AND (?3 IS NULL OR t.timestamp <= ?3) \
              ORDER BY {fts_table}.rank LIMIT ?4"
         )))
@@ -426,6 +435,7 @@ impl DatabaseManager {
         .bind(start)
         .bind(end)
         .bind(limit)
+        .bind(KEYWORD_SCAN)
         .fetch_all(&mut *self.acquire_search_read().await?)
         .await
     }
@@ -1361,6 +1371,34 @@ mod tests {
             db.unembedded_audio(None, None, 10).await.unwrap(),
             vec![(1, Some("released audio".to_string()))]
         );
+        db.close().await;
+    }
+
+    /// Keyword matches are scored among the newest `KEYWORD_SCAN` only: the
+    /// oldest frame is the best match but falls outside the bound.
+    #[tokio::test]
+    async fn keyword_hits_score_only_the_newest_matches() {
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
+        let newest = KEYWORD_SCAN + 2;
+        db.execute_raw_sql_write(&format!(
+            "INSERT INTO frames(id,timestamp,full_text) VALUES (1,'2026-11-26T12:00:00Z','cat cat cat'); \
+             WITH RECURSIVE n(i) AS (SELECT 2 UNION ALL SELECT i+1 FROM n WHERE i<{}) \
+             INSERT INTO frames(id,timestamp,full_text) \
+             SELECT i,'2026-11-26T12:00:01Z','cat and a few other words' FROM n; \
+             INSERT INTO frames(id,timestamp,full_text) VALUES ({newest},'2026-11-26T12:00:02Z','cat cat cat');",
+            newest - 1
+        ))
+        .await
+        .unwrap();
+        let hits = db
+            .keyword_hits(EmbeddingSourceType::Frame, "cat", None, None, 3)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0], newest, "best match within the bound first");
+        assert!(!hits.contains(&1), "{hits:?}");
         db.close().await;
     }
 

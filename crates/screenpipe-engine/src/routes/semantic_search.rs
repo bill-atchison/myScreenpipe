@@ -10,6 +10,8 @@
 //! it was embedded from, so edited or re-redacted text never surfaces
 //! through a stale vector.
 
+use crate::history_access::HistoryAccessPolicy;
+use crate::routes::search::{apply_search_history_access, OptionalPipePerms};
 use crate::server::AppState;
 use axum::{
     extract::{Query, State},
@@ -89,8 +91,16 @@ fn internal(e: impl std::fmt::Display) -> Failure {
 
 pub(crate) async fn semantic_search(
     State(state): State<Arc<AppState>>,
+    OptionalPipePerms(pipe): OptionalPipePerms,
     Query(params): Query<SemanticSearchParams>,
 ) -> Result<Json<Value>, Failure> {
+    // Per-item app/window/content filtering is not built here.
+    if pipe.is_some_and(|p| p.has_data_restrictions() || p.privacy_filter) {
+        return Err(failure(
+            StatusCode::FORBIDDEN,
+            "semantic search is not available to pipes with data restrictions; use /search",
+        ));
+    }
     let q = params.q.trim().to_string();
     if q.is_empty() || params.q.chars().count() > MAX_QUERY_CHARS {
         return Err(failure(
@@ -105,7 +115,8 @@ pub(crate) async fn semantic_search(
         ));
     };
     let text = q.clone();
-    // CPU-bound inference stays off the async executor.
+    // CPU-bound inference stays off the async executor. Only the query's
+    // first chunk (~254 tokens) is embedded.
     let vector = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vector>> {
         let Some(first) = chunk(&text, model.tokenizer()).into_iter().next() else {
             return Ok(None);
@@ -115,9 +126,15 @@ pub(crate) async fn semantic_search(
     .await
     .map_err(internal)?
     .map_err(internal)?;
-    let items = hybrid_search(&state.db, &q, vector.as_ref(), &params)
-        .await
-        .map_err(internal)?;
+    let items = hybrid_search(
+        &state.db,
+        &q,
+        vector.as_ref(),
+        &params,
+        &state.history_access,
+    )
+    .await
+    .map_err(internal)?;
     Ok(Json(json!({ "data": items })))
 }
 
@@ -128,8 +145,13 @@ pub(crate) async fn hybrid_search(
     q: &str,
     vector: Option<&Vector>,
     params: &SemanticSearchParams,
+    history: &HistoryAccessPolicy,
 ) -> Result<Vec<SemanticSearchItem>, sqlx::Error> {
     use EmbeddingSourceType::{Audio, Frame};
+    let (mut start, end) = (params.start_time, params.end_time);
+    if apply_search_history_access(history, &mut start, end, Utc::now()) {
+        return Ok(Vec::new());
+    }
     let limit = params.limit.clamp(1, MAX_LIMIT) as usize;
     let depth = (limit as u32 * DEPTH_PER_RESULT).min(MAX_DEPTH) as usize;
     let types: &[EmbeddingSourceType] = match params.content_type {
@@ -137,7 +159,6 @@ pub(crate) async fn hybrid_search(
         ContentFilter::Audio => &[Audio],
         ContentFilter::All => &[Frame, Audio],
     };
-    let (start, end) = (params.start_time, params.end_time);
 
     // Nearest rows first, each with the hash of the text it was embedded from.
     let mut embedded: HashMap<Key, i64> = HashMap::new();
@@ -254,6 +275,7 @@ mod tests {
     use super::*;
     use axum::{body::Body, http::Request, Router};
     use screenpipe_audio::audio_manager::AudioManagerBuilder;
+    use screenpipe_core::pipes::permissions::{PermissionRule, PipePermissions};
     use screenpipe_db::privacy_release::ReleasePolicy;
     use screenpipe_db::{EmbeddingChunk, EmbeddingSource};
     use tower::ServiceExt;
@@ -306,7 +328,53 @@ mod tests {
         server.advertise_mdns = false;
         server.api_auth = true;
         server.api_auth_key = Some(KEY.into());
+        let content_deny = vec![PermissionRule::Content {
+            value: "audio".into(),
+        }];
+        for (token, deny_rules, privacy_filter) in [
+            (OPEN_PIPE, vec![], false),
+            (NO_AUDIO_PIPE, content_deny, false),
+            (PII_PIPE, vec![], true),
+        ] {
+            let perms = PipePermissions {
+                pipe_name: token.into(),
+                allow_rules: vec![],
+                deny_rules,
+                use_default_allowlist: false,
+                time_range: None,
+                days: None,
+                pipe_token: Some(token.into()),
+                pipe_dir: None,
+                privacy_filter,
+            };
+            server
+                .pipe_permissions
+                .insert(token.into(), Arc::new(perms));
+        }
         server.try_create_router().await.unwrap()
+    }
+
+    const OPEN_PIPE: &str = "sp_pipe_open";
+    const NO_AUDIO_PIPE: &str = "sp_pipe_no_audio";
+    const PII_PIPE: &str = "sp_pipe_pii";
+
+    /// Per-item filtering is not built: restricted pipes are refused.
+    #[tokio::test]
+    async fn refuses_pipes_with_data_restrictions() {
+        let r = memory_router().await;
+        for pipe in [NO_AUDIO_PIPE, PII_PIPE] {
+            let (status, body) = get(&r, Some(pipe), "q=hello").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{pipe}");
+            assert_eq!(
+                body["error"],
+                "semantic search is not available to pipes with data restrictions; use /search"
+            );
+        }
+        // Unrestricted pipes and the app get past the check (503: no model).
+        for token in [OPEN_PIPE, KEY] {
+            let (status, _) = get(&r, Some(token), "q=hello").await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{token}");
+        }
     }
 
     async fn get(router: &Router, token: Option<&str>, query: &str) -> (StatusCode, Value) {
@@ -480,7 +548,7 @@ mod tests {
     ) -> Vec<(Key, &'static str)> {
         let mut frames = params(q);
         frames.content_type = ContentFilter::Frame;
-        hybrid_search(db, q, vector, &frames)
+        hybrid_search(db, q, vector, &frames, &open())
             .await
             .unwrap()
             .into_iter()
@@ -537,7 +605,7 @@ mod tests {
     async fn returns_released_rows_with_filters() {
         let root = tempfile::tempdir().unwrap();
         let db = privacy_fixture(&root).await;
-        let all = hybrid_search(&db, "cat", Some(&unit(1)), &params("cat"))
+        let all = hybrid_search(&db, "cat", Some(&unit(1)), &params("cat"), &open())
             .await
             .unwrap();
         assert_eq!(all[0].source_type, "audio");
@@ -558,10 +626,68 @@ mod tests {
         only_frames.content_type = ContentFilter::Frame;
         only_frames.start_time = Some("2026-11-26T12:00:02Z".parse().unwrap());
         only_frames.limit = 1;
-        let hits = hybrid_search(&db, "cat", Some(&unit(1)), &only_frames)
+        let hits = hybrid_search(&db, "cat", Some(&unit(1)), &only_frames, &open())
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!((hits[0].source_type, hits[0].id), ("frame", 2));
+    }
+
+    fn open() -> HistoryAccessPolicy {
+        HistoryAccessPolicy::unrestricted()
+    }
+
+    /// Rows older than the history-access cutoff never return from either
+    /// side; a range ending before it returns nothing.
+    #[tokio::test]
+    async fn history_cutoff_hides_older_rows() {
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
+        let recent = (Utc::now() - chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        db.execute_raw_sql_write(&format!(
+            "INSERT INTO frames(id,timestamp,full_text) VALUES \
+               (1,'2020-01-01T00:00:00Z','old cat'),(2,'{recent}','new cat')"
+        ))
+        .await
+        .unwrap();
+        let (old, new) = (text_hash("old cat"), text_hash("new cat"));
+        let source = |source_id, text_hash| EmbeddingSource {
+            source_type: FRAME,
+            source_id,
+            text_hash,
+        };
+        let chunk = |text_hash| EmbeddingChunk {
+            text_hash,
+            chunk_index: 0,
+            embedding: unit(0),
+        };
+        db.insert_embeddings(
+            &[source(1, old), source(2, new)],
+            &[],
+            &[chunk(old), chunk(new)],
+        )
+        .await
+        .unwrap();
+        let search = |params: SemanticSearchParams, history: HistoryAccessPolicy| {
+            let db = &db;
+            async move {
+                hybrid_search(db, "cat", Some(&unit(0)), &params, &history)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|i| (i.id, i.matched_by))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let mut all = search(params("cat"), open()).await;
+        all.sort();
+        assert_eq!(all, [(1, "both"), (2, "both")]);
+        let limited = HistoryAccessPolicy::last_24_hours;
+        assert_eq!(search(params("cat"), limited()).await, [(2, "both")]);
+        let mut before = params("cat");
+        before.end_time = Some("2020-06-01T00:00:00Z".parse().unwrap());
+        assert!(search(before, limited()).await.is_empty());
     }
 }

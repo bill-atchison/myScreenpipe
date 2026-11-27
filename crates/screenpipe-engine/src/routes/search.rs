@@ -1021,7 +1021,7 @@ fn try_acquire_search_permit(semaphore: Arc<Semaphore>) -> Option<OwnedSemaphore
 ///
 /// Returns `true` when the requested range ends wholly before the accessible
 /// boundary. Callers can then return an empty result without touching the DB.
-fn apply_search_history_access(
+pub(crate) fn apply_search_history_access(
     policy: &HistoryAccessPolicy,
     start_time: &mut Option<DateTime<Utc>>,
     end_time: Option<DateTime<Utc>>,
@@ -2953,11 +2953,13 @@ pub(crate) async fn storage_snapshot_middleware(
     use axum::response::IntoResponse;
     let path = request.uri().path();
     let read = (request.method() == axum::http::Method::GET
-        && (matches!(path, "/search" | "/search/keyword" | "/elements")
-            || (path.starts_with("/frames/")
-                && ["/text", "/ocr", "/context", "/metadata", "/elements"]
-                    .iter()
-                    .any(|suffix| path.ends_with(suffix)))))
+        && (matches!(
+            path,
+            "/search" | "/search/keyword" | "/search/semantic" | "/elements"
+        ) || (path.starts_with("/frames/")
+            && ["/text", "/ocr", "/context", "/metadata", "/elements"]
+                .iter()
+                .any(|suffix| path.ends_with(suffix)))))
         || (request.method() == axum::http::Method::POST && path == "/raw_sql");
     if !read {
         return next.run(request).await;
