@@ -314,6 +314,7 @@ mod tests {
             monitor_hosts_focus: true,
             ax_screenshot_coherent: true,
             focused_window_bounds: None,
+            stored_labels: None,
         };
         let stored = paired_capture(&ctx, None, None)
             .await

@@ -3416,6 +3416,7 @@ async fn persist_masked_screenshot(
         monitor_hosts_focus: false,
         ax_screenshot_coherent: false,
         focused_window_bounds: None,
+        stored_labels: None,
     };
     let result = paired_capture_with_optional_db(&ctx, None, None, true, snapshot_image).await?;
     if let (Some(sender), PairedCaptureOutcome::Indexed(result)) = (params.semantic_tx, &result) {

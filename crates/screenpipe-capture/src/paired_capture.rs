@@ -1524,6 +1524,7 @@ mod tests {
             monitor_hosts_focus: true,
             ax_screenshot_coherent: true,
             focused_window_bounds: None,
+            stored_labels: None,
         };
         let mut tree = make_snap(vec![AccessibilityTreeNode {
             text: "Contact me@example.com".into(),
@@ -1680,6 +1681,7 @@ mod tests {
             monitor_hosts_focus: false,
             ax_screenshot_coherent: false,
             focused_window_bounds: None,
+            stored_labels: None,
         };
         let presized =
             DynamicImage::ImageRgb8(RgbImage::from_pixel(50, 50, image::Rgb([200, 0, 0])));
