@@ -132,7 +132,11 @@ case "$cmd" in
       # Same identity every build keeps the handoff working and TCC grants across rebuilds.
       id='$SIGN_IDENTITY'
       if ! security find-identity -v -p codesigning | grep -qF \"\\\"\$id\\\"\"; then
-        echo \"warning: no '\$id' code-signing certificate (see PERSONAL.md); signing ad hoc, so macOS will ask for permissions again\" >&2
+        if security find-identity -p codesigning | grep -qF \"\\\"\$id\\\"\"; then
+          echo \"warning: '\$id' exists but is not trusted for code signing (PERSONAL.md, step 3); signing ad hoc\" >&2
+        else
+          echo \"warning: no '\$id' code-signing certificate (see PERSONAL.md); signing ad hoc, so macOS will ask for permissions again\" >&2
+        fi
         id=-
       fi
       if pgrep -f '$PROD_PAT' >/dev/null; then

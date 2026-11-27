@@ -124,8 +124,13 @@ developer account is needed. On the Mac:
 2. Name: `screenpipe personal` (exactly; `install` looks for this name).
    Identity Type: **Self-Signed Root**. Certificate Type: **Code Signing**.
    Click **Create**, then **Done**. It goes into your login keychain.
-3. Check it: `security find-identity -v -p codesigning` lists
-   `"screenpipe personal"`.
+3. Trust it for code signing: in Keychain Access, double-click
+   **screenpipe personal** (login keychain, My Certificates), expand
+   **Trust**, set **Code Signing** to **Always Trust**, close the window and
+   enter your password. Certificate Assistant does not do this for you.
+4. Check it: `security find-identity -v -p codesigning` lists
+   `"screenpipe personal"`. Without step 3 it only appears without `-v`,
+   marked `CSSMERR_TP_NOT_TRUSTED`.
 
 `install` signs with it automatically (override with `SIGN_IDENTITY=...`) and
 falls back to ad hoc, with a warning, when it isn't there. The first build
