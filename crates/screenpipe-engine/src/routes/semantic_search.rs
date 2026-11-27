@@ -690,4 +690,146 @@ mod tests {
         before.end_time = Some("2020-06-01T00:00:00Z".parse().unwrap());
         assert!(search(before, limited()).await.is_empty());
     }
+
+    const EVAL_FRAMES: [&str; 30] = [
+        "fn retry_with_backoff(attempts: u32) { sleep(Duration::from_secs(2u64.pow(attempts))); } // wait longer after each failed request",
+        "Subject: Statement from Acme Corp. Hi, the bill from Acme is past due by 14 days. Please remit the balance of $2,300 to avoid late fees.",
+        "Onboarding guide: new hires receive a laptop on their first day and must enroll in two-factor authentication before accessing internal systems.",
+        "Maria: can we push the release to Thursday? QA found a crash when opening large files",
+        "$ git push origin main\nerror: failed to push some refs. hint: Updates were rejected because the remote contains work that you do not have locally",
+        "Slow-cooker chili: brown the beef, add beans, tomatoes and cumin, then simmer for six hours.",
+        "Team standup moved to 10:30. Conference room Birch is booked; join by video link if remote.",
+        "SELECT customer_id, SUM(amount) FROM orders GROUP BY customer_id HAVING SUM(amount) > 10000;",
+        "Expense policy: meals while traveling are reimbursed up to $60 per day with itemized receipts.",
+        "error[E0382]: borrow of moved value: `config` --> src/main.rs:42:20",
+        "Sam: my flight lands at 7pm, can someone pick me up from the airport?",
+        "Your password will expire in 3 days. Choose a new one to keep your account secure.",
+        "Quarterly revenue grew 12% compared to last year, driven by subscription renewals in the enterprise segment.",
+        "Heavy rain expected across the region this weekend with flooding possible near the river.",
+        "def test_login_rejects_wrong_password(): assert client.post('/login', json={'password': 'bad'}).status_code == 401",
+        "Reminder: the dentist appointment is tomorrow at 3pm, remember to bring your insurance card",
+        "Kubernetes pods keep restarting because the container runs out of memory; raise the memory limit in the deployment manifest.",
+        "Lee: I'm stepping out for lunch, back in an hour.",
+        "Q3 budget: marketing 45,000 engineering 210,000 travel 18,000 total headcount 52",
+        "Congratulations! Your job application has moved to the final interview round. Please select a time slot.",
+        "npm ERR! ENOSPC: no space left on device, write",
+        "Meeting notes: we decided to drop the legacy dashboard and migrate every customer to the new analytics page by March.",
+        "// TODO: cache the thumbnails so we don't regenerate them on every scroll",
+        "Best hiking trails near Seattle: Rattlesnake Ledge, Mount Si, and Snow Lake, all under ten miles.",
+        "Priya: the client hated the first mockup, they want a darker color scheme",
+        "Privacy notice: we never sell personal data and you may request deletion of your account at any time.",
+        "Your package has shipped and will arrive on Friday. Track it with the number below.",
+        "Connection refused: could not reach database server at localhost:5432",
+        "button.addEventListener('click', () => { modal.classList.add('hidden'); });",
+        "Tom: great news, the funding round closed and we raised the seed money",
+    ];
+
+    const EVAL_AUDIO: [&str; 4] = [
+        "so basically the sprint is slipping because the backend team is waiting on the design specs",
+        "remember to buy milk eggs and bread on the way home",
+        "I think we should hire another engineer before the product launch",
+        "the quarterly review with the board is scheduled for next Tuesday afternoon",
+    ];
+
+    /// (query, target). Frame ids are 1-based positions in `EVAL_FRAMES`.
+    const EVAL_QUERIES: [(&str, Key); 11] = [
+        ("invoice overdue payment", (FRAME, 2)),
+        ("why does my service keep crashing out of memory", (FRAME, 17)),
+        ("can't push my code changes", (FRAME, 5)),
+        ("groceries to pick up", (AUDIO, 2)),
+        ("when does the plane arrive", (FRAME, 11)),
+        ("forgot login credentials expiring", (FRAME, 12)),
+        ("disk is full", (FRAME, 21)),
+        ("decided to retire the old reporting tool", (FRAME, 22)),
+        ("wait before retrying failed network calls", (FRAME, 1)),
+        ("raised money from investors", (FRAME, 30)),
+        ("doctor visit reminder", (FRAME, 16)),
+    ];
+
+    /// Recall of keyword-only search versus hybrid search with the real
+    /// model, on a small paraphrase fixture. Prints each query's target rank.
+    #[tokio::test]
+    #[ignore = "downloads all-MiniLM-L6-v2 (~90 MB) from Hugging Face"]
+    async fn recall_eval() {
+        use screenpipe_embed::{default_cache_dir, Embedder};
+        let model = Embedder::load(default_cache_dir().unwrap()).await.unwrap();
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
+        let sql_text = |t: &str| t.replace('\'', "''");
+        let mut sql = String::new();
+        for (i, text) in EVAL_FRAMES.iter().enumerate() {
+            sql += &format!(
+                "INSERT INTO frames(id,timestamp,full_text) VALUES({},'2026-11-26T12:00:{:02}Z','{}');",
+                i + 1,
+                i,
+                sql_text(text)
+            );
+        }
+        sql += "INSERT INTO audio_chunks(id,file_path) VALUES(1,'a.wav');";
+        for (i, text) in EVAL_AUDIO.iter().enumerate() {
+            sql += &format!(
+                "INSERT INTO audio_transcriptions(id,audio_chunk_id,offset_index,timestamp,transcription,device) \
+                 VALUES({0},1,{0},'2026-11-26T13:00:{0:02}Z','{1}','mic');",
+                i + 1,
+                sql_text(text)
+            );
+        }
+        db.execute_raw_sql_write(&sql).await.unwrap();
+
+        let (mut sources, mut chunks) = (Vec::new(), Vec::new());
+        let frames = EVAL_FRAMES.iter().map(|t| (FRAME, *t));
+        let audio = EVAL_AUDIO.iter().map(|t| (AUDIO, *t));
+        for (n, (kind, text)) in frames.chain(audio).enumerate() {
+            // Frames take ids 1..=30; audio restarts at 1.
+            let id = if kind == FRAME { n + 1 } else { n + 1 - EVAL_FRAMES.len() } as i64;
+            let pieces = chunk(text, model.tokenizer());
+            let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+            sources.push(EmbeddingSource {
+                source_type: kind,
+                source_id: id,
+                text_hash: text_hash(text),
+            });
+            for (index, embedding) in model.embed(&refs).unwrap().into_iter().enumerate() {
+                chunks.push(EmbeddingChunk {
+                    text_hash: text_hash(text),
+                    chunk_index: index as i64,
+                    embedding,
+                });
+            }
+        }
+        db.insert_embeddings(&sources, &[], &chunks).await.unwrap();
+
+        let rank = |hits: &[SemanticSearchItem], target: Key| {
+            hits.iter()
+                .position(|h| h.id == target.1 && h.source_type == target.0.as_str())
+                .map(|p| p + 1)
+        };
+        let show = |r: Option<usize>| r.map_or("miss".to_string(), |r| r.to_string());
+        let (mut keyword_hits, mut hybrid_hits) = (0, 0);
+        eprintln!("{:<50} {:>8} {:>8}", "query", "keyword", "hybrid");
+        for (q, target) in EVAL_QUERIES {
+            let first = chunk(q, model.tokenizer()).remove(0);
+            let vector = model.embed(&[first.as_str()]).unwrap().remove(0);
+            let keyword = hybrid_search(&db, q, None, &params(q), &open())
+                .await
+                .unwrap();
+            let hybrid = hybrid_search(&db, q, Some(&vector), &params(q), &open())
+                .await
+                .unwrap();
+            let (k, h) = (rank(&keyword, target), rank(&hybrid, target));
+            keyword_hits += k.is_some_and(|r| r <= 5) as usize;
+            hybrid_hits += h.is_some_and(|r| r <= 5) as usize;
+            eprintln!("{q:<50} {:>8} {:>8}", show(k), show(h));
+        }
+        let total = EVAL_QUERIES.len() as f64;
+        eprintln!(
+            "recall@5: keyword {keyword_hits}/{0} = {1:.2}, hybrid {hybrid_hits}/{0} = {2:.2}",
+            EVAL_QUERIES.len(),
+            keyword_hits as f64 / total,
+            hybrid_hits as f64 / total
+        );
+        assert!(hybrid_hits >= keyword_hits);
+        assert!(hybrid_hits as f64 / total >= 0.7);
+    }
 }
