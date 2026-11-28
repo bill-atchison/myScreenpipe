@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Standup Update — {{standup_date}}</title>
+  <style>
+    :root {
+      --paper:#f4efe1; --ink:#221f18; --maroon:#8a2b27; --meta-bg:#e9e1cd;
+      --label:#6d5f4e; --value:#2b2820; --amber:#a8762b;
+      --rule:#ddd3bc; --subrule:#ece4d0; --card:#faf7ef;
+      --serif:Georgia,'Times New Roman',serif;
+      --mono:ui-monospace,'Cascadia Mono',Consolas,'Courier New',monospace;
+    }
+    * { box-sizing:border-box; }
+    body {
+      margin:0; background:var(--paper); color:var(--ink);
+      font-family:var(--serif); font-size:17px; line-height:1.6;
+    }
+    .sheet {
+      max-width:64rem; margin:0 auto; padding:3.5rem 2rem 3.4rem;
+      display:flex; flex-direction:column; gap:2.6rem;
+    }
+    .masthead { display:flex; flex-direction:column; gap:1.2rem; }
+    .eyebrow {
+      margin:0; color:var(--maroon); font-family:var(--mono);
+      font-size:.76rem; font-weight:700; letter-spacing:.16em; text-transform:uppercase;
+    }
+    h1 {
+      margin:0; color:var(--ink); font-family:var(--serif);
+      font-size:clamp(2.2rem,5.4vw,3.4rem); font-weight:700;
+      line-height:1.06; letter-spacing:-.01em;
+    }
+    .facts {
+      display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.35fr) minmax(0,.9fr);
+      gap:1px; margin:0; background:var(--rule); border:1px solid var(--rule);
+      border-left:6px solid var(--maroon); border-radius:14px; overflow:hidden;
+    }
+    .facts > div {
+      display:flex; flex-direction:column; gap:.4rem; min-width:0;
+      padding:1rem 1.2rem; background:var(--meta-bg);
+    }
+    .facts dt {
+      color:var(--label); font-family:var(--mono); font-size:.66rem;
+      font-weight:700; letter-spacing:.14em; text-transform:uppercase;
+    }
+    .facts dd {
+      margin:0; color:var(--value); font-family:var(--mono);
+      font-size:.84rem; line-height:1.5; overflow-wrap:anywhere;
+    }
+    .block { display:flex; flex-direction:column; gap:1.25rem; min-width:0; }
+    .section-heading { display:flex; flex-direction:column; gap:.65rem; }
+    .section-heading::before {
+      content:""; display:block; width:3.5rem; height:3px;
+      border-radius:2px; background:var(--maroon);
+    }
+    h2 {
+      margin:0; color:var(--ink); font-family:var(--serif);
+      font-size:1.75rem; font-weight:700; line-height:1.15; letter-spacing:-.01em;
+    }
+    .summary-box {
+      padding:1.2rem 1.5rem; background:var(--meta-bg);
+      border-left:5px solid var(--amber); border-radius:0 12px 12px 0;
+    }
+    .recap-list { margin:0; padding-left:1.4rem; max-width:84ch; list-style-type:disc; }
+    .recap-list li {
+      margin:0 0 .9rem; padding-left:.25rem; color:var(--ink);
+      line-height:1.6; overflow-wrap:anywhere;
+    }
+    .recap-list li:last-child { margin-bottom:0; }
+    .recap-list li::marker { color:var(--maroon); }
+    strong { color:var(--value); }
+    code {
+      font-family:var(--mono); font-size:.85em; color:var(--ink);
+      background:var(--meta-bg); border:1px solid var(--rule);
+      padding:.05em .35em; border-radius:5px; overflow-wrap:anywhere;
+    }
+    .summary-box code { background:var(--card); }
+    a { color:var(--maroon); text-underline-offset:.18em; }
+    :focus-visible { outline:2px solid var(--maroon); outline-offset:3px; }
+    @media (max-width:44rem) { .facts { grid-template-columns:1fr; } }
+    @media (max-width:34rem) {
+      body { font-size:16px; }
+      .sheet { padding:2.5rem 1rem; gap:2.2rem; }
+      .summary-box { padding:1rem 1.1rem; }
+    }
+    @media print {
+      .sheet { max-width:none; padding:0; gap:1.8rem; }
+      .masthead,.section-heading,.facts { break-inside:avoid; }
+      .section-heading { break-after:avoid; }
+      .recap-list li { orphans:3; widows:3; }
+      body { print-color-adjust:exact; -webkit-print-color-adjust:exact; }
+    }
+  </style>
+</head>
+<body>
+  <main class="sheet">
+    <header class="masthead">
+      <p class="eyebrow">Day Recap</p>
+      <h1>Standup Update</h1>
+      <dl class="facts">
+        <div><dt>Standup Date:</dt><dd>{{standup_date}}</dd></div>
+        <div><dt>Curated Today —</dt><dd>{{curated_at}}</dd></div>
+        <div><dt>Type:</dt><dd>Standup Update</dd></div>
+      </dl>
+    </header>
+    <section class="block" aria-labelledby="tldr-heading">
+      <header class="section-heading"><h2 id="tldr-heading">TL;DR</h2></header>
+      <div class="summary-box"><ul class="recap-list">{{tldr_items}}</ul></div>
+    </section>
+    <section class="block" aria-labelledby="yesterday-heading">
+      <header class="section-heading"><h2 id="yesterday-heading">Yesterday</h2></header>
+      <ul class="recap-list">{{yesterday_items}}</ul>
+    </section>
+    <section class="block" aria-labelledby="today-heading">
+      <header class="section-heading"><h2 id="today-heading">Today</h2></header>
+      <ul class="recap-list">{{today_items}}</ul>
+    </section>
+  </main>
+</body>
+</html>

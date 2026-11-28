@@ -52,6 +52,7 @@ Use only screenpipe's recorded data via the local API at `http://localhost:3030`
    Actions:
    - <owner>: <action> (<due, if said>)
    ```
+   - Each transcript line has a `deviceType`: `input` is William's microphone (William speaking); `output` is the call audio (the other participants). An action said on `input` is William's; an action said on `output` is never William's.
    - Speaker labels ("speaker 1", "?") are anonymous and can be wrong. Name an owner only when the same exchange shows who it is: someone is addressed by name just before they commit ("Hey, Don… Yes, sir, will do" → Don), or they name themselves. William is called "Bill" by others; give William an action only when he is addressed or clearly speaking as the one who will do it ("I'll get something set up for today" in his exchange with Don). Otherwise use the speaker's role as it shows in the meeting ("offshore lead", "tester", "support"), and "owner unclear" only when even that is unknown.
    - Include every follow-up someone commits to out loud ("I'll follow up with him", "I'll send you the reports", "email us if you need a replacement"), not only formal decisions. Walk the transcript to the very end: commitments often come in the last minutes after the main meeting ends.
    - When several defects or tickets are discussed, keep each outcome attached to the right one; if you cannot tell which outcome belongs to which, say so instead of guessing.
