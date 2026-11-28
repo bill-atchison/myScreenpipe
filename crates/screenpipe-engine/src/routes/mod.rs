@@ -32,6 +32,7 @@ pub mod retranscribe;
 pub mod search;
 pub mod semantic;
 pub mod semantic_search;
+pub mod snippets;
 pub mod speakers;
 pub mod streaming;
 pub mod structured_outputs;

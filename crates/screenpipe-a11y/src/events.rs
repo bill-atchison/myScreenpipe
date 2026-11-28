@@ -166,6 +166,23 @@ pub struct AncestorHop {
     pub name: Option<String>,
 }
 
+/// Most clipboard text kept per event, in bytes; room for a copied source
+/// file so snippet capture gets whole code. Runs once per clipboard event.
+pub const CLIPBOARD_CONTENT_MAX_BYTES: usize = 20_000;
+
+/// Clipboard text as stored: at most [`CLIPBOARD_CONTENT_MAX_BYTES`], cut on
+/// a char boundary and marked with a trailing "..." when cut.
+pub fn cap_clipboard_text(text: &str) -> String {
+    if text.len() <= CLIPBOARD_CONTENT_MAX_BYTES {
+        return text.to_string();
+    }
+    let mut end = CLIPBOARD_CONTENT_MAX_BYTES - 3;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
 /// Serialize an ancestor chain (leaf-most first, as collected by walking
 /// AXParent upward) into the compact root-first JSON stored on the event:
 /// `[{"role":"AXWindow","name":"Inbox"},{"role":"AXGroup"},...]`.
@@ -939,6 +956,18 @@ impl UiEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_text_keeps_20k_bytes_and_cuts_on_a_char_boundary() {
+        let code = "fn a() {}\n".repeat(1_500); // 15,000 bytes: kept whole
+        assert_eq!(cap_clipboard_text(&code), code);
+        // 'é' is two bytes; 19,997 is mid-character.
+        let long = "é".repeat(15_000);
+        let capped = cap_clipboard_text(&long);
+        assert!(capped.len() <= CLIPBOARD_CONTENT_MAX_BYTES);
+        assert!(capped.len() >= CLIPBOARD_CONTENT_MAX_BYTES - 4);
+        assert!(capped.ends_with("é..."));
+    }
 
     fn hop(role: &str, name: Option<&str>) -> AncestorHop {
         AncestorHop {

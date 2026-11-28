@@ -113,6 +113,7 @@ import {
   Download,
   Trash2,
   Search,
+  Code,
   ListTodo,
   Pause,
   Play,
@@ -322,6 +323,7 @@ const SERVER_RESTART_SETTINGS = new Set<keyof SettingsStore>([
   "enableWorkflowEvents",
   "disableSnapshotCompaction",
   "enableSemanticSearch",
+  "enableSnippetCapture",
 ]);
 
 type AudioPipelineSnapshot = {
@@ -4065,6 +4067,27 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 id="enableSemanticSearch"
                 checked={Boolean(settings.enableSemanticSearch ?? false)}
                 onCheckedChange={(checked) => handleSettingsChange({ enableSemanticSearch: checked }, true)}
+              />
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <Code className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground">{ui("Code snippets")}</h3>
+                  <p className="text-xs text-muted-foreground">
+                    {ui("Save code you copy as snippets. Turns on clipboard recording: the text of everything you copy, cut or paste is stored on this device, even when clipboard capture is off. Keystrokes are not recorded. Restarts recording.")}
+                  </p>
+                </div>
+              </div>
+              <Switch
+                id="enableSnippetCapture"
+                checked={Boolean(settings.enableSnippetCapture ?? false)}
+                onCheckedChange={(checked) => handleSettingsChange({ enableSnippetCapture: checked }, true)}
               />
             </div>
           </CardContent>

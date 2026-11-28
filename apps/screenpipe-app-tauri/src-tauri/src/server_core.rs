@@ -1526,6 +1526,14 @@ impl ServerCore {
             Arc::clone(&db),
             local_data_dir.clone(),
         ));
+        // Opt-in snippet capture: saves copied code from recorded clipboard rows.
+        if config.enable_snippet_capture {
+            owned_tasks.push(screenpipe_engine::snippet_worker::spawn(
+                Arc::clone(&db),
+                local_data_dir.clone(),
+                config.async_pii_redaction,
+            ));
+        }
 
         Ok(Self {
             db,

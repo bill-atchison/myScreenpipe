@@ -594,7 +594,7 @@ fn clipboard_snapshot(capture_content: bool, apply_pii: bool) -> Option<(i64, Op
         }
     })?;
     let content = content.map(|text| {
-        let truncated = truncate(&text, 1000);
+        let truncated = crate::events::cap_clipboard_text(&text);
         if apply_pii {
             remove_pii(&truncated)
         } else {

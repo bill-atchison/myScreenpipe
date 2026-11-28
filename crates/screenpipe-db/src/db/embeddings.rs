@@ -609,7 +609,7 @@ impl DatabaseManager {
     /// policy is certified: the gate `protected_reads` applies, after which
     /// the source columns hold the redacted text. `*_redacted_at` markers
     /// are not used; they survive policy changes and edits.
-    async fn release_gate(&self, kind: &str, id: &str) -> Result<String, SqlxError> {
+    pub(super) async fn release_gate(&self, kind: &str, id: &str) -> Result<String, SqlxError> {
         Ok(if self.release_policy().await?.text {
             format!(
                 "EXISTS (SELECT 1 FROM _privacy_release r JOIN _privacy_policy p ON p.id = 1 \

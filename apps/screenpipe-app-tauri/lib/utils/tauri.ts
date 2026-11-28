@@ -3898,6 +3898,13 @@ semanticContextMode?: SemanticContextMode;
  */
 enableSemanticSearch?: boolean;
 /**
+ * Save code the user copies as snippets (`/snippets`). Turning it on
+ * also records clipboard text (copies, cuts and pastes) into input
+ * history, overriding `disableClipboardCapture`; keystrokes stay off
+ * unless enabled separately. Opt-in. Takes effect on restart.
+ */
+enableSnippetCapture?: boolean;
+/**
  * Legacy timeline gate retained for managed deployments and compatibility.
  * Consumer installs migrate visibility to sidebarNavLayout. Screenshot
  * capture controls cache work through `timeline_cache_disabled`.

@@ -47,6 +47,9 @@ pub struct RecordingConfig {
     pub semantic_context_mode: SemanticContextMode,
     /// Opt in to the background embedding worker for semantic search.
     pub enable_semantic_search: bool,
+    /// Opt in to the snippet worker; also turns clipboard rows on
+    /// (`disable_clipboard_capture` is false whenever this is true).
+    pub enable_snippet_capture: bool,
     /// Skip timeline cache warm-up and per-frame/audio buffering when capture
     /// is off or the legacy timeline gate is set. The streaming endpoint can
     /// still read saved history directly from the database.
@@ -317,6 +320,7 @@ impl RecordingConfig {
             enable_semantic_context: settings.enable_semantic_context,
             semantic_context_mode: settings.semantic_context_mode,
             enable_semantic_search: settings.enable_semantic_search,
+            enable_snippet_capture: settings.enable_snippet_capture,
             disable_timeline: settings.timeline_cache_disabled(),
             use_pii_removal: settings.use_pii_removal,
             async_pii_redaction: settings.async_pii_redaction,
@@ -379,7 +383,7 @@ impl RecordingConfig {
             ignore_incognito_windows: settings.ignore_incognito_windows,
             enhanced_incognito_detection: settings.enhanced_incognito_detection,
             pause_on_drm_content: settings.pause_on_drm_content,
-            disable_clipboard_capture: settings.disable_clipboard_capture,
+            disable_clipboard_capture: settings.clipboard_capture_disabled(),
             disable_keyboard_capture: settings.disable_keyboard_capture,
             disable_click_capture: settings.disable_click_capture,
             languages: settings
@@ -691,6 +695,27 @@ mod tests {
             ..Default::default()
         };
         assert!(build(&settings).enable_semantic_search);
+    }
+
+    /// Snippet capture turns clipboard text on and nothing else: keystrokes
+    /// stay off.
+    #[test]
+    fn snippet_capture_turns_on_clipboard_content_only() {
+        let settings = screenpipe_config::RecordingSettings {
+            enable_snippet_capture: true,
+            disable_clipboard_capture: true,
+            disable_keyboard_capture: true,
+            ..Default::default()
+        };
+        let config = build(&settings);
+        assert!(config.enable_snippet_capture);
+        let ui = config.to_ui_recorder_config();
+        assert!(ui.capture_clipboard);
+        assert!(ui.capture_clipboard_content);
+        assert!(ui.record_clipboard_events);
+        assert!(!ui.capture_text);
+        assert!(!ui.record_keyboard_events);
+        assert!(!build(&screenpipe_config::RecordingSettings::default()).enable_snippet_capture);
     }
 
     #[test]

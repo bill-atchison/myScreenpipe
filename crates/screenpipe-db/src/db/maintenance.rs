@@ -322,6 +322,7 @@ impl DatabaseManager {
                 .execute(&mut **tx.conn())
                 .await?;
         let ui_events_deleted = ui_events_result.rows_affected();
+        super::snippets::delete_snippets_in_range(tx.conn(), &start_str, &end_str).await?;
 
         // display_layout follows user deletions instead of living forever
         // (rows carry personal device names) — but KEEP the newest snapshot
@@ -527,6 +528,7 @@ impl DatabaseManager {
                 .execute(&mut **tx.conn())
                 .await?;
         let ui_events_deleted = ui_events_result.rows_affected();
+        super::snippets::delete_snippets_in_range(tx.conn(), &start_str, &end_str).await?;
 
         // display_layout follows user deletions instead of living forever
         // (rows carry personal device names) — but KEEP the newest snapshot

@@ -1190,6 +1190,14 @@ impl SCServer {
                 "/search/semantic",
                 get(crate::routes::semantic_search::semantic_search),
             )
+            // Plain axum (not in OpenAPI): code snippets saved from clipboard copies.
+            .route("/snippets", get(crate::routes::snippets::list_snippets))
+            .route(
+                "/snippets/:id",
+                get(crate::routes::snippets::get_snippet)
+                    .put(crate::routes::snippets::update_snippet)
+                    .delete(crate::routes::snippets::delete_snippet),
+            )
             // Read-only reuse of local chat discovery; inherits API auth and
             // vault/pipe permissions. No cross-chat dispatch is exposed.
             .route(

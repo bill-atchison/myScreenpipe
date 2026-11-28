@@ -668,6 +668,20 @@ pub struct RecordArgs {
     )]
     pub enable_semantic_search: bool,
 
+    /// Save code you copy as snippets (`/snippets`). Also records clipboard
+    /// text (copies, cuts and pastes), overriding --disable-clipboard-capture;
+    /// keystrokes stay off. Off by default. `--enable-snippet-capture=false`
+    /// or the environment variable overrides a saved choice; CLI flags win.
+    #[arg(
+        long,
+        env = "SCREENPIPE_ENABLE_SNIPPET_CAPTURE",
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true"
+    )]
+    pub enable_snippet_capture: bool,
+
     /// Windows to ignore (case-insensitive contains). Use `App::Title` to
     /// scope to one window of one app (e.g. `Slack::#hr`). `::title` matches
     /// any app whose focused window title contains `title`. `App::` blocks
@@ -968,6 +982,7 @@ pub struct RecordArgSources {
     pub app_context: bool,
     pub enable_semantic_context: bool,
     pub enable_semantic_search: bool,
+    pub enable_snippet_capture: bool,
     pub ignored_windows: bool,
     pub included_windows: bool,
     pub ignored_urls: bool,
@@ -1045,6 +1060,10 @@ impl RecordArgSources {
                 record.value_source("enable_semantic_search"),
                 Some(ValueSource::CommandLine | ValueSource::EnvVariable)
             ),
+            enable_snippet_capture: matches!(
+                record.value_source("enable_snippet_capture"),
+                Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+            ),
             ignored_windows: from_command_line(record, "ignored_windows"),
             included_windows: from_command_line(record, "included_windows"),
             ignored_urls: from_command_line(record, "ignored_urls"),
@@ -1105,6 +1124,7 @@ impl RecordArgSources {
             || self.app_context
             || self.enable_semantic_context
             || self.enable_semantic_search
+            || self.enable_snippet_capture
             || self.ignored_windows
             || self.included_windows
             || self.ignored_urls
@@ -1210,6 +1230,8 @@ impl RecordArgs {
         let capture_on_clipboard = self
             .capture_on_clipboard
             .unwrap_or(defaults.capture_on_clipboard);
+        // Snippet capture reads clipboard rows, so it turns them on.
+        let clipboard_off = self.disable_clipboard_capture && !self.enable_snippet_capture;
         crate::ui_recorder::UiRecorderConfig {
             enabled: true,
             enable_tree_walker: true,
@@ -1219,15 +1241,15 @@ impl RecordArgs {
             included_windows: self.included_windows.clone(),
             // Keep operation detection alive when clipboard-triggered capture
             // is enabled, but do not store rows/content when the user opted out.
-            capture_clipboard: !self.disable_clipboard_capture || capture_on_clipboard,
-            capture_clipboard_content: !self.disable_clipboard_capture,
+            capture_clipboard: !clipboard_off || capture_on_clipboard,
+            capture_clipboard_content: !clipboard_off,
             // Keyboard events always reach the recorder so they can wake
             // event-driven capture. --disable-keyboard-capture only stops
             // text/key rows from being persisted.
             capture_text: !self.disable_keyboard_capture,
             capture_keystrokes: true,
             record_keyboard_events: !self.disable_keyboard_capture,
-            record_clipboard_events: !self.disable_clipboard_capture,
+            record_clipboard_events: !clipboard_off,
             // Clicks stay captured at the hook level so they keep waking
             // event-driven capture; only row persistence is gated.
             record_click_events: !self.disable_click_capture,
@@ -1273,6 +1295,7 @@ impl RecordArgs {
             enable_semantic_context,
             semantic_context_mode,
             enable_semantic_search: self.enable_semantic_search,
+            enable_snippet_capture: self.enable_snippet_capture,
             // CLI has no --disable-timeline flag; the desktop app drives this
             // toggle. Default to enabled (timeline on) for the engine binary.
             disable_timeline: false,
@@ -1612,6 +1635,9 @@ impl RecordArgs {
         }
         if sources.enable_semantic_search {
             settings.enable_semantic_search = self.enable_semantic_search;
+        }
+        if sources.enable_snippet_capture {
+            settings.enable_snippet_capture = self.enable_snippet_capture;
         }
         // An explicit --monitor-id or --use-all-monitors means the user wants
         // vision on, so it clears a persisted disable_vision:true (the #3648
@@ -2917,6 +2943,7 @@ mod tests {
         for flag in [
             "--enable-semantic-context",
             "--enable-semantic-search",
+            "--enable-snippet-capture",
             "--experimental-meeting-piggyback",
             "--disable-clipboard-capture",
             "--disable-keyboard-capture",
@@ -2937,6 +2964,7 @@ mod tests {
                 let mut settings = screenpipe_config::RecordingSettings {
                     enable_semantic_context: !enabled,
                     enable_semantic_search: !enabled,
+                    enable_snippet_capture: !enabled,
                     experimental_meeting_piggyback: !enabled,
                     disable_clipboard_capture: !enabled,
                     disable_keyboard_capture: !enabled,
@@ -2946,6 +2974,7 @@ mod tests {
                 let actual = match flag {
                     "--enable-semantic-context" => settings.enable_semantic_context,
                     "--enable-semantic-search" => settings.enable_semantic_search,
+                    "--enable-snippet-capture" => settings.enable_snippet_capture,
                     "--experimental-meeting-piggyback" => settings.experimental_meeting_piggyback,
                     "--disable-clipboard-capture" => settings.disable_clipboard_capture,
                     _ => settings.disable_keyboard_capture,
@@ -2985,6 +3014,29 @@ mod tests {
         let mut saved = screenpipe_config::RecordingSettings::default();
         record_args(argv).apply_explicit_overrides(&mut saved, &sources);
         assert!(saved.enable_semantic_search);
+    }
+
+    #[test]
+    fn snippet_capture_flag_is_opt_in_and_turns_on_clipboard_rows_only() {
+        let argv = ["screenpipe", "record", "--disable-clipboard-capture"];
+        let args = record_args(argv);
+        assert!(!args.to_recording_settings().enable_snippet_capture);
+        assert!(!args.to_ui_recorder_config().record_clipboard_events);
+
+        let argv = [
+            "screenpipe",
+            "record",
+            "--disable-clipboard-capture",
+            "--disable-keyboard-capture",
+            "--enable-snippet-capture",
+        ];
+        let args = record_args(argv);
+        assert!(args.to_recording_settings().enable_snippet_capture);
+        let ui = args.to_ui_recorder_config();
+        assert!(ui.capture_clipboard_content);
+        assert!(ui.record_clipboard_events);
+        assert!(!ui.record_keyboard_events);
+        assert!(!ui.capture_text);
     }
 
     #[test]

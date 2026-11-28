@@ -2390,6 +2390,15 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
     // the embedding worker.
     let project_tag_worker =
         screenpipe_engine::project_tag_worker::spawn(Arc::clone(&db), local_data_dir.clone());
+    // Opt-in (`--enable-snippet-capture`): saves copied code from recorded
+    // clipboard rows. Aborted with the embedding worker.
+    let snippet_worker = config.enable_snippet_capture.then(|| {
+        screenpipe_engine::snippet_worker::spawn(
+            Arc::clone(&db),
+            local_data_dir.clone(),
+            config.async_pii_redaction,
+        )
+    });
 
     // Image-PII reconciliation worker (issue #3185 follow-up).
     // Independent of the text worker — users can toggle either one
@@ -2532,6 +2541,9 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
         worker.abort();
     }
     project_tag_worker.abort();
+    if let Some(worker) = &snippet_worker {
+        worker.abort();
+    }
     let _ = shutdown_tx.send(());
     if let Some(ref handle) = ui_recorder_handle {
         handle.stop();

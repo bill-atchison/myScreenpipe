@@ -578,7 +578,7 @@ fn monitor_keyboards(
                                     thread::sleep(std::time::Duration::from_millis(50));
                                     let content = if capture_content {
                                         get_clipboard().map(|s| {
-                                            let truncated = truncate(&s, 1000);
+                                            let truncated = crate::events::cap_clipboard_text(&s);
                                             if apply_pii {
                                                 remove_pii(&truncated)
                                             } else {
@@ -615,7 +615,7 @@ fn monitor_keyboards(
                                     thread::sleep(std::time::Duration::from_millis(50));
                                     let content = if capture_content {
                                         get_clipboard().map(|s| {
-                                            let truncated = truncate(&s, 1000);
+                                            let truncated = crate::events::cap_clipboard_text(&s);
                                             if apply_pii {
                                                 remove_pii(&truncated)
                                             } else {
@@ -646,7 +646,7 @@ fn monitor_keyboards(
                             evdev::KeyCode::KEY_V => {
                                 let content = if config.capture_clipboard_content {
                                     get_clipboard().map(|s| {
-                                        let truncated = truncate(&s, 1000);
+                                        let truncated = crate::events::cap_clipboard_text(&s);
                                         if config.apply_pii_removal {
                                             remove_pii(&truncated)
                                         } else {

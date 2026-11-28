@@ -100,6 +100,7 @@ mod semantic_worker;
 pub mod server;
 pub mod sleep_monitor;
 pub mod snapshot_compaction;
+pub mod snippet_worker;
 pub mod structured_outputs;
 mod sync_api;
 pub mod sync_provider;

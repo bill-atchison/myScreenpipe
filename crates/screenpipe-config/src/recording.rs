@@ -474,6 +474,13 @@ pub struct RecordingSettings {
     #[serde(rename = "enableSemanticSearch", default)]
     pub enable_semantic_search: bool,
 
+    /// Save code the user copies as snippets (`/snippets`). Turning it on
+    /// also records clipboard text (copies, cuts and pastes) into input
+    /// history, overriding `disableClipboardCapture`; keystrokes stay off
+    /// unless enabled separately. Opt-in. Takes effect on restart.
+    #[serde(rename = "enableSnippetCapture", default)]
+    pub enable_snippet_capture: bool,
+
     /// Legacy timeline gate retained for managed deployments and compatibility.
     /// Consumer installs migrate visibility to sidebarNavLayout. Screenshot
     /// capture controls cache work through `timeline_cache_disabled`.
@@ -947,6 +954,11 @@ impl RecordingSettings {
         self.disable_timeline || self.disable_screenshots || self.disable_vision
     }
 
+    /// Snippet capture needs clipboard text, so it turns clipboard rows on.
+    pub fn clipboard_capture_disabled(&self) -> bool {
+        self.disable_clipboard_capture && !self.enable_snippet_capture
+    }
+
     /// Returns the Deepgram API key if actually configured.
     /// Treats empty string and "default" as not configured (matching existing behavior).
     pub fn effective_deepgram_key(&self) -> Option<&str> {
@@ -1017,6 +1029,7 @@ impl Default for RecordingSettings {
             enable_semantic_context: false,
             semantic_context_mode: SemanticContextMode::Memory,
             enable_semantic_search: false,
+            enable_snippet_capture: false,
             disable_timeline: false,
             monitor_ids: vec![],
             use_all_monitors: true,
@@ -1681,6 +1694,29 @@ mod tests {
         .unwrap();
         assert!(!computer_use.semantic_context_mode.includes_memory());
         assert!(computer_use.semantic_context_mode.includes_computer_use());
+    }
+
+    #[test]
+    fn snippet_capture_defaults_off_round_trips_and_turns_clipboard_on() {
+        let legacy: RecordingSettings = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.enable_snippet_capture);
+        assert!(!RecordingSettings::default().enable_snippet_capture);
+        let on: RecordingSettings =
+            serde_json::from_str(r#"{"enableSnippetCapture":true,"disableClipboardCapture":true}"#)
+                .unwrap();
+        assert!(on.enable_snippet_capture);
+        assert!(!on.clipboard_capture_disabled());
+        let json = serde_json::to_value(&on).unwrap();
+        assert_eq!(json["enableSnippetCapture"], true);
+        assert_eq!(
+            serde_json::from_value::<RecordingSettings>(json).unwrap(),
+            on
+        );
+        let off = RecordingSettings {
+            enable_snippet_capture: false,
+            ..on
+        };
+        assert!(off.clipboard_capture_disabled());
     }
 
     #[test]
