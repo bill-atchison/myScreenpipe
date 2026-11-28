@@ -565,8 +565,11 @@ fn spawn_clipboard_worker_thread(
                 if !seen.capture_and_deliver(
                     || {
                         with_allowed_focus(&current_focus, |focus| {
-                            let (generation, content) =
-                                clipboard_snapshot(req.capture_content, req.apply_pii)?;
+                            let (generation, content) = clipboard_snapshot(
+                                req.capture_content,
+                                req.apply_pii,
+                                crate::events::clipboard_cap(req.operation, req.max_bytes),
+                            )?;
                             let event = clipboard_event(req.operation, content, req.start, &focus);
                             Some(((req.operation != 'v').then_some(generation), event))
                         })
@@ -584,7 +587,11 @@ fn spawn_clipboard_worker_thread(
 
 /// Read content and its pasteboard identity together, then process the stable
 /// content outside the snapshot window. Both native producers use this policy.
-fn clipboard_snapshot(capture_content: bool, apply_pii: bool) -> Option<(i64, Option<String>)> {
+fn clipboard_snapshot(
+    capture_content: bool,
+    apply_pii: bool,
+    max_bytes: usize,
+) -> Option<(i64, Option<String>)> {
     let (generation, content) = stable_snapshot(get_clipboard_change_count, || {
         if capture_content {
             let _pool = cidre::objc::AutoreleasePoolPage::push();
@@ -594,7 +601,7 @@ fn clipboard_snapshot(capture_content: bool, apply_pii: bool) -> Option<(i64, Op
         }
     })?;
     let content = content.map(|text| {
-        let truncated = crate::events::cap_clipboard_text(&text);
+        let truncated = crate::events::cap_clipboard_text(&text, max_bytes);
         if apply_pii {
             remove_pii(&truncated)
         } else {
@@ -707,6 +714,10 @@ fn run_clipboard_poller(
                     let (generation, content) = clipboard_snapshot(
                         config.capture_clipboard_content,
                         config.apply_pii_removal,
+                        crate::events::clipboard_cap(
+                            CLIPBOARD_OP_POLLED,
+                            config.clipboard_content_max_bytes,
+                        ),
                     )?;
                     observed_generation = Some(generation);
                     let event = clipboard_event(CLIPBOARD_OP_POLLED, content, start, &focus);
@@ -777,6 +788,8 @@ struct ClipboardRequest {
     delay_ms: u64,
     capture_content: bool,
     apply_pii: bool,
+    /// Configured copy/cut cap; see `clipboard_cap`.
+    max_bytes: usize,
     start: Instant,
     tx: Sender<UiEvent>,
 }
@@ -1357,6 +1370,7 @@ extern "C" fn tap_callback(
                         delay_ms: delay,
                         capture_content: state.config.capture_clipboard_content,
                         apply_pii: state.config.apply_pii_removal,
+                        max_bytes: state.config.clipboard_content_max_bytes,
                         start: state.start,
                         tx: state.tx.clone(),
                     });

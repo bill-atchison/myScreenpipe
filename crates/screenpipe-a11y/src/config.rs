@@ -47,6 +47,12 @@ pub struct UiCaptureConfig {
     /// Capture clipboard content (privacy risk - disabled by default)
     pub capture_clipboard_content: bool,
 
+    /// Most copy/cut text kept per clipboard event, in bytes; pastes always
+    /// keep [`crate::events::DEFAULT_CLIPBOARD_CONTENT_MAX_BYTES`]. Raised
+    /// only while snippet capture is on.
+    #[serde(default = "default_clipboard_content_max_bytes")]
+    pub clipboard_content_max_bytes: usize,
+
     /// Capture element context on clicks (slower but richer)
     pub capture_context: bool,
 
@@ -194,6 +200,10 @@ impl std::str::FromStr for ExtractionThreadPriority {
     }
 }
 
+fn default_clipboard_content_max_bytes() -> usize {
+    crate::events::DEFAULT_CLIPBOARD_CONTENT_MAX_BYTES
+}
+
 impl Default for UiCaptureConfig {
     fn default() -> Self {
         Self {
@@ -216,6 +226,7 @@ impl Default for UiCaptureConfig {
             scroll_interval_ms: None,
             capture_clipboard: true,
             capture_clipboard_content: true,
+            clipboard_content_max_bytes: default_clipboard_content_max_bytes(),
             capture_context: true,
             capture_mouse_move: false, // High volume
             capture_tree: false,       // Freezes foreground apps on Windows; snapshots unconsumed

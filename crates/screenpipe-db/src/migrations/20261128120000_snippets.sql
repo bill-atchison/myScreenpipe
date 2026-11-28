@@ -19,7 +19,11 @@ CREATE TABLE IF NOT EXISTS snippets (
     document_path TEXT,
     frame_id INTEGER,
     ui_event_id INTEGER,
-    enriched_at TEXT
+    enriched_at TEXT,
+    -- Text privacy receipt key the copy was released under when saved; NULL
+    -- when release was off. While release is on, the API serves a snippet
+    -- only if this matches the current key or its event is released now.
+    release_key INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_snippets_created_at ON snippets(created_at);

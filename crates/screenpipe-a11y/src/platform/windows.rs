@@ -1294,6 +1294,13 @@ impl InputWorker {
     fn emit_clipboard_event(&self, p: PendingClipboard) {
         let content = if self.config.capture_clipboard_content {
             get_clipboard_text().map(|c| {
+                let c = crate::events::cap_clipboard_text(
+                    &c,
+                    crate::events::clipboard_cap(
+                        p.operation,
+                        self.config.clipboard_content_max_bytes,
+                    ),
+                );
                 if self.config.apply_pii_removal {
                     remove_pii(&c)
                 } else {

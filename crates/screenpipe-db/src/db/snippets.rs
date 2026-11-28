@@ -32,6 +32,9 @@ pub struct ClipboardCopy {
     pub ready: bool,
     /// Not ready after a day: the worker gives up on it instead of waiting.
     pub stale: bool,
+    /// Text privacy receipt key `ready` was judged under; `None` while
+    /// release is off.
+    pub release_key: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -45,6 +48,7 @@ pub struct NewSnippet {
     pub document_path: Option<String>,
     pub frame_id: Option<i64>,
     pub ui_event_id: i64,
+    pub release_key: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -171,12 +175,18 @@ impl DatabaseManager {
     ) -> Result<Vec<ClipboardCopy>, SqlxError> {
         let input_gate = self.release_gate("input", "u.id").await?;
         let frame_gate = self.release_gate("frames", "f.id").await?;
+        let release_key = if input_gate == "1" {
+            "NULL"
+        } else {
+            "(SELECT receipt_key FROM _privacy_policy WHERE id = 1)"
+        };
         sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT u.id, COALESCE(strftime('{TIME_FORMAT}', u.timestamp), u.timestamp) AS created_at, \
                u.text_content AS content, u.app_name, u.window_title, u.browser_url, \
                CASE WHEN {frame_gate} THEN f.document_path END AS document_path, u.frame_id, \
                ({input_gate}) AND (?3 = 0 OR u.redacted_at IS NOT NULL) AS ready, \
-               julianday(u.timestamp) < julianday('now', '-1 day') AS stale \
+               julianday(u.timestamp) < julianday('now', '-1 day') AS stale, \
+               {release_key} AS release_key \
              FROM ui_events u LEFT JOIN frames f ON f.id = u.frame_id \
              WHERE u.event_type = 'clipboard' AND u.id > ?1 \
                AND u.text_content IS NOT NULL AND trim(u.text_content) != '' \
@@ -212,12 +222,14 @@ impl DatabaseManager {
         let held = Instant::now();
         let added = sqlx::query(
             "INSERT OR IGNORE INTO snippets (created_at, content, content_hash, language, \
-               app_name, window_title, browser_url, document_path, frame_id, ui_event_id) \
+               app_name, window_title, browser_url, document_path, frame_id, ui_event_id, \
+               release_key) \
              SELECT json_extract(value, '$.created_at'), json_extract(value, '$.content'), \
                json_extract(value, '$.content_hash'), json_extract(value, '$.language'), \
                json_extract(value, '$.app_name'), json_extract(value, '$.window_title'), \
                json_extract(value, '$.browser_url'), json_extract(value, '$.document_path'), \
-               json_extract(value, '$.frame_id'), json_extract(value, '$.ui_event_id') \
+               json_extract(value, '$.frame_id'), json_extract(value, '$.ui_event_id'), \
+               json_extract(value, '$.release_key') \
              FROM json_each(?)",
         )
         .bind(payload)
@@ -290,6 +302,21 @@ impl DatabaseManager {
         Ok(linked)
     }
 
+    /// While text privacy release is on, a snippet is served only if it was
+    /// saved under the current receipt key or its clipboard event is
+    /// released now; snippets saved before release was switched on stay
+    /// hidden until then.
+    async fn snippet_release_gate(&self) -> Result<String, SqlxError> {
+        let event = self.release_gate("input", "ui_event_id").await?;
+        Ok(if event == "1" {
+            event
+        } else {
+            format!(
+                "(release_key = (SELECT receipt_key FROM _privacy_policy WHERE id = 1) OR {event})"
+            )
+        })
+    }
+
     /// Newest first.
     // ponytail: `q` is a LIKE scan over every snippet; add FTS5 if the
     // library grows past what a scan answers quickly (tens of thousands).
@@ -301,9 +328,10 @@ impl DatabaseManager {
                 .replace('_', "\\_");
             format!("%{escaped}%")
         });
+        let gate = self.snippet_release_gate().await?;
         let rows: Vec<SnippetRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {COLUMNS} FROM snippets \
-             WHERE (?1 IS NULL OR content LIKE ?1 ESCAPE '\\' OR title LIKE ?1 ESCAPE '\\' \
+             WHERE {gate} AND (?1 IS NULL OR content LIKE ?1 ESCAPE '\\' OR title LIKE ?1 ESCAPE '\\' \
                     OR description LIKE ?1 ESCAPE '\\') \
                AND (?2 IS NULL OR language = ?2 COLLATE NOCASE) \
                AND (?3 IS NULL OR app_name = ?3 COLLATE NOCASE) \
@@ -326,8 +354,9 @@ impl DatabaseManager {
     }
 
     pub async fn get_snippet(&self, id: i64) -> Result<Option<Snippet>, SqlxError> {
+        let gate = self.snippet_release_gate().await?;
         let row: Option<SnippetRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "SELECT {COLUMNS} FROM snippets WHERE id = ?"
+            "SELECT {COLUMNS} FROM snippets WHERE id = ? AND {gate}"
         )))
         .bind(id)
         .fetch_optional(&self.pool)
@@ -408,6 +437,7 @@ mod tests {
             document_path: copy.document_path.clone(),
             frame_id: copy.frame_id,
             ui_event_id: copy.id,
+            release_key: copy.release_key,
         }
     }
 
@@ -620,6 +650,20 @@ mod tests {
         let db = DatabaseManager::new(path.to_str().unwrap(), Default::default())
             .await
             .unwrap();
+        // Saved while release was off, from event 2.
+        db.execute_raw_sql_write(
+            "INSERT INTO ui_events(id,timestamp,event_type,text_content) \
+             VALUES (2,'2026-11-28T09:00:00Z','clipboard','fn early() {}'); \
+             INSERT INTO snippets(id,created_at,content,content_hash,ui_event_id) \
+             VALUES (1,'2026-11-28T09:00:00.000Z','fn early() {}','early',2);",
+        )
+        .await
+        .unwrap();
+        let all = SnippetFilter {
+            limit: 50,
+            ..Default::default()
+        };
+        assert_eq!(db.list_snippets(&all).await.unwrap().len(), 1);
         db.configure_release(&ReleasePolicy {
             identity: "test:model-v1".into(),
             text: true,
@@ -627,25 +671,55 @@ mod tests {
         })
         .await
         .unwrap();
+        assert!(
+            db.list_snippets(&all).await.unwrap().is_empty(),
+            "saved before release, event not released: hidden"
+        );
+        assert!(db.get_snippet(1).await.unwrap().is_none());
         db.execute_raw_sql_write(
             "INSERT INTO ui_events(id,timestamp,event_type,text_content,redacted_at) \
-             VALUES (1,'2026-11-28T10:00:00Z','clipboard','key = \"alice@example.com\";',1)",
+             VALUES (3,'2026-11-28T10:00:00Z','clipboard','key = \"alice@example.com\";',1)",
         )
         .await
         .unwrap();
-        let copies = db.clipboard_copies_after(0, 10, false).await.unwrap();
+        let copies = db.clipboard_copies_after(2, 10, false).await.unwrap();
         assert!(
             !copies[0].ready,
             "a redaction timestamp alone is not a release"
         );
 
-        let job = db.release_pending("input", 10).await.unwrap().remove(0);
+        let job = db
+            .release_pending("input", 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == "3")
+            .unwrap();
         let mut values = job.values.clone();
         values.insert("text_content".into(), Some("key = \"[EMAIL]\";".into()));
         assert!(db.publish_release(&job, &values).await.unwrap());
-        let copies = db.clipboard_copies_after(0, 10, true).await.unwrap();
+        let copies = db.clipboard_copies_after(2, 10, true).await.unwrap();
         assert!(copies[0].ready);
+        assert!(copies[0].release_key.is_some());
         assert_eq!(copies[0].content, "key = \"[EMAIL]\";");
+
+        // Saved under the current release: served; the early one still is not.
+        db.insert_snippets(&[new_snippet(&copies[0])])
+            .await
+            .unwrap();
+        let served = db.list_snippets(&all).await.unwrap();
+        assert_eq!(
+            served
+                .iter()
+                .map(|s| s.content.as_str())
+                .collect::<Vec<_>>(),
+            ["key = \"[EMAIL]\";"]
+        );
+        // Retention unlinks it; the receipt key it was saved under still serves it.
+        db.execute_raw_sql_write("DELETE FROM ui_events WHERE id = 3")
+            .await
+            .unwrap();
+        assert_eq!(db.list_snippets(&all).await.unwrap().len(), 1);
         db.close().await;
     }
 }

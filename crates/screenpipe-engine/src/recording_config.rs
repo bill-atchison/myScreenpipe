@@ -500,6 +500,11 @@ impl RecordingConfig {
             included_windows: self.included_windows.clone(),
             capture_clipboard: !self.disable_clipboard_capture || capture_on_clipboard,
             capture_clipboard_content: !self.disable_clipboard_capture,
+            clipboard_content_max_bytes: if self.enable_snippet_capture {
+                screenpipe_a11y::events::SNIPPET_CLIPBOARD_CONTENT_MAX_BYTES
+            } else {
+                screenpipe_a11y::events::DEFAULT_CLIPBOARD_CONTENT_MAX_BYTES
+            },
             // Keyboard events always reach the recorder so they can wake
             // event-driven capture. Persisting text/key rows remains the
             // privacy-sensitive opt-in controlled by disable_keyboard_capture.
@@ -715,6 +720,20 @@ mod tests {
         assert!(ui.record_clipboard_events);
         assert!(!ui.capture_text);
         assert!(!ui.record_keyboard_events);
+        assert_eq!(
+            ui.to_ui_config().clipboard_content_max_bytes,
+            screenpipe_a11y::events::SNIPPET_CLIPBOARD_CONTENT_MAX_BYTES
+        );
+        let off = build(&screenpipe_config::RecordingSettings {
+            disable_clipboard_capture: false,
+            ..Default::default()
+        });
+        assert_eq!(
+            off.to_ui_recorder_config()
+                .to_ui_config()
+                .clipboard_content_max_bytes,
+            screenpipe_a11y::events::DEFAULT_CLIPBOARD_CONTENT_MAX_BYTES
+        );
         assert!(!build(&screenpipe_config::RecordingSettings::default()).enable_snippet_capture);
     }
 

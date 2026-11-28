@@ -4080,7 +4080,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 <div>
                   <h3 className="text-sm font-medium text-foreground">{ui("Code snippets")}</h3>
                   <p className="text-xs text-muted-foreground">
-                    {ui("Save code you copy as snippets. Turns on clipboard recording: the text of everything you copy, cut or paste is stored on this device, even when clipboard capture is off. Keystrokes are not recorded. Restarts recording.")}
+                    {ui("Save code you copy from now on as snippets. Turns on clipboard recording: the text of everything you copy, cut or paste is stored on this device, even when clipboard capture is off. Keystrokes are not recorded. Saved snippets are kept until you delete them; clipboard retention does not remove them. Restarts recording.")}
                   </p>
                 </div>
               </div>

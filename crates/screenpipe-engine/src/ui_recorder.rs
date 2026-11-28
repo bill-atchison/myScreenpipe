@@ -169,6 +169,8 @@ pub struct UiRecorderConfig {
     pub capture_clipboard: bool,
     /// Capture clipboard content (privacy sensitive)
     pub capture_clipboard_content: bool,
+    /// Most copy/cut text kept per clipboard event; raised for snippet capture.
+    pub clipboard_content_max_bytes: usize,
     /// Capture app switches
     pub capture_app_switch: bool,
     /// Capture window focus changes
@@ -236,6 +238,8 @@ impl Default for UiRecorderConfig {
             capture_keystrokes: false,
             capture_clipboard: true,
             capture_clipboard_content: true,
+            clipboard_content_max_bytes:
+                screenpipe_a11y::events::DEFAULT_CLIPBOARD_CONTENT_MAX_BYTES,
             capture_app_switch: true,
             capture_window_focus: true,
             // On by default where bursts are coalesced to one row per gesture
@@ -279,6 +283,7 @@ impl UiRecorderConfig {
         // clipboard event storage/content is disabled for privacy.
         config.capture_clipboard = self.capture_clipboard || self.capture_on_clipboard;
         config.capture_clipboard_content = self.capture_clipboard && self.capture_clipboard_content;
+        config.clipboard_content_max_bytes = self.clipboard_content_max_bytes;
         config.capture_app_switch = self.capture_app_switch;
         // Window focus changes are workflow boundaries. Keep them enabled
         // for both CLI and desktop-app runs even if an older caller carries

@@ -574,11 +574,13 @@ fn monitor_keyboards(
                                 let start = start;
                                 let capture_content = config.capture_clipboard_content;
                                 let apply_pii = config.apply_pii_removal;
+                                let max_bytes = config.clipboard_content_max_bytes;
                                 thread::spawn(move || {
                                     thread::sleep(std::time::Duration::from_millis(50));
                                     let content = if capture_content {
                                         get_clipboard().map(|s| {
-                                            let truncated = crate::events::cap_clipboard_text(&s);
+                                            let truncated =
+                                                crate::events::cap_clipboard_text(&s, max_bytes);
                                             if apply_pii {
                                                 remove_pii(&truncated)
                                             } else {
@@ -611,11 +613,13 @@ fn monitor_keyboards(
                                 let start = start;
                                 let capture_content = config.capture_clipboard_content;
                                 let apply_pii = config.apply_pii_removal;
+                                let max_bytes = config.clipboard_content_max_bytes;
                                 thread::spawn(move || {
                                     thread::sleep(std::time::Duration::from_millis(50));
                                     let content = if capture_content {
                                         get_clipboard().map(|s| {
-                                            let truncated = crate::events::cap_clipboard_text(&s);
+                                            let truncated =
+                                                crate::events::cap_clipboard_text(&s, max_bytes);
                                             if apply_pii {
                                                 remove_pii(&truncated)
                                             } else {
@@ -646,7 +650,12 @@ fn monitor_keyboards(
                             evdev::KeyCode::KEY_V => {
                                 let content = if config.capture_clipboard_content {
                                     get_clipboard().map(|s| {
-                                        let truncated = crate::events::cap_clipboard_text(&s);
+                                        // Pastes keep the small default cap: this runs on the
+                                        // evdev loop.
+                                        let truncated = crate::events::cap_clipboard_text(
+                                            &s,
+                                            crate::events::DEFAULT_CLIPBOARD_CONTENT_MAX_BYTES,
+                                        );
                                         if config.apply_pii_removal {
                                             remove_pii(&truncated)
                                         } else {

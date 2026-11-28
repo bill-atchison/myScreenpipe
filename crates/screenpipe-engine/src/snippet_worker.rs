@@ -5,8 +5,10 @@
 //! worker reads clipboard copies and cuts recorded in `ui_events` since its
 //! high water mark, keeps the ones that look like code, and saves them to
 //! `snippets` (served by `/snippets`). Progress lives in a sidecar
-//! `snippets.state.json`, not in the database. Capture is never touched: the
-//! clipboard rows are already durable when this reads them.
+//! `snippets.state.json`, not in the database. The first run (no state file)
+//! starts at the newest event, so only copies made after opting in are
+//! saved. Capture is never touched: the clipboard rows are already durable
+//! when this reads them.
 //!
 //! Privacy: `ui_events` is the `input` surface of the text privacy release.
 //! While release is on, a copy is saved only after its input receipt is
@@ -17,15 +19,17 @@
 //! like a secret (keys, tokens, passwords) is never saved. Snippets outlive
 //! clipboard retention; a user's time-range delete removes the snippets
 //! copied in that range. Snippets saved before release was switched on are
-//! not revisited.
+//! not revisited, but the API hides them until their event is released.
 //!
-//! Capture keeps at most `CLIPBOARD_CONTENT_MAX_BYTES` (20,000) of clipboard
-//! text and marks a cut copy with a trailing "..."; those are not saved, so
-//! a snippet is never a fragment.
+//! With snippet capture on, capture keeps up to
+//! `SNIPPET_CLIPBOARD_CONTENT_MAX_BYTES` (20,000) of a copy or cut (pastes
+//! stay at 1,000) and marks a cut copy with a trailing "..."; those are not
+//! saved, so a snippet is never a fragment.
 
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use regex::Regex;
+use screenpipe_a11y::events::SNIPPET_CLIPBOARD_CONTENT_MAX_BYTES;
 use screenpipe_db::{ClipboardCopy, DatabaseManager, NewSnippet};
 use screenpipe_resource::ResourceGovernor;
 use serde::{Deserialize, Serialize};
@@ -53,12 +57,11 @@ pub struct State {
     pub high_water: i64,
 }
 
-/// A missing or unreadable state file starts over; inserts are idempotent.
-pub fn read_state(path: &Path) -> State {
+/// `None`: no (readable) state file, i.e. the first run since opting in.
+pub fn read_state(path: &Path) -> Option<State> {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
 }
 
 fn write_state(path: &Path, state: &State) -> Result<()> {
@@ -198,11 +201,13 @@ const OPERATORS: &[&str] = &[
 
 /// A credential written out: a quoted literal assigned to a secret-named key,
 /// an env-style secret assignment, or a bearer token.
-static SECRET_ASSIGNMENTS: Lazy<[Regex; 3]> = Lazy::new(|| {
+static SECRET_ASSIGNMENTS: Lazy<[Regex; 4]> = Lazy::new(|| {
     [
-        r#"(?i)(pass(word|wd)?|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token|access[_-]?token)\w*["']?\s*[:=]\s*["'][^"'\s]{6,}["']"#,
+        r#"(?i)(pass(word|wd)?|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token|access[_-]?token)\w*["']?\s*[:=]\s*["']?[^"'\s]{6,}"#,
         r"(?m)^\s*(export\s+)?[A-Z0-9_]*(PASSWORD|PASSWD|SECRET|API_KEY|TOKEN|PRIVATE_KEY)[A-Z0-9_]*\s*=\s*\S{6,}",
         r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{16,}",
+        // Credentials in a URL: scheme://user:pass@host.
+        r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@",
     ]
     .map(|p| Regex::new(p).expect("secret pattern compiles"))
 });
@@ -515,11 +520,13 @@ pub struct PassStats {
     pub linked: u64,
 }
 
-/// Capture marks clipboard text it cut short with a trailing "...".
-// ponytail: code that really ends in "..." is skipped too; compare against
-// the cap length if that matters.
+/// Capture cuts copies at the snippet cap (on, since this worker runs only
+/// with snippet capture) and marks them with a trailing "...". Shorter text
+/// ending in "..." is real code and kept.
+// ponytail: PII removal after the cut can shorten a cut copy below the
+// threshold; it would then be saved as a fragment.
 fn cut_by_capture(text: &str) -> bool {
-    text.trim_end().ends_with("...")
+    text.ends_with("...") && text.len() >= SNIPPET_CLIPBOARD_CONTENT_MAX_BYTES - 4
 }
 
 fn new_snippet(copy: &ClipboardCopy) -> NewSnippet {
@@ -543,6 +550,7 @@ fn new_snippet(copy: &ClipboardCopy) -> NewSnippet {
         document_path: copy.document_path.clone(),
         frame_id: copy.frame_id,
         ui_event_id: copy.id,
+        release_key: copy.release_key,
     }
 }
 
@@ -554,9 +562,18 @@ pub async fn pass(
     wait_for_redaction: bool,
     state_path: &Path,
 ) -> Result<(State, PassStats)> {
-    let mut state = read_state(state_path);
     let mut stats = PassStats::default();
     let max = db.max_ui_event_id().await?;
+    let Some(mut state) = read_state(state_path) else {
+        // First run since opting in: only copies made from now on are saved.
+        let state = State { high_water: max };
+        write_state(state_path, &state)?;
+        info!(
+            high_water = max,
+            "snippets: first run, saving copies from now on"
+        );
+        return Ok((state, stats));
+    };
     if max < state.high_water {
         // A replaced or reset database: ids restart.
         info!(
@@ -620,6 +637,13 @@ pub async fn pass(
         stats.linked = db
             .link_snippet_frames(&since, LINK_BATCH, guess_language)
             .await?;
+    }
+    if stats.passed_over > 0 {
+        warn!(
+            passed_over = stats.passed_over,
+            "snippets: gave up on clipboard copies still unreleased or unredacted after a day; \
+             is PII redaction / privacy release processing ui_events?"
+        );
     }
     if stats.scanned > 0 || stats.linked > 0 {
         info!(
@@ -693,6 +717,8 @@ mod tests {
         "const client = new Client({\n  apiKey: \"a8f3k2j9d0s7l1q4w6e8r2t5\",\n});",
         "password = \"hunter2hunter2\";",
         "DB_PASSWORD=supersecretvalue\nDB_HOST=localhost",
+        "password = hunter2hunter2\nlet user = admin;",
+        "DATABASE_URL=postgres://user:p4ss@host/db\nPORT=5432",
         "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----",
         "curl -H \"Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc\" https://x.io",
     ];
@@ -782,10 +808,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(STATE_FILE);
         let db = db().await;
+        // Opted in before these copies were made.
+        write_state(&path, &State { high_water: 0 }).unwrap();
         let (state, stats) = pass(&db, &governor(), false, &path).await.unwrap();
         assert_eq!(state.high_water, 4, "the paste is not read");
         assert_eq!((stats.scanned, stats.saved), (4, 1));
-        assert_eq!(read_state(&path), state);
+        assert_eq!(read_state(&path), Some(state));
         assert_eq!(
             contents(&db).await,
             [("    let a = b();".to_string(), Some("rust".to_string()))]
@@ -794,24 +822,51 @@ mod tests {
         // Nothing new: nothing read.
         let (_, again) = pass(&db, &governor(), false, &path).await.unwrap();
         assert_eq!((again.scanned, again.saved), (0, 0));
-        db.execute_raw_sql_write(
+        // 7: code cut at the cap by capture; 8: short code that ends in "...".
+        let cut = screenpipe_a11y::events::cap_clipboard_text(
+            &"let a = 1;\n".repeat(2_500),
+            SNIPPET_CLIPBOARD_CONTENT_MAX_BYTES,
+        );
+        assert!(cut.ends_with("..."));
+        db.execute_raw_sql_write(&format!(
             "INSERT INTO ui_events(id,timestamp,event_type,modifiers,text_content) VALUES \
              (6,'2026-11-28T10:00:05Z','clipboard',99,'SELECT 1 FROM t;'), \
-             (7,'2026-11-28T10:00:06Z','clipboard',99,'fn cut() {\n    let a = 1;\n    let b...')",
-        )
+             (7,'2026-11-28T10:00:06Z','clipboard',99,'{cut}'), \
+             (8,'2026-11-28T10:00:07Z','clipboard',99,'fn spread() {{\n    call(...args)\n}}...')"
+        ))
         .await
         .unwrap();
         let (state, more) = pass(&db, &governor(), false, &path).await.unwrap();
         assert_eq!(
             (state.high_water, more.scanned, more.saved),
-            (7, 2, 1),
-            "code cut short by capture is not saved"
+            (8, 3, 2),
+            "code cut short by capture is not saved; short code ending in ... is"
         );
 
         // A database replaced under the same data dir restarts ids.
         write_state(&path, &State { high_water: 1_000 }).unwrap();
         let (state, _) = pass(&db, &governor(), false, &path).await.unwrap();
-        assert_eq!(state.high_water, 7);
+        assert_eq!(state.high_water, 8);
+    }
+
+    /// No state file: copies already recorded are not saved; later ones are.
+    #[tokio::test]
+    async fn first_run_saves_only_copies_made_after_opting_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE);
+        let db = db().await;
+        let (state, stats) = pass(&db, &governor(), false, &path).await.unwrap();
+        assert_eq!((state.high_water, stats.saved), (5, 0));
+        assert_eq!(read_state(&path), Some(state));
+        assert!(contents(&db).await.is_empty());
+        db.execute_raw_sql_write(
+            "INSERT INTO ui_events(id,timestamp,event_type,modifiers,text_content) VALUES \
+             (6,'2026-11-28T10:00:05Z','clipboard',99,'SELECT 1 FROM t;')",
+        )
+        .await
+        .unwrap();
+        let (state, stats) = pass(&db, &governor(), false, &path).await.unwrap();
+        assert_eq!((state.high_water, stats.saved), (6, 1));
     }
 
     /// Waiting for redaction stops the scan at the first unredacted copy, so
@@ -835,6 +890,7 @@ mod tests {
         db.execute_raw_sql_write("UPDATE ui_events SET redacted_at = 1 WHERE id = 7")
             .await
             .unwrap();
+        write_state(&path, &State { high_water: 0 }).unwrap();
         let (state, stats) = pass(&db, &governor(), true, &path).await.unwrap();
         assert_eq!(state.high_water, 4, "stops before waiting copy 6");
         assert_eq!((stats.passed_over, stats.saved), (3, 1));

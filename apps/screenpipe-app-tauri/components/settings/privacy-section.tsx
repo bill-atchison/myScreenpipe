@@ -1225,14 +1225,16 @@ export function PrivacySection() {
                   <HelpTooltip text={ui("when on, screenpipe records clipboard copy/paste events and contents. turn off if you ship ~/.screenpipe to a remote LLM or share it — passwords, API keys, and private keys frequently pass through the clipboard.")} />
                 </h3>
                 <p className="text-xs text-muted-foreground">
-                  Skip if your data leaves the machine (passwords, keys often
-                  pass through copy/paste).
+                  {settings.enableSnippetCapture
+                    ? ui("On because Code snippets needs it. Turn off Code snippets to change this.")
+                    : "Skip if your data leaves the machine (passwords, keys often pass through copy/paste)."}
                 </p>
               </div>
             </div>
             <Switch
               id="captureClipboard"
-              checked={!(settings.disableClipboardCapture ?? true)}
+              checked={Boolean(settings.enableSnippetCapture) || !(settings.disableClipboardCapture ?? true)}
+              disabled={Boolean(settings.enableSnippetCapture)}
               onCheckedChange={handleClipboardCaptureToggle}
             />
           </div>

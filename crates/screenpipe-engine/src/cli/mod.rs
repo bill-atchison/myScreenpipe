@@ -1243,6 +1243,11 @@ impl RecordArgs {
             // is enabled, but do not store rows/content when the user opted out.
             capture_clipboard: !clipboard_off || capture_on_clipboard,
             capture_clipboard_content: !clipboard_off,
+            clipboard_content_max_bytes: if self.enable_snippet_capture {
+                screenpipe_a11y::events::SNIPPET_CLIPBOARD_CONTENT_MAX_BYTES
+            } else {
+                screenpipe_a11y::events::DEFAULT_CLIPBOARD_CONTENT_MAX_BYTES
+            },
             // Keyboard events always reach the recorder so they can wake
             // event-driven capture. --disable-keyboard-capture only stops
             // text/key rows from being persisted.
@@ -3037,6 +3042,10 @@ mod tests {
         assert!(ui.record_clipboard_events);
         assert!(!ui.record_keyboard_events);
         assert!(!ui.capture_text);
+        assert_eq!(
+            ui.clipboard_content_max_bytes,
+            screenpipe_a11y::events::SNIPPET_CLIPBOARD_CONTENT_MAX_BYTES
+        );
     }
 
     #[test]

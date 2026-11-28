@@ -166,17 +166,32 @@ pub struct AncestorHop {
     pub name: Option<String>,
 }
 
-/// Most clipboard text kept per event, in bytes; room for a copied source
-/// file so snippet capture gets whole code. Runs once per clipboard event.
-pub const CLIPBOARD_CONTENT_MAX_BYTES: usize = 20_000;
+/// Clipboard text kept per event, in bytes, unless configured otherwise.
+/// Pastes always use this.
+pub const DEFAULT_CLIPBOARD_CONTENT_MAX_BYTES: usize = 1_000;
 
-/// Clipboard text as stored: at most [`CLIPBOARD_CONTENT_MAX_BYTES`], cut on
-/// a char boundary and marked with a trailing "..." when cut.
-pub fn cap_clipboard_text(text: &str) -> String {
-    if text.len() <= CLIPBOARD_CONTENT_MAX_BYTES {
+/// Copy/cut text kept while snippet capture is on: room for a copied source
+/// file. Runs once per clipboard event, never per frame.
+pub const SNIPPET_CLIPBOARD_CONTENT_MAX_BYTES: usize = 20_000;
+
+/// The cap for one clipboard operation: `configured` for copies and cuts,
+/// the default for pastes ('v').
+pub fn clipboard_cap(operation: char, configured: usize) -> usize {
+    if operation == 'v' {
+        DEFAULT_CLIPBOARD_CONTENT_MAX_BYTES
+    } else {
+        configured.max(DEFAULT_CLIPBOARD_CONTENT_MAX_BYTES)
+    }
+}
+
+/// Clipboard text as stored: at most `max_bytes` (at least 4), cut on a char
+/// boundary and marked with a trailing "..." when cut.
+pub fn cap_clipboard_text(text: &str, max_bytes: usize) -> String {
+    let max_bytes = max_bytes.max(4);
+    if text.len() <= max_bytes {
         return text.to_string();
     }
-    let mut end = CLIPBOARD_CONTENT_MAX_BYTES - 3;
+    let mut end = max_bytes - 3;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -958,14 +973,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clipboard_text_keeps_20k_bytes_and_cuts_on_a_char_boundary() {
-        let code = "fn a() {}\n".repeat(1_500); // 15,000 bytes: kept whole
-        assert_eq!(cap_clipboard_text(&code), code);
+    fn clipboard_text_is_capped_per_operation_on_a_char_boundary() {
+        let snippet = SNIPPET_CLIPBOARD_CONTENT_MAX_BYTES;
+        let code = "fn a() {}\n".repeat(1_500); // 15,000 bytes
+                                                // Copies and cuts get the configured cap; pastes never do.
+        for op in ['c', 'x', 'p'] {
+            assert_eq!(cap_clipboard_text(&code, clipboard_cap(op, snippet)), code);
+        }
+        let paste = cap_clipboard_text(&code, clipboard_cap('v', snippet));
+        assert_eq!(paste.len(), DEFAULT_CLIPBOARD_CONTENT_MAX_BYTES);
+        assert!(paste.ends_with("..."));
+        // Default config: 1,000 for everything.
+        let copy = cap_clipboard_text(
+            &code,
+            clipboard_cap('c', DEFAULT_CLIPBOARD_CONTENT_MAX_BYTES),
+        );
+        assert_eq!(copy.len(), DEFAULT_CLIPBOARD_CONTENT_MAX_BYTES);
         // 'é' is two bytes; 19,997 is mid-character.
         let long = "é".repeat(15_000);
-        let capped = cap_clipboard_text(&long);
-        assert!(capped.len() <= CLIPBOARD_CONTENT_MAX_BYTES);
-        assert!(capped.len() >= CLIPBOARD_CONTENT_MAX_BYTES - 4);
+        let capped = cap_clipboard_text(&long, snippet);
+        assert!(capped.len() <= snippet);
+        assert!(capped.len() >= snippet - 4);
         assert!(capped.ends_with("é..."));
     }
 
