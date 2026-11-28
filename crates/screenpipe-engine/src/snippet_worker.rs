@@ -59,9 +59,39 @@ pub struct State {
 
 /// `None`: no (readable) state file, i.e. the first run since opting in.
 pub fn read_state(path: &Path) -> Option<State> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            info!(
+                "snippets: cannot read {} ({e}); treating as a first run",
+                path.display()
+            );
+            return None;
+        }
+    };
+    match serde_json::from_str(&text) {
+        Ok(state) => Some(state),
+        Err(e) => {
+            info!(
+                "snippets: cannot parse {} ({e}); treating as a first run",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Snippet capture is off: forget progress, so the next opt-in is a first
+/// run and copies made while it was off are never saved.
+pub fn forget_progress(data_dir: &Path) -> Result<()> {
+    let path = data_dir.join(STATE_FILE);
+    match std::fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("removing {}", path.display()))
+        }
+        _ => Ok(()),
+    }
 }
 
 fn write_state(path: &Path, state: &State) -> Result<()> {
@@ -203,7 +233,9 @@ const OPERATORS: &[&str] = &[
 /// an env-style secret assignment, or a bearer token.
 static SECRET_ASSIGNMENTS: Lazy<[Regex; 4]> = Lazy::new(|| {
     [
-        r#"(?i)(pass(word|wd)?|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token|access[_-]?token)\w*["']?\s*[:=]\s*["']?[^"'\s]{6,}"#,
+        // Quoted after `:` or `=`, or a bare token after `=` that is not an
+        // expression or type (no `(`, `.`, `[`, `:`).
+        r#"(?i)(pass(word|wd)?|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token|access[_-]?token)\w*["']?\s*(?:[:=]\s*["'][^"'\s]{6,}["']|=\s*[^\s"'(\[.:;,]{6,}(?:[\s;,]|$))"#,
         r"(?m)^\s*(export\s+)?[A-Z0-9_]*(PASSWORD|PASSWD|SECRET|API_KEY|TOKEN|PRIVATE_KEY)[A-Z0-9_]*\s*=\s*\S{6,}",
         r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{16,}",
         // Credentials in a URL: scheme://user:pass@host.
@@ -698,6 +730,10 @@ mod tests {
         "let total = items.iter().map(|i| i.price).sum::<u64>();",
         "run();",
         "#include <stdio.h>\nint main(void) { return 0; }",
+        // Secret-named code that holds no literal secret.
+        "interface Login {\n  user: string;\n  password: string;\n}",
+        "import os\napi_key = os.environ[\"X\"]",
+        "const password = bcrypt.hash(pw);",
     ];
 
     const NOT_CODE: &[&str] = &[
@@ -721,6 +757,7 @@ mod tests {
         "DB_PASSWORD=supersecretvalue\nDB_HOST=localhost",
         "password = hunter2hunter2\nlet user = admin;",
         "DATABASE_URL=postgres://user:p4ss@host/db\nPORT=5432",
+        "const db = {\n  password: \"hunter2hunter2\",\n};",
         "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----",
         "curl -H \"Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc\" https://x.io",
     ];
@@ -854,6 +891,42 @@ mod tests {
         let (state, reset) = pass(&db, &governor(), false, &path).await.unwrap();
         assert_eq!((state.high_water, reset.saved), (8, 0));
         assert!(contents(&db).await.is_empty());
+        // Only a copy made after the reset is saved.
+        db.execute_raw_sql_write(
+            "INSERT INTO ui_events(id,timestamp,event_type,modifiers,text_content) VALUES \
+             (9,'2026-11-28T10:00:08Z','clipboard',99,'let after_reset = 1;')",
+        )
+        .await
+        .unwrap();
+        let (state, after) = pass(&db, &governor(), false, &path).await.unwrap();
+        assert_eq!((state.high_water, after.saved), (9, 1));
+        assert_eq!(
+            contents(&db).await,
+            [(
+                "let after_reset = 1;".to_string(),
+                Some("javascript".to_string())
+            )]
+        );
+    }
+
+    /// Capture off at startup forgets progress: after opting back in, copies
+    /// made while it was off are not saved. An unparseable state file is a
+    /// first run too.
+    #[tokio::test]
+    async fn opting_out_forgets_progress_so_off_period_copies_are_not_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE);
+        let db = db().await;
+        write_state(&path, &State { high_water: 0 }).unwrap();
+        forget_progress(dir.path()).unwrap();
+        assert!(!path.exists());
+        forget_progress(dir.path()).unwrap(); // already gone: fine
+        let (state, stats) = pass(&db, &governor(), false, &path).await.unwrap();
+        assert_eq!((state.high_water, stats.saved), (5, 0));
+        assert!(contents(&db).await.is_empty());
+
+        std::fs::write(&path, "{not json").unwrap();
+        assert_eq!(read_state(&path), None);
     }
 
     /// No state file: copies already recorded are not saved; later ones are.

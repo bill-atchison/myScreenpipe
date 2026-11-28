@@ -1533,6 +1533,9 @@ impl ServerCore {
                 local_data_dir.clone(),
                 config.async_pii_redaction,
             ));
+        } else if let Err(e) = screenpipe_engine::snippet_worker::forget_progress(&local_data_dir) {
+            // The next opt-in starts fresh: no copies from the off period.
+            warn!("snippets: {e:#}");
         }
 
         Ok(Self {

@@ -1227,7 +1227,7 @@ export function PrivacySection() {
                 <p className="text-xs text-muted-foreground">
                   {settings.enableSnippetCapture
                     ? ui("On because Code snippets needs it. Turn off Code snippets to change this.")
-                    : "Skip if your data leaves the machine (passwords, keys often pass through copy/paste)."}
+                    : ui("Skip if your data leaves the machine (passwords, keys often pass through copy/paste).")}
                 </p>
               </div>
             </div>

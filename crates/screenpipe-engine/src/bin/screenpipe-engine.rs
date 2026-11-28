@@ -2399,6 +2399,12 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
             config.async_pii_redaction,
         )
     });
+    if !config.enable_snippet_capture {
+        // The next opt-in starts fresh: no copies from the off period.
+        if let Err(e) = screenpipe_engine::snippet_worker::forget_progress(&local_data_dir) {
+            warn!("snippets: {e:#}");
+        }
+    }
 
     // Image-PII reconciliation worker (issue #3185 follow-up).
     // Independent of the text worker — users can toggle either one

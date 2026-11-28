@@ -364,7 +364,8 @@ impl DatabaseManager {
         Ok(row.map(Snippet::from))
     }
 
-    /// Set the given fields and mark the snippet enriched. `None`: not found.
+    /// Set the given fields and mark the snippet enriched. `None`: not found,
+    /// or hidden by the text privacy release.
     pub async fn update_snippet(
         &self,
         id: i64,
@@ -374,12 +375,14 @@ impl DatabaseManager {
             .tags
             .as_ref()
             .map(|t| serde_json::to_string(t).expect("tags serialize"));
+        // A snippet the API may not show is not changed either.
+        let gate = self.snippet_release_gate().await?;
         let mut tx = self.begin_immediate_with_retry().await?;
         let changed = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE snippets SET title = COALESCE(?1, title), \
                description = COALESCE(?2, description), tags = COALESCE(?3, tags), \
                language = COALESCE(?4, language), enriched_at = strftime('{TIME_FORMAT}', 'now') \
-             WHERE id = ?5"
+             WHERE id = ?5 AND {gate}"
         )))
         .bind(&update.title)
         .bind(&update.description)
@@ -396,14 +399,17 @@ impl DatabaseManager {
         self.get_snippet(id).await
     }
 
-    /// `false`: not found.
+    /// `false`: not found, or hidden by the text privacy release.
     pub async fn delete_snippet(&self, id: i64) -> Result<bool, SqlxError> {
+        let gate = self.snippet_release_gate().await?;
         let mut tx = self.begin_immediate_with_retry().await?;
-        let removed = sqlx::query("DELETE FROM snippets WHERE id = ?")
-            .bind(id)
-            .execute(&mut **tx.conn())
-            .await?
-            .rows_affected();
+        let removed = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM snippets WHERE id = ? AND {gate}"
+        )))
+        .bind(id)
+        .execute(&mut **tx.conn())
+        .await?
+        .rows_affected();
         tx.commit().await?;
         Ok(removed > 0)
     }
@@ -676,6 +682,19 @@ mod tests {
             "saved before release, event not released: hidden"
         );
         assert!(db.get_snippet(1).await.unwrap().is_none());
+        // Hidden rows are neither changed nor deleted.
+        let update = SnippetUpdate {
+            title: Some("leak".into()),
+            ..Default::default()
+        };
+        assert!(db.update_snippet(1, &update).await.unwrap().is_none());
+        assert!(!db.delete_snippet(1).await.unwrap());
+        let (title, kept): (Option<String>, i64) =
+            sqlx::query_as("SELECT title, count(*) FROM snippets WHERE id = 1")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!((title, kept), (None, 1));
         db.execute_raw_sql_write(
             "INSERT INTO ui_events(id,timestamp,event_type,text_content,redacted_at) \
              VALUES (3,'2026-11-28T10:00:00Z','clipboard','key = \"alice@example.com\";',1)",
