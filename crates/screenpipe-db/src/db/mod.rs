@@ -475,6 +475,7 @@ mod starred;
 pub use starred::StarredSession;
 mod outputs;
 mod project_tags;
+pub use self::project_tags::ProjectTagBatch;
 mod search;
 mod semantic;
 mod setup;

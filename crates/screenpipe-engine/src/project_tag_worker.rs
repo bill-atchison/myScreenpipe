@@ -8,13 +8,17 @@
 //! is the on/off switch: without it the worker idles. Every few minutes it
 //! reloads the rules; when they change it clears every `project:` tag and
 //! re-tags from the first frame. Progress lives in a sidecar
-//! `project-rules.state.json`, not in the database. Each batch takes the
-//! background CPU lane and writes through the shared writer; capture never
-//! waits on it.
+//! `project-rules.state.json`, not in the database.
+//!
+//! Each batch takes the background CPU lane, reads and matches frames
+//! without the writer, then holds the shared writer only to insert the tag
+//! links, so capture writes queue behind at most one short insert. Batches
+//! are sized by time. Tags are taken from titles and URLs as they are when
+//! tagged; redacting them afterwards does not remove the tags.
 
 use anyhow::{Context, Result};
 use screenpipe_db::DatabaseManager;
-use screenpipe_resource::ResourceGovernor;
+use screenpipe_resource::{ResourceGovernor, WorkSliceConfig, WorkSliceController};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,8 +30,9 @@ use tracing::{debug, info, warn};
 pub const RULES_FILE: &str = "project-rules.json";
 const STATE_FILE: &str = "project-rules.state.json";
 const INTERVAL: Duration = Duration::from_secs(300);
-/// Frame ids per tagging transaction.
-const BATCH: i64 = 20_000;
+/// Frames read per batch, sized by time between these bounds.
+const INITIAL_BATCH: u32 = 1_000;
+const MAX_BATCH: u32 = 50_000;
 /// Tag links removed per clearing transaction.
 const CLEAR_BATCH: i64 = 20_000;
 const MIN_COOLDOWN: Duration = Duration::from_millis(50);
@@ -94,20 +99,32 @@ pub fn write_state(path: &Path, state: &State) -> Result<()> {
     std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PassStats {
+    pub scanned: u64,
+    pub tagged: u64,
+    /// Longest single hold of the shared writer, clearing included.
+    pub longest_hold: Duration,
+}
+
 /// Bring the tags up to date with `rules`: clear and restart when they
-/// changed, then tag every frame above the high water mark.
+/// changed, then tag every frame above the high water mark that existed when
+/// the pass began.
 pub async fn tag_pass(
     db: &DatabaseManager,
     governor: &Arc<ResourceGovernor>,
     rules: &Rules,
     state_path: &Path,
-) -> Result<State> {
+) -> Result<(State, PassStats)> {
     let hash = rules_hash(rules);
     let mut state = read_state(state_path);
+    let mut stats = PassStats::default();
     if state.rules_hash != hash {
         loop {
             let _permit = governor.acquire_background_cpu().await;
-            if db.clear_project_tags(CLEAR_BATCH).await? == 0 {
+            let (removed, hold) = db.clear_project_tags(CLEAR_BATCH).await?;
+            stats.longest_hold = stats.longest_hold.max(hold);
+            if removed == 0 {
                 break;
             }
         }
@@ -119,27 +136,59 @@ pub async fn tag_pass(
         write_state(state_path, &state)?;
     }
     let max = db.max_frame_id().await?;
+    if max < state.high_water {
+        // A replaced or reset database: ids restart, so would the tags.
+        info!(
+            max,
+            high_water = state.high_water,
+            "project tags: frame ids went backwards, re-tagging from the start"
+        );
+        state.high_water = 0;
+        write_state(state_path, &state)?;
+    }
+    let mut sizer = WorkSliceController::new(WorkSliceConfig {
+        max_units: MAX_BATCH,
+        initial_units: INITIAL_BATCH,
+        ..WorkSliceConfig::default()
+    });
     while state.high_water < max {
-        let to = (state.high_water + BATCH).min(max);
         let permit = governor.acquire_background_cpu().await;
         let started = Instant::now();
-        let tagged = db
-            .tag_project_frames(rules, state.high_water + 1, to)
+        let batch = db
+            .tag_project_frames(rules, state.high_water, i64::from(sizer.current_units()))
             .await?;
-        state.high_water = to;
+        if batch.scanned == 0 {
+            break;
+        }
+        state.high_water = batch.last_id;
         write_state(state_path, &state)?;
+        stats.scanned += batch.scanned;
+        stats.tagged += batch.tagged;
+        stats.longest_hold = stats.longest_hold.max(batch.writer_hold);
         let worked = started.elapsed();
+        let next = sizer.observe(worked);
         let cooldown = permit.finish(worked, MIN_COOLDOWN, MAX_COOLDOWN).cooldown;
         debug!(
-            to,
-            tagged,
+            high_water = state.high_water,
+            scanned = batch.scanned,
+            tagged = batch.tagged,
+            next,
             worked_ms = worked.as_millis(),
+            hold_ms = batch.writer_hold.as_millis(),
             "project tags: batch"
         );
         // Hold the lane through the cooldown, as the embedding worker does.
         tokio::time::sleep(cooldown).await;
     }
-    Ok(state)
+    info!(
+        projects = rules.len(),
+        scanned = stats.scanned,
+        tagged = stats.tagged,
+        longest_writer_hold_ms = stats.longest_hold.as_millis(),
+        high_water = state.high_water,
+        "project tags: pass done"
+    );
+    Ok((state, stats))
 }
 
 /// Tag frames for the engine's lifetime; aborted on shutdown.
@@ -192,14 +241,7 @@ pub async fn tick(
     }
     let rules = rules.as_ref()?;
     match tag_pass(db, governor, rules, &data_dir.join(STATE_FILE)).await {
-        Ok(state) => {
-            debug!(
-                projects = rules.len(),
-                high_water = state.high_water,
-                "project tags: pass done"
-            );
-            Some(state)
-        }
+        Ok((state, _)) => Some(state),
         Err(e) => {
             note(format!("project tags: pass failed, retrying: {e:#}"), true);
             None
@@ -302,5 +344,97 @@ mod tests {
             .unwrap();
         assert_ne!(changed.rules_hash, state.rules_hash);
         assert_eq!(tags(&db).await, ["2:project:canopy"]);
+    }
+
+    /// A database replaced under the same data dir restarts frame ids; a
+    /// high water mark above them must not stall tagging forever.
+    #[tokio::test]
+    async fn high_water_above_the_last_frame_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(RULES_FILE),
+            r#"{"projects":{"dtpos":["dt pos"]}}"#,
+        )
+        .unwrap();
+        let db = db_with_frames().await;
+        let mut rules = None;
+        let mut quiet = |_: String, _: bool| {};
+        let state = tick(&db, &governor(), dir.path(), &mut rules, &mut quiet)
+            .await
+            .unwrap();
+        // The old database had more frames; this one has no tags yet.
+        write_state(
+            &dir.path().join(STATE_FILE),
+            &State {
+                high_water: 1_000,
+                ..state
+            },
+        )
+        .unwrap();
+        db.execute_raw_sql_write("DELETE FROM vision_tags")
+            .await
+            .unwrap();
+        let after = tick(&db, &governor(), dir.path(), &mut rules, &mut quiet)
+            .await
+            .unwrap();
+        assert_eq!(after.high_water, 2);
+        assert_eq!(tags(&db).await, ["1:project:dtpos"]);
+    }
+
+    /// Longest writer hold and total time of a full first pass over 400k
+    /// frames, in both storage modes, with the personal rules file's shape.
+    #[tokio::test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    async fn full_pass_cost() {
+        const FRAMES: i64 = 400_000;
+        let rules = load_rules(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../personal/project-rules.json"),
+        )
+        .unwrap()
+        .unwrap();
+        for hybrid in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let db = if hybrid {
+                DatabaseManager::new_hybrid(root.path(), Default::default(), Default::default())
+                    .await
+                    .unwrap()
+            } else {
+                let path = root.path().join("db.sqlite");
+                DatabaseManager::new(path.to_str().unwrap(), Default::default())
+                    .await
+                    .unwrap()
+            };
+            // About 1 in 25 frames matches a project.
+            db.execute_raw_sql_write(&format!(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<{FRAMES}) \
+                 INSERT INTO frames(id,timestamp,window_name,browser_url,document_path) \
+                 SELECT i, strftime('%Y-%m-%dT%H:%M:%fZ','2026-01-01','+'||i||' seconds'), \
+                   CASE i % 100 WHEN 0 THEN 'DT POS - Tax ' || i WHEN 1 THEN 'Canopy board' \
+                     ELSE 'Some window title number ' || i END, \
+                   CASE WHEN i % 100 = 2 THEN 'https://github.com/x/screenpipe/pull/' || i \
+                     ELSE 'https://example.com/page/' || i END, \
+                   CASE WHEN i % 100 = 3 THEN '/Users/x/src/zpos/main.clw' END \
+                 FROM n"
+            ))
+            .await
+            .unwrap();
+            let state_path = root.path().join(STATE_FILE);
+            let started = Instant::now();
+            let (state, stats) = tag_pass(&db, &governor(), &rules, &state_path)
+                .await
+                .unwrap();
+            let total = started.elapsed();
+            assert_eq!(state.high_water, FRAMES);
+            assert_eq!(stats.scanned, FRAMES as u64);
+            assert_eq!(stats.tagged, (FRAMES / 100 * 4) as u64);
+            eprintln!(
+                "PROJECT_TAGS mode={} frames={FRAMES} tagged={} longest_writer_hold_ms={:.1} total_ms={}",
+                if hybrid { "compressed" } else { "sqlite" },
+                stats.tagged,
+                stats.longest_hold.as_secs_f64() * 1000.0,
+                total.as_millis()
+            );
+            db.close().await;
+        }
     }
 }

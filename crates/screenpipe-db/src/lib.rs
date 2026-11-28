@@ -50,7 +50,7 @@ pub use db::{
     ActivityActionRecord, ActivityEvidenceDraft, ActivityEvidenceRecord, ActivityIntervalDraft,
     ActivityIntervalRecord, ActivityLedgerObservation, ActivityTaskDraft, DatabaseManager,
     DeleteTimeRangeResult, EmbeddingChunk, EmbeddingRelease, EmbeddingSource, EmbeddingSourceType,
-    ImmediateTx, NewMeetingTranscriptSegment, SemanticActor, SemanticActorAlias,
+    ImmediateTx, NewMeetingTranscriptSegment, ProjectTagBatch, SemanticActor, SemanticActorAlias,
     SemanticActorReference, SemanticAttachResult, SemanticCleanupResult, SemanticContextQuery,
     SemanticFrameContext, SemanticProjectionWriteResult, SemanticRow, StarredSession,
     EMBEDDING_DIMS, MEETING_END_REASON_AUTO_END, MEETING_END_REASON_EXPLICIT_STOP,
