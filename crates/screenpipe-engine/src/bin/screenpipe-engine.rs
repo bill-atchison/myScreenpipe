@@ -2386,6 +2386,10 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
     let embedding_worker = config
         .enable_semantic_search
         .then(|| screenpipe_engine::embedding_worker::spawn(Arc::clone(&db)));
+    // Always on: the rules file in the data dir is its switch. Aborted with
+    // the embedding worker.
+    let project_tag_worker =
+        screenpipe_engine::project_tag_worker::spawn(Arc::clone(&db), local_data_dir.clone());
 
     // Image-PII reconciliation worker (issue #3185 follow-up).
     // Independent of the text worker — users can toggle either one
@@ -2527,6 +2531,7 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
     if let Some(worker) = &embedding_worker {
         worker.abort();
     }
+    project_tag_worker.abort();
     let _ = shutdown_tx.send(());
     if let Some(ref handle) = ui_recorder_handle {
         handle.stop();

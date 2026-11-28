@@ -1521,6 +1521,11 @@ impl ServerCore {
         if config.enable_semantic_search {
             owned_tasks.push(screenpipe_engine::embedding_worker::spawn(Arc::clone(&db)));
         }
+        // Always on: the rules file in the data dir is its switch.
+        owned_tasks.push(screenpipe_engine::project_tag_worker::spawn(
+            Arc::clone(&db),
+            local_data_dir.clone(),
+        ));
 
         Ok(Self {
             db,

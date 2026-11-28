@@ -474,6 +474,7 @@ pub mod privacy_release;
 mod starred;
 pub use starred::StarredSession;
 mod outputs;
+mod project_tags;
 mod search;
 mod semantic;
 mod setup;

@@ -1,0 +1,9 @@
+{
+  "_comment": "Copy to ~/.screenpipe/project-rules.json on the recording machine. Each pattern is a case-insensitive substring matched against a frame's window title, browser URL and open-file path. A frame gets project:<name> for every project with a matching pattern. Editing the file re-tags everything.",
+  "projects": {
+    "dtpos": ["dt pos", "dtpos", "northstar", "dt loyalty", "pos tax", "store operations / pos", "zpos"],
+    "canopy": ["canopy", "gbko"],
+    "myscreenpipe": ["screenpipe"],
+    "multiterminal": ["mymultiterminal"]
+  }
+}
