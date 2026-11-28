@@ -18,8 +18,8 @@ Screenpipe instance.
 2. Use the authenticated REST endpoint for the requested evidence.
 3. Never access the recorder's live SQLite database, write-ahead log, or shared-memory files directly. Use authenticated `/raw_sql` when the typed endpoints lack a needed field; resolve auth via the environment or `screenpipe auth token`. If unavailable, report it.
 4. Preserve explicit user boundaries on time, source, content type, app, account, and action. Widen only filters you chose, and never turn a read request into a write.
-5. Start broad activity questions with `/activity-summary`; for questions about what the user worked on, decided, or discussed, read the workstream summaries and use `/search/semantic` (see "Recall past work"); use `/search` only for specific or verbatim evidence. Let `/activity-summary` own time math and check `data_status` before claiming there is no activity.
-6. When answering about past activity, link each claim to a real moment from your results: `[time — app](screenpipe://frame/<frame_id>)` for a screen result, or `[time — source](screenpipe://timeline?timestamp=<ISO8601>)` for audio, meetings, summaries, or anything else with a timestamp. If a source gives no frame ID or timestamp, run a narrow `/search` or `/search/semantic` for that moment to get one. Never invent an ID or timestamp; leave a claim unlinked only when no result supports a link.
+5. Start broad activity questions with `/activity-summary`; for questions about what the user worked on, decided, or discussed, follow item 6; use `/search` only for specific or verbatim evidence. Let `/activity-summary` own time math and check `data_status` before claiming there is no activity.
+6. Recall past work ("what was I debugging Tuesday afternoon?", "what did we decide about X?"): turn the time phrase into explicit local bounds (morning 06:00–12:00, afternoon 12:00–18:00, a weekday = the most recent past one) and state them. Read the workstream summaries first: `GET /memories?source=workstream&tags=workstream,hourly&start_time=<start>&end_time=<end>&limit=50` (one per project per hour, tagged `project:<name>`; `tags=workstream,daily,date:<YYYY-MM-DD>` for a day). They are generated: verify specifics before stating them. Then find the moments with `GET /search/semantic?q=<topic>&start_time=<start>&end_time=<end>&limit=20` (meaning plus keyword; times accept ISO 8601, `yesterday`, `YYYY-MM-DD`, `3h ago`; 503 means it is off, so use `/search`). Narrow to a project with `/search?tags=project:<name>`. In meeting transcripts each line has `deviceType`: `input` is the user's own microphone (the user speaking), `output` is the call audio (other participants). An action said on `output` is never the user's; name another owner only when the exchange names them, and someone who suggests an action is not its owner.
 7. Separate observed activity, explicit commitments, inferred open loops, and completed outcomes. Seeing a task or discussion is not evidence that the user performed or completed it.
 
 ## Essential read parameters
@@ -294,16 +294,6 @@ head -20 /tmp/sp.csv
 Response: `{"data": [{"type":"OCR","content":{"frame_id":...,"text":...,"app_name":...}}, {"type":"Audio","content":{"chunk_id":...,"transcription":...,"speaker":{"name":...}}}, {"type":"Parsed","content":{"frame_id":...,"text":...,"items":[...],"actors":[...]}}], "pagination":{"limit":10,"offset":0,"total":42}}`.
 
 ---
-
-## Recall past work — workstream summaries and `GET /search/semantic`
-
-For questions like "what was I debugging Tuesday afternoon?" or "what did we decide about X?":
-
-1. Turn the user's time phrase into explicit bounds in the user's local timezone (afternoon = 12:00–18:00, morning = 06:00–12:00, a weekday = the most recent past one). Say the range you used in the answer.
-2. Read the workstream summaries for that range: `GET /memories?source=workstream&tags=workstream,hourly&start_time=<start>&end_time=<end>&limit=50` (one memory per project per hour, tagged `project:<name>` and `window:<hour>`), or `tags=workstream,daily,date:<YYYY-MM-DD>` for a whole day. They list what was done, decided, and left open, with meeting decisions and action items. They are generated summaries, so verify specific claims below before stating them.
-3. Find the moments by meaning: `GET /search/semantic?q=<topic>&start_time=<start>&end_time=<end>&limit=20`. It merges meaning-based and keyword matches. `content_type=frame|audio|all`; times accept ISO 8601, `yesterday`, `2026-11-26`, or `3h ago`. Each result has `source_type` (`frame` or `audio`), `id`, `timestamp`, a text excerpt, app/window or device, and `matched_by` (`vector`, `keyword`, or `both`). A 503 means semantic search is off or its model isn't loaded: fall back to `/search`.
-4. Narrow to one project with `/search?tags=project:<name>` when the user names a project.
-5. Answer from that evidence and cite every claim with a link from the results (see "Deep Links"): a frame result as `[time — app](screenpipe://frame/<id>)`, an audio result as `[time — meeting/device](screenpipe://timeline?timestamp=<timestamp>)`. Never invent an ID or timestamp. If nothing supports an answer, say so.
 
 ## Synced devices — `GET /data-sync/devices` and `/data-sync/search`
 
