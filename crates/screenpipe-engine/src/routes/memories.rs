@@ -222,14 +222,30 @@ pub(crate) async fn list_memories_handler(
         None
     };
 
+    // created_at is stored as UTC text (…Z) and compared as text, so an offset
+    // like -05:00 must be converted first or the range shifts by the offset.
+    let bad_time = |e: String| (StatusCode::BAD_REQUEST, JsonResponse(json!({"error": e})));
+    let start_time = query
+        .start_time
+        .as_deref()
+        .map(utc_bound)
+        .transpose()
+        .map_err(bad_time)?;
+    let end_time = query
+        .end_time
+        .as_deref()
+        .map(utc_bound)
+        .transpose()
+        .map_err(bad_time)?;
+
     let (memories_result, total_result) = tokio::join!(
         state.db.list_memories(
             query.q.as_deref(),
             query.source.as_deref(),
             legacy_tags_filter,
             query.min_importance,
-            query.start_time.as_deref(),
-            query.end_time.as_deref(),
+            start_time.as_deref(),
+            end_time.as_deref(),
             query.limit,
             query.offset,
             query.order_by.as_deref(),
@@ -241,8 +257,8 @@ pub(crate) async fn list_memories_handler(
             query.source.as_deref(),
             legacy_tags_filter,
             query.min_importance,
-            query.start_time.as_deref(),
-            query.end_time.as_deref(),
+            start_time.as_deref(),
+            end_time.as_deref(),
             &tags_all,
         )
     );
@@ -457,9 +473,29 @@ pub(crate) fn enrich_source_context_with_device(ctx: Option<Value>) -> Option<Va
     Some(enriched)
 }
 
+/// Parse a flexible time (ISO 8601 with any offset, `yesterday`, `3h ago`) into
+/// the UTC text form memories store, so text comparison orders correctly.
+fn utc_bound(s: &str) -> Result<String, String> {
+    super::time::parse_flexible_datetime(s).map(|t| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utc_bound_converts_offsets_to_stored_utc_text() {
+        assert_eq!(
+            utc_bound("2026-11-27T12:00:00-05:00").unwrap(),
+            "2026-11-27T17:00:00.000Z"
+        );
+        assert_eq!(
+            utc_bound("2026-11-27T17:00:00Z").unwrap(),
+            "2026-11-27T17:00:00.000Z"
+        );
+        assert!(utc_bound("3h ago").unwrap().ends_with('Z'));
+        assert!(utc_bound("not a time").is_err());
+    }
 
     #[test]
     fn parse_exact_tag_filter_only_splits_comma_separated_values() {
