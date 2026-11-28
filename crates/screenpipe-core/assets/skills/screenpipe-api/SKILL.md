@@ -19,7 +19,8 @@ Screenpipe instance.
 3. Never access the recorder's live SQLite database, write-ahead log, or shared-memory files directly. Use authenticated `/raw_sql` when the typed endpoints lack a needed field; resolve auth via the environment or `screenpipe auth token`. If unavailable, report it.
 4. Preserve explicit user boundaries on time, source, content type, app, account, and action. Widen only filters you chose, and never turn a read request into a write.
 5. Start broad activity questions with `/activity-summary`; for questions about what the user worked on, decided, or discussed, read the workstream summaries and use `/search/semantic` (see "Recall past work"); use `/search` only for specific or verbatim evidence. Let `/activity-summary` own time math and check `data_status` before claiming there is no activity.
-6. Separate observed activity, explicit commitments, inferred open loops, and completed outcomes. Seeing a task or discussion is not evidence that the user performed or completed it.
+6. When answering about past activity, link each claim to a real moment from your results: `[time — app](screenpipe://frame/<frame_id>)` for a screen result, or `[time — source](screenpipe://timeline?timestamp=<ISO8601>)` for audio, meetings, summaries, or anything else with a timestamp. If a source gives no frame ID or timestamp, run a narrow `/search` or `/search/semantic` for that moment to get one. Never invent an ID or timestamp; leave a claim unlinked only when no result supports a link.
+7. Separate observed activity, explicit commitments, inferred open loops, and completed outcomes. Seeing a task or discussion is not evidence that the user performed or completed it.
 
 ## Essential read parameters
 
