@@ -60,7 +60,15 @@ pub struct SemanticSearchParams {
     pub limit: u32,
     #[serde(default)]
     pub content_type: ContentFilter,
+    #[serde(
+        default,
+        deserialize_with = "super::time::deserialize_flexible_datetime_option"
+    )]
     pub start_time: Option<DateTime<Utc>>,
+    #[serde(
+        default,
+        deserialize_with = "super::time::deserialize_flexible_datetime_option"
+    )]
     pub end_time: Option<DateTime<Utc>>,
 }
 
@@ -461,6 +469,23 @@ mod tests {
             body["error"],
             "semantic search not enabled or model not loaded"
         );
+    }
+
+    /// Relative and calendar times parse like /search: the request gets past
+    /// query parsing (503, no model) instead of a 400 rejection.
+    #[tokio::test]
+    async fn accepts_relative_times() {
+        let r = memory_router().await;
+        for query in [
+            "q=hello&start_time=2h%20ago&end_time=now",
+            "q=hello&start_time=yesterday",
+            "q=hello&start_time=2026-11-26T12:00:00Z",
+        ] {
+            let (status, _) = get(&r, Some(KEY), query).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{query}");
+        }
+        let (status, _) = get(&r, Some(KEY), "q=hello&start_time=tuesday-ish").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     fn unit(axis: usize) -> Vector {

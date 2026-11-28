@@ -35,6 +35,7 @@ import { teamFrameContent, teamFramePath } from "./team-frame";
 import { jpegImageContent } from "./frame-image";
 import { CHAT_SEARCH_TOOL, searchChats } from "./chat-search";
 import { SEMANTIC_SEARCH_TOOL, semanticSearch } from "./semantic-search";
+import { WORKSTREAM_SUMMARIES_TOOL, workstreamSummaries } from "./workstream-summaries";
 import { WORKFLOW_TOOLS, readWorkflowTool, frameAutomationContent } from "./workflow-tools";
 import { PKG_VERSION } from "./version";
 import { BUNDLED_SKILLS_TOOL, readBundledSkills } from "./bundled-skills";
@@ -348,7 +349,7 @@ const server = new Server(
 const TOOLS: Tool[] = [
   CHAT_SEARCH_TOOL,
   SEMANTIC_SEARCH_TOOL,
-  SEMANTIC_SEARCH_TOOL,
+  WORKSTREAM_SUMMARIES_TOOL,
   ...WORKFLOW_TOOLS,
   BUNDLED_SKILLS_TOOL,
   {
@@ -2359,6 +2360,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeCall(r
 
       case "semantic-search":
         return await semanticSearch(args, callAPI);
+
+      case "workstream-summaries":
+        return await workstreamSummaries(args, callAPI);
 
       case "search-chats":
         return await searchChats(args, callAPI);
