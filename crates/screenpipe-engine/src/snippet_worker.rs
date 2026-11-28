@@ -579,9 +579,11 @@ pub async fn pass(
         info!(
             max,
             high_water = state.high_water,
-            "snippets: ui_event ids went backwards, starting over"
+            "snippets: ui_event ids went backwards, saving copies from now on"
         );
-        state.high_water = 0;
+        // Like a first run: a replaced database can hold copies from before
+        // the user opted in, so nothing already in it is saved.
+        state.high_water = max;
         write_state(state_path, &state)?;
     }
     loop {
@@ -843,10 +845,15 @@ mod tests {
             "code cut short by capture is not saved; short code ending in ... is"
         );
 
-        // A database replaced under the same data dir restarts ids.
+        // A database replaced under the same data dir restarts ids: start at
+        // its newest event and save none of the copies already in it.
+        db.execute_raw_sql_write("DELETE FROM snippets")
+            .await
+            .unwrap();
         write_state(&path, &State { high_water: 1_000 }).unwrap();
-        let (state, _) = pass(&db, &governor(), false, &path).await.unwrap();
-        assert_eq!(state.high_water, 8);
+        let (state, reset) = pass(&db, &governor(), false, &path).await.unwrap();
+        assert_eq!((state.high_water, reset.saved), (8, 0));
+        assert!(contents(&db).await.is_empty());
     }
 
     /// No state file: copies already recorded are not saved; later ones are.
