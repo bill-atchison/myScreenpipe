@@ -234,8 +234,10 @@ const OPERATORS: &[&str] = &[
 static SECRET_ASSIGNMENTS: Lazy<[Regex; 4]> = Lazy::new(|| {
     [
         // Quoted after `:` or `=`, or a bare token after `=` that is not an
-        // expression or type (no `(`, `.`, `[`, `:`).
-        r#"(?i)(pass(word|wd)?|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token|access[_-]?token)\w*["']?\s*(?:[:=]\s*["'][^"'\s]{6,}["']|=\s*[^\s"'(\[.:;,]{6,}(?:[\s;,]|$))"#,
+        // expression or type (no `(`, `.`, `[`, `:`). Unquoted YAML-style
+        // `password: value` is deliberately not caught: it would also flag
+        // type annotations such as `password: string`.
+        r#"(?i)(pass(word|wd)?|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token|access[_-]?token)\w*["']?\s*(?:[:=]\s*["'][^"'\n]{6,}["']|=\s*[^\s"'(\[.:;,]{6,}(?:[\s;,]|$))"#,
         r"(?m)^\s*(export\s+)?[A-Z0-9_]*(PASSWORD|PASSWD|SECRET|API_KEY|TOKEN|PRIVATE_KEY)[A-Z0-9_]*\s*=\s*\S{6,}",
         r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{16,}",
         // Credentials in a URL: scheme://user:pass@host.
@@ -758,6 +760,7 @@ mod tests {
         "password = hunter2hunter2\nlet user = admin;",
         "DATABASE_URL=postgres://user:p4ss@host/db\nPORT=5432",
         "const db = {\n  password: \"hunter2hunter2\",\n};",
+        "password = \"correct horse battery\";\nlet user = admin;",
         "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----",
         "curl -H \"Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc\" https://x.io",
     ];
