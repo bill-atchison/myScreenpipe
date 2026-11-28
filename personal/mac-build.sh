@@ -11,8 +11,11 @@ set -euo pipefail
 branch="${1:-myScreenpipe}"
 cd "$(dirname "$0")/.."
 
-git checkout -- apps/screenpipe-app-tauri/src-tauri/gen/schemas 2>/dev/null || true
-git diff --quiet && git diff --cached --quiet || { echo "error: checkout has local changes" >&2; exit 1; }
+# A release build rewrites these tracked files; drop only that noise, never real edits.
+git checkout -- apps/screenpipe-app-tauri/src-tauri/gen/schemas apps/screenpipe-app-tauri/src-tauri/Cargo.lock 2>/dev/null || true
+# A chmod +x on these scripts is not a real change either.
+git -c core.fileMode=false diff --quiet && git diff --cached --quiet || {
+  echo "error: checkout has local changes:" >&2; git -c core.fileMode=false status --short >&2; exit 1; }
 git fetch -q origin "$branch"
 git switch -q "$branch"
 git merge -q --ff-only "origin/$branch"

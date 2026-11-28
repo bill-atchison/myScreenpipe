@@ -176,7 +176,9 @@ case "$cmd" in
       rm -rf \"\$prev\"
       [ -d /Applications/screenpipe.app ] && mv /Applications/screenpipe.app \"\$prev\"
       mv \"\$staged\" /Applications/screenpipe.app
-      open /Applications/screenpipe.app
+      # LaunchServices can refuse a just-moved bundle (error -600); retry instead of letting
+      # err_exit stop here with the recorder down and no rollback.
+      for i in {1..10}; do open /Applications/screenpipe.app && break; sleep 3; done
       for i in {1..60}; do curl -s http://127.0.0.1:3030/health | grep -q '\"status\":\"healthy\"' && break; sleep 2; done
       if ! curl -s http://127.0.0.1:3030/health | grep -q '\"status\":\"healthy\"'; then
         echo 'error: new build not healthy after 2 minutes (macOS may be asking for permissions)' >&2
