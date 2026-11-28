@@ -6,7 +6,7 @@ preset:
 - codex
 - claude code
 - screenpipe-cloud
-timeout: 300
+timeout: 600
 icon: 🧵
 title: Workstream (hourly)
 description: Hourly per-project summary of the previous clock hour, saved as memories tagged workstream
@@ -26,8 +26,9 @@ Use only screenpipe's recorded data via the local API at `http://localhost:3030`
 3. `GET /meetings?start_time=<start>&end_time=<end>`. **Meetings are never skipped.** For each meeting that overlaps the window (Teams or any other app), read `GET /meetings/<id>/transcript` and keep its part inside the window.
 4. `GET /activity-summary?start_time=<start>&end_time=<end>`. If there was no meeting and it shows under 5 minutes of activity in total, stop and write nothing.
 5. If you need more detail, run at most 4 more searches (`/search` or `/search/semantic`, limit 10, within the window).
-6. **Find the projects.** A project is a repo, product or ticket the work belongs to. Infer it from window titles, repo and branch names, VS Code / terminal workspace names, MultiTerminal ticket titles, document names, and meeting titles and what was discussed. Use short stable lowercase names (`myscreenpipe`, `dtpos`, `multiterminal`). Ignore anything under 3 minutes.
-   - **Skip work that belongs to no project** (browsing, reading news or email): write nothing for it.
+6. **Find the projects.** A project is a repo, product or ticket the work belongs to. Infer it from window titles, repo and branch names, VS Code / terminal workspace names, MultiTerminal ticket titles, document names, and meeting titles and what was discussed. Ignore anything under 3 minutes.
+   - **Reuse existing project names.** First `GET /memories/tags` and use a `project:` name that already exists whenever the work fits it. Variants of one product line are one project: DT POS, WinDSS, Northstar, phone-number capture and loyalty work are all `dtpos`. Only create a new short lowercase name for a clearly different repo or product.
+   - **Skip work that belongs to no project** (browsing, reading news or email): write nothing for it. Never write `project:other`.
    - **Meetings:** put a meeting under the project it was about. If it was about no single project, use the project `meetings`. Never drop a meeting.
 7. For each project, write one memory with `POST /memories`:
    ```json

@@ -6,7 +6,7 @@ preset:
 - codex
 - claude code
 - screenpipe-cloud
-timeout: 300
+timeout: 600
 icon: 🧵
 title: Workstream (daily)
 description: Evening per-project rollup of the day's hourly workstream summaries, saved as memories
@@ -21,9 +21,10 @@ Roll up today's hourly workstream summaries into **one daily summary per project
 
 1. `date` = today's local date, `YYYY-MM-DD`.
 2. **Skip if already done:** `GET /memories?source=workstream&tags=workstream,daily,date:<date>&limit=1`. If anything comes back, stop.
-3. `GET /memories?source=workstream&tags=workstream,hourly&start_time=<today 00:00 local>&limit=200&order_by=created_at&order_dir=asc`.
-   If there are none, stop and write nothing.
-4. Group them by their `project:` tag. For each project, write one memory with `POST /memories`:
+3. `GET /memories?source=workstream&tags=workstream,hourly&start_time=<yesterday 23:00 local>&limit=200&order_by=created_at&order_dir=asc`.
+   Keep **only** the memories whose `window:` tag starts with `window:<date>T` (an hour of today). Ignore every other one, even if it was created today.
+   If none are left, stop and write nothing.
+4. Group them by their `project:` tag, treating variants of one product line as one project (`dtposnorth` belongs to `dtpos`), and never write `project:other`. For each project, write one memory with `POST /memories`:
    ```json
    {"content": "...", "source": "workstream", "importance": 0.6,
     "tags": ["workstream", "daily", "project:<name>", "date:<date>"]}
